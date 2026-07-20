@@ -1,4 +1,5 @@
 from pathlib import Path
+import os
 from typing import Any
 from uuid import uuid4
 
@@ -22,9 +23,19 @@ from careerops.renderers.latex import render_latex, sha256_file
 
 def default_repository() -> CareerOpsRepository:
     root = Path(__file__).resolve().parents[3]
-    repo = CareerOpsRepository(root / "data" / "careerops.db", root / "vault")
+    database_path = _configured_path("CAREEROPS_DB_PATH", root / "data" / "careerops.db", root)
+    vault_path = _configured_path("CAREEROPS_VAULT_PATH", root / "vault", root)
+    repo = CareerOpsRepository(database_path, vault_path)
     repo.initialize()
     return repo
+
+
+def _configured_path(name: str, default: Path, root: Path) -> Path:
+    raw = os.getenv(name)
+    if not raw:
+        return default
+    path = Path(raw)
+    return path if path.is_absolute() else root / path
 
 
 def create_app(repository: CareerOpsRepository | None = None) -> FastAPI:
@@ -40,7 +51,12 @@ def create_app(repository: CareerOpsRepository | None = None) -> FastAPI:
 
     @app.get("/health")
     def health() -> dict[str, str]:
-        return {"status": "ok"}
+        try:
+            with repo.connection() as connection:
+                connection.execute("SELECT 1").fetchone()
+        except Exception as exc:
+            raise HTTPException(status_code=503, detail="Database unavailable") from exc
+        return {"status": "ok", "database": "ok"}
 
     @app.get("/applications")
     def list_applications() -> list[dict[str, Any]]:
