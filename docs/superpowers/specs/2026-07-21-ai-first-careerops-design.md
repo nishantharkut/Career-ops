@@ -143,7 +143,7 @@ The app should use a provider adapter layer.
 Recommended order:
 
 1. **Local OSS provider**: Ollama first when installed, with LM Studio or another OpenAI-compatible local runtime later. Best for private drafts, semantic analysis, and low/no recurring cost.
-2. **Codex worker provider**: invokes `codex exec` or a Codex MCP/runtime path for deep repo/session reasoning. Best for evidence reconstruction and codebase inspection.
+2. **Codex worker provider**: invokes a configured Codex CLI identity for deep repo/session reasoning. On this machine, `codex2` is the preferred identity and `codex` is also available. Best for evidence reconstruction and codebase inspection.
 3. **Optional OpenAI API provider**: only when explicitly configured and approved. Best for higher quality generation when the user accepts cloud processing.
 4. **Deterministic fallback provider**: existing rule-based parser/analyzer. This is fallback and verifier, not the full product.
 
@@ -166,6 +166,9 @@ CareerOps must make privacy mode explicit.
 - Can read selected local files and session files when explicitly scoped.
 - Should run with a constrained working directory and explicit prompt contract.
 - Must write artifacts back through CareerOps, not silently mutate user files.
+- A normal ChatGPT-authenticated Codex run sends the bounded task context to OpenAI. The UI must say this before launch; it must not label Codex mode as fully local or claim that all task data stays on the machine.
+- Multiple local Codex identities are selectable. `codex2` is preferred on the current machine, with `codex` available as another explicit choice.
+- CareerOps stores the chosen executable on the provider/task record and never silently falls back to a different Codex identity after a task starts.
 
 ### Cloud AI Mode
 
@@ -304,6 +307,15 @@ The proper integration is a controlled Codex worker:
   - no silent modification of resume/application files
 - Codex writes the final response to a task output artifact.
 - CareerOps parses, stores, and verifies the output before showing it.
+
+Codex executable discovery is interchangeable but explicit:
+
+- `CAREEROPS_CODEX_COMMANDS` is an ordered comma-separated list, defaulting to `codex2,codex` for the current Windows installation.
+- Each available command becomes a separate provider choice, labelled with the exact resolved command and CLI version.
+- `codex2` is the default when available because it selects `C:\Users\nhnis\codex-account2\.codex` through its wrapper.
+- `CAREEROPS_CODEX_COMMAND` may pin a single command for a deployment.
+- If a selected identity becomes unavailable, that task fails with a recoverable provider error. It is not rerouted to another account.
+- The worker uses read-only sandboxing, a bounded task directory, structured output, and ephemeral sessions. Prompt content goes through stdin; shell interpolation is not used.
 
 Codex may be allowed to inspect selected `.codex` session files only through an explicit context reconstruction task. The app must never scan all 5+ GB of session history by default.
 

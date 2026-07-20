@@ -22,7 +22,7 @@
 - `careerops/ai/providers/deterministic.py`: explicit verifier-only fallback, never labelled as AI.
 - `careerops/ai/providers/mock.py`: deterministic CI provider.
 - `careerops/ai/providers/ollama.py`: local Ollama availability probe and structured generation.
-- `careerops/ai/providers/codex.py`: constrained `codex exec` worker using a bounded task folder and output schema.
+- `careerops/ai/providers/codex.py`: interchangeable constrained Codex CLI workers (`codex2` preferred, `codex` optional) using a bounded task folder and output schema.
 - `careerops/ai/prompts/analyze_jd_v1.txt`: versioned semantic JD extraction prompt.
 - `careerops/ai/prompts/analyze_fit_v1.txt`: versioned semantic fit and risk prompt.
 - `careerops/ai/prompts/suggest_resume_edits_v1.txt`: versioned exact-span resume edit prompt.
@@ -276,12 +276,25 @@ def test_ollama_probe_reports_unavailable_without_throwing(http_server):
 
 
 def test_codex_command_is_read_only_and_bounded(tmp_path):
-    provider = CodexProvider(executable="codex", timeout_seconds=30)
+    provider = CodexProvider(executable="codex2", timeout_seconds=30)
     command = provider.build_command(tmp_path / "task", tmp_path / "task" / "schema.json", tmp_path / "task" / "output.json")
-    assert command[:2] == ["codex", "exec"]
+    assert command[:2] == ["codex2", "exec"]
     assert ["--sandbox", "read-only"] == command[command.index("--sandbox"):command.index("--sandbox") + 2]
     assert "--dangerously-bypass-approvals-and-sandbox" not in command
     assert str(tmp_path / "task") in command
+
+
+def test_codex_identities_are_discovered_in_configured_order(monkeypatch):
+    monkeypatch.setenv("CAREEROPS_CODEX_COMMANDS", "codex2,codex")
+    providers = discover_codex_providers(which=lambda value: f"C:/bin/{value}.cmd" if value == "codex2" else f"C:/bin/{value}.exe")
+    assert [provider.executable_name for provider in providers] == ["codex2", "codex"]
+    assert providers[0].is_default is True
+
+
+def test_selected_codex_identity_never_falls_back(tmp_path):
+    provider = CodexProvider(executable="missing-codex2", timeout_seconds=1)
+    with pytest.raises(ProviderUnavailableError, match="missing-codex2"):
+        provider.run(valid_request(tmp_path))
 
 
 def test_provider_rejects_non_schema_output(tmp_path):
@@ -325,7 +338,9 @@ class AiProvider(Protocol):
 
 Use a discriminated `TaskOutput` union with `AnalyzeJdOutput`, `AnalyzeFitOutput`, `ResumeEditsOutput`, `CoverLetterOutput`, and `ClaimReviewOutput`. The only allowed task names are `analyze_jd`, `analyze_fit`, `suggest_resume_edits`, `draft_cover_letter`, and `review_claims`. JD output validates normalized fields plus uncertainty; fit output validates matches, gaps, risks, and recommendations; resume suggestions require `source_text`, `replacement_text`, `reason`, and `evidence_refs`; cover letters contain bounded plain text plus evidence references; claim review returns one decision per supplied claim. All string and list fields are length-limited.
 
-Ollama uses `POST /api/chat` with `stream: false`, `format` set to the JSON Schema, and a finite timeout. Codex uses `subprocess.run()` with an argument list, stdin prompt, `--cd <task_dir>`, `--sandbox read-only`, `--skip-git-repo-check`, `--output-schema <schema>`, and `--output-last-message <output>`; shell execution is forbidden. The deterministic provider returns verifier-only output and has `is_ai=False`.
+Ollama uses `POST /api/chat` with `stream: false`, `format` set to the JSON Schema, and a finite timeout. Codex discovery reads `CAREEROPS_CODEX_COMMANDS` in order (`codex2,codex` for the current machine) or a single `CAREEROPS_CODEX_COMMAND` override. Each resolved executable is registered as a separate provider; `codex2` is preferred, and a running task never falls back to another identity. Codex uses `subprocess.run()` with an argument list, stdin prompt, `--cd <task_dir>`, `--sandbox read-only`, `--skip-git-repo-check`, `--ephemeral`, `--output-schema <schema>`, and `--output-last-message <output>`; shell interpolation is forbidden. The wrapper is executed directly, which is verified on Windows. The deterministic provider returns verifier-only output and has `is_ai=False`.
+
+Codex provider metadata sets `data_leaves_machine=True` for ChatGPT-authenticated runs and exposes the exact command/version. The UI must require per-task acknowledgement before sending private context through that provider. Local Ollama sets `data_leaves_machine=False`.
 
 - [ ] **Step 4: Run provider tests**
 
@@ -660,8 +675,8 @@ git commit -m "feat: create evidence-checked resume drafts"
 ```tsx
 test("shows provider, privacy, and draft-only contract before AI runs", async () => {
   render(<App />);
-  expect(await screen.findByText("Codex deep review")).toBeInTheDocument();
-  expect(screen.getByText("Private data uses your local Codex session")).toBeInTheDocument();
+  expect(await screen.findByText("Codex account 2 (codex2)")).toBeInTheDocument();
+  expect(screen.getByText("Selected task data is sent through your signed-in Codex account")).toBeInTheDocument();
   expect(screen.getByText("Creates suggestions, not final files")).toBeInTheDocument();
 });
 
@@ -693,7 +708,7 @@ Install `lucide-react`. Split the current page without changing its route. On se
 Applications | Application and resume | AI review and approval
 ```
 
-The AI panel contains one provider select, one privacy statement, a compact task-type menu for the five approved tasks, one context-sensitive run command, task status, provenance, and findings. The primary shortcut is `Run AI review` for `analyze_fit`; the menu also exposes `Analyze JD`, `Suggest resume edits`, `Draft cover letter`, and `Review claims`. Use `ShieldCheck`, `Play`, `RefreshCw`, `FileDown`, `Check`, `X`, and `FilePlus2` icons with accessible labels/tooltips. Never show a fake ATS score, generic chat box, or cloud mode. Poll pending/running tasks every 1.5 seconds and stop on completed/blocked/failed.
+The AI panel contains one provider select, one privacy statement, a compact task-type menu for the five approved tasks, one context-sensitive run command, task status, provenance, and findings. `Codex account 2 (codex2)` and `Codex default (codex)` appear as separate choices when both are available; `codex2` is preferred. Selecting a ChatGPT-authenticated Codex provider reveals an acknowledgement that bounded task data is sent to OpenAI, and the run button remains disabled until it is checked. A failed `codex2` task is never silently rerun with `codex`. The primary shortcut is `Run AI review` for `analyze_fit`; the menu also exposes `Analyze JD`, `Suggest resume edits`, `Draft cover letter`, and `Review claims`. Use `ShieldCheck`, `Play`, `RefreshCw`, `FileDown`, `Check`, `X`, and `FilePlus2` icons with accessible labels/tooltips. Never show a fake ATS score, generic chat box, or an unlabelled cloud mode. Poll pending/running tasks every 1.5 seconds and stop on completed/blocked/failed.
 
 The center workspace uses compact `Resume`, `Requirements`, and `Evidence` tabs. Requirements show unknown/uncertain values and save corrections separately. Evidence permits profile fact entry and application evidence linking with explicit verification/privacy controls. A short `History` disclosure lists immutable application and resume versions without introducing another page.
 
@@ -901,7 +916,7 @@ git commit -m "feat: add verified backup and recovery"
 Document:
 
 ```text
-1. Local Codex mode: CAREEROPS_CODEX_ENABLED=true, existing local Codex auth.
+1. Codex mode: `CAREEROPS_CODEX_COMMANDS=codex2,codex`, `codex2` preferred, exact selected identity shown, and bounded task data sent through that signed-in account only after acknowledgement.
 2. Local Ollama mode: endpoint, model, health check, and no cloud transfer.
 3. Verifier-only mode: clearly useful for safety, clearly not AI.
 4. Hosted mode: AI runs only where the configured provider is reachable.
