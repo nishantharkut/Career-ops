@@ -1,6 +1,8 @@
 from pathlib import Path
 import sqlite3
 
+from careerops.core.migrations import run_migrations
+
 
 SCHEMA = """
 PRAGMA foreign_keys = ON;
@@ -113,3 +115,4 @@ def connect_database(path: Path) -> sqlite3.Connection:
 def initialize_database(path: Path) -> None:
     with connect_database(path) as connection:
         connection.executescript(SCHEMA)
+        run_migrations(connection)

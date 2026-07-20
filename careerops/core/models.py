@@ -26,6 +26,8 @@ class Application:
     notes: str
     created_at: str
     updated_at: str
+    role_type: str = ""
+    submitted_at: str | None = None
 
 
 @dataclass(frozen=True)
@@ -89,4 +91,98 @@ class AuditEvent:
     entity_id: str
     before_json: JsonDict
     after_json: JsonDict
+    created_at: str
+
+
+@dataclass(frozen=True)
+class AiProviderConfig:
+    id: str
+    provider_kind: str
+    display_name: str
+    enabled: bool
+    privacy_mode: str
+    endpoint: str
+    model: str
+    created_at: str
+    updated_at: str
+
+
+@dataclass(frozen=True)
+class AiTask:
+    id: str
+    application_id: str
+    task_type: str
+    provider_config_id: str
+    prompt_template_id: str
+    input_artifact_ids: list[str]
+    status: str
+    privacy_mode: str
+    started_at: str | None
+    completed_at: str | None
+    error_summary: str
+    created_at: str
+    updated_at: str
+
+
+@dataclass(frozen=True)
+class AiArtifact:
+    id: str
+    task_id: str
+    artifact_type: str
+    path: Path
+    sha256: str
+    schema_version: str
+    created_at: str
+
+
+@dataclass(frozen=True)
+class AiFinding:
+    id: str
+    task_id: str
+    finding_type: str
+    severity: str
+    claim_text: str
+    evidence_item_id: str | None
+    recommendation: str
+    verifier_state: str
+    decision: str
+    payload: JsonDict
+    created_at: str
+    updated_at: str
+
+
+@dataclass(frozen=True)
+class EvidenceItem:
+    id: str
+    claim_text: str
+    evidence_type: str
+    source_path: Path | None
+    source_url: str | None
+    source_sha256: str | None
+    verification_state: str
+    privacy_level: str
+    notes: str
+    created_at: str
+    updated_at: str
+
+
+@dataclass(frozen=True)
+class ProfileFact:
+    id: str
+    fact_key: str
+    fact_value: str
+    verification_state: str
+    privacy_level: str
+    notes: str
+    created_at: str
+    updated_at: str
+
+
+@dataclass(frozen=True)
+class ApplicationVersion:
+    id: str
+    application_id: str
+    version_number: int
+    event_type: str
+    snapshot: JsonDict
     created_at: str

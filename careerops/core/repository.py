@@ -11,10 +11,17 @@ from uuid import uuid4
 
 from careerops.core.database import connect_database, initialize_database
 from careerops.core.models import (
+    AiArtifact,
+    AiFinding,
+    AiProviderConfig,
+    AiTask,
     Application,
+    ApplicationVersion,
     Approval,
     AuditEvent,
+    EvidenceItem,
     JobDescriptionSnapshot,
+    ProfileFact,
     Report,
     ResumeVersion,
 )
@@ -23,6 +30,16 @@ from careerops.core.status import ApplicationStatus, SubmissionState
 
 SECRET_PATTERNS = (
     re.compile(r"(?i)(password|secret|token|api[_-]?key)\s*[:=]\s*\S+"),
+)
+SECRET_KEY_PATTERN = re.compile(r"(?i)(password|secret|token|api[_-]?key)")
+VERIFICATION_STATES = frozenset(
+    {
+        "verified",
+        "user_stated",
+        "needs_verification",
+        "rejected",
+        "private_do_not_publish",
+    }
 )
 
 
@@ -40,7 +57,10 @@ def sha256_text(value: str) -> str:
 
 def redact(value: Any) -> Any:
     if isinstance(value, dict):
-        return {key: redact(inner) for key, inner in value.items()}
+        return {
+            key: "[REDACTED]" if SECRET_KEY_PATTERN.search(str(key)) else redact(inner)
+            for key, inner in value.items()
+        }
     if isinstance(value, list):
         return [redact(inner) for inner in value]
     if isinstance(value, str):
@@ -58,8 +78,588 @@ class CareerOpsRepository:
 
     def initialize(self) -> None:
         initialize_database(self.database_path)
-        for directory in ("applications", "resumes", "evidence", "reports", "exports"):
+        for directory in (
+            "applications",
+            "resumes",
+            "evidence",
+            "reports",
+            "exports",
+            "ai-tasks",
+            "ai-artifacts",
+            "application-versions",
+        ):
             (self.vault_path / directory).mkdir(parents=True, exist_ok=True)
+
+    def upsert_ai_provider(
+        self,
+        *,
+        provider_kind: str,
+        display_name: str,
+        privacy_mode: str,
+        endpoint: str,
+        model: str,
+        enabled: bool,
+    ) -> AiProviderConfig:
+        provider_id = new_id("aip")
+        now = utc_now()
+        with self.connection() as connection:
+            connection.execute(
+                """
+                INSERT INTO ai_provider_configs (
+                    id, provider_kind, display_name, enabled, privacy_mode, endpoint,
+                    model, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(provider_kind, endpoint, model) DO UPDATE SET
+                    display_name = excluded.display_name,
+                    enabled = excluded.enabled,
+                    privacy_mode = excluded.privacy_mode,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    provider_id,
+                    provider_kind,
+                    display_name,
+                    int(enabled),
+                    privacy_mode,
+                    endpoint,
+                    model,
+                    now,
+                    now,
+                ),
+            )
+            row = connection.execute(
+                """
+                SELECT * FROM ai_provider_configs
+                WHERE provider_kind = ? AND endpoint = ? AND model = ?
+                """,
+                (provider_kind, endpoint, model),
+            ).fetchone()
+        if row is None:
+            raise RuntimeError("AI provider upsert did not return a row")
+        return self._ai_provider_from_row(row)
+
+    def upsert_ai_provider_config(self, **values: Any) -> AiProviderConfig:
+        return self.upsert_ai_provider(**values)
+
+    def get_ai_provider(self, provider_config_id: str) -> AiProviderConfig:
+        row = self._one("SELECT * FROM ai_provider_configs WHERE id = ?", (provider_config_id,))
+        return self._ai_provider_from_row(row)
+
+    def get_ai_provider_config(self, provider_config_id: str) -> AiProviderConfig:
+        return self.get_ai_provider(provider_config_id)
+
+    def list_ai_providers(self) -> list[AiProviderConfig]:
+        with self.connection() as connection:
+            rows = connection.execute(
+                "SELECT * FROM ai_provider_configs ORDER BY created_at ASC, id ASC"
+            ).fetchall()
+        return [self._ai_provider_from_row(row) for row in rows]
+
+    def list_ai_provider_configs(self) -> list[AiProviderConfig]:
+        return self.list_ai_providers()
+
+    def create_ai_task(
+        self,
+        *,
+        application_id: str,
+        task_type: str,
+        provider_config_id: str,
+        prompt_template_id: str,
+        input_artifact_ids: list[str],
+        privacy_mode: str,
+    ) -> AiTask:
+        task_id = new_id("ait")
+        now = utc_now()
+        with self.connection() as connection:
+            connection.execute(
+                """
+                INSERT INTO ai_tasks (
+                    id, application_id, task_type, provider_config_id,
+                    prompt_template_id, input_artifact_ids_json, status, privacy_mode,
+                    started_at, completed_at, error_summary, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    task_id,
+                    application_id,
+                    task_type,
+                    provider_config_id,
+                    prompt_template_id,
+                    json.dumps(input_artifact_ids),
+                    "pending",
+                    privacy_mode,
+                    None,
+                    None,
+                    "",
+                    now,
+                    now,
+                ),
+            )
+        return self.get_ai_task(task_id)
+
+    def get_ai_task(self, task_id: str) -> AiTask:
+        row = self._one("SELECT * FROM ai_tasks WHERE id = ?", (task_id,))
+        return self._ai_task_from_row(row)
+
+    def list_ai_tasks(
+        self,
+        application_id: str | None = None,
+        *,
+        status: str | None = None,
+    ) -> list[AiTask]:
+        clauses: list[str] = []
+        parameters: list[Any] = []
+        if application_id is not None:
+            clauses.append("application_id = ?")
+            parameters.append(application_id)
+        if status is not None:
+            clauses.append("status = ?")
+            parameters.append(status)
+        where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+        with self.connection() as connection:
+            rows = connection.execute(
+                f"SELECT * FROM ai_tasks{where} ORDER BY created_at ASC, id ASC",
+                tuple(parameters),
+            ).fetchall()
+        return [self._ai_task_from_row(row) for row in rows]
+
+    def claim_ai_task(self, task_id: str) -> bool:
+        now = utc_now()
+        with self.connection() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE ai_tasks
+                SET status = 'running', started_at = ?, completed_at = NULL,
+                    error_summary = '', updated_at = ?
+                WHERE id = ? AND status = 'pending'
+                """,
+                (now, now, task_id),
+            )
+        return cursor.rowcount == 1
+
+    def start_ai_task(self, task_id: str) -> AiTask:
+        if not self.claim_ai_task(task_id):
+            raise ValueError("AI task is not pending")
+        return self.get_ai_task(task_id)
+
+    def complete_ai_task(self, task_id: str) -> AiTask:
+        before = self.get_ai_task(task_id)
+        now = utc_now()
+        with self.connection() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE ai_tasks
+                SET status = 'completed', completed_at = ?, error_summary = '', updated_at = ?
+                WHERE id = ? AND status = 'running'
+                """,
+                (now, now, task_id),
+            )
+            if cursor.rowcount != 1:
+                raise ValueError("AI task is not running")
+            self._write_audit(
+                connection,
+                "ai_task.completed",
+                "ai_task",
+                task_id,
+                before.__dict__,
+                {"status": "completed", "completed_at": now},
+            )
+        return self.get_ai_task(task_id)
+
+    def fail_ai_task(self, task_id: str, error_summary: str) -> AiTask:
+        before = self.get_ai_task(task_id)
+        now = utc_now()
+        safe_error = str(redact(error_summary))
+        with self.connection() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE ai_tasks
+                SET status = 'failed', completed_at = ?, error_summary = ?, updated_at = ?
+                WHERE id = ? AND status = 'running'
+                """,
+                (now, safe_error, now, task_id),
+            )
+            if cursor.rowcount != 1:
+                raise ValueError("AI task is not running")
+            self._write_audit(
+                connection,
+                "ai_task.failed",
+                "ai_task",
+                task_id,
+                before.__dict__,
+                {"status": "failed", "completed_at": now, "error_summary": safe_error},
+            )
+        return self.get_ai_task(task_id)
+
+    def requeue_interrupted_ai_tasks(self) -> int:
+        now = utc_now()
+        with self.connection() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE ai_tasks
+                SET status = 'pending', started_at = NULL, completed_at = NULL,
+                    error_summary = '', updated_at = ?
+                WHERE status = 'running'
+                """,
+                (now,),
+            )
+        return cursor.rowcount
+
+    def save_ai_artifact(
+        self,
+        task_id: str,
+        artifact_type: str,
+        path: Path,
+        sha256: str,
+        schema_version: str,
+    ) -> AiArtifact:
+        artifact_id = new_id("aia")
+        now = utc_now()
+        with self.connection() as connection:
+            connection.execute(
+                """
+                INSERT INTO ai_artifacts (
+                    id, task_id, artifact_type, path, sha256, schema_version, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    artifact_id,
+                    task_id,
+                    artifact_type,
+                    str(path),
+                    sha256,
+                    schema_version,
+                    now,
+                ),
+            )
+        return self.get_ai_artifact(artifact_id)
+
+    def get_ai_artifact(self, artifact_id: str) -> AiArtifact:
+        row = self._one("SELECT * FROM ai_artifacts WHERE id = ?", (artifact_id,))
+        return self._ai_artifact_from_row(row)
+
+    def list_ai_artifacts(self, task_id: str) -> list[AiArtifact]:
+        with self.connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM ai_artifacts
+                WHERE task_id = ?
+                ORDER BY created_at ASC, id ASC
+                """,
+                (task_id,),
+            ).fetchall()
+        return [self._ai_artifact_from_row(row) for row in rows]
+
+    def save_ai_finding(
+        self,
+        *,
+        task_id: str,
+        finding_type: str,
+        severity: str,
+        claim_text: str,
+        evidence_item_id: str | None,
+        recommendation: str,
+        verifier_state: str,
+        decision: str = "pending",
+        payload: dict[str, Any] | None = None,
+    ) -> AiFinding:
+        finding_id = new_id("aif")
+        now = utc_now()
+        with self.connection() as connection:
+            connection.execute(
+                """
+                INSERT INTO ai_findings (
+                    id, task_id, finding_type, severity, claim_text, evidence_item_id,
+                    recommendation, verifier_state, decision, payload_json,
+                    created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    finding_id,
+                    task_id,
+                    finding_type,
+                    severity,
+                    claim_text,
+                    evidence_item_id,
+                    recommendation,
+                    verifier_state,
+                    decision,
+                    json.dumps(payload or {}),
+                    now,
+                    now,
+                ),
+            )
+        return self.get_ai_finding(finding_id)
+
+    def get_ai_finding(self, finding_id: str) -> AiFinding:
+        row = self._one("SELECT * FROM ai_findings WHERE id = ?", (finding_id,))
+        return self._ai_finding_from_row(row)
+
+    def list_ai_findings(self, task_id: str) -> list[AiFinding]:
+        with self.connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM ai_findings
+                WHERE task_id = ?
+                ORDER BY created_at ASC, id ASC
+                """,
+                (task_id,),
+            ).fetchall()
+        return [self._ai_finding_from_row(row) for row in rows]
+
+    def update_ai_finding_decision(self, finding_id: str, decision: str) -> AiFinding:
+        before = self.get_ai_finding(finding_id)
+        now = utc_now()
+        with self.connection() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE ai_findings
+                SET decision = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (decision, now, finding_id),
+            )
+            if cursor.rowcount != 1:
+                raise KeyError(f"No AI finding: {finding_id}")
+            self._write_audit(
+                connection,
+                "ai_finding.decision_updated",
+                "ai_finding",
+                finding_id,
+                before.__dict__,
+                {"decision": decision},
+            )
+        return self.get_ai_finding(finding_id)
+
+    def create_profile_fact(
+        self,
+        *,
+        fact_key: str,
+        fact_value: str,
+        verification_state: str,
+        privacy_level: str,
+        notes: str = "",
+    ) -> ProfileFact:
+        self._validate_verification_state(verification_state)
+        fact_id = new_id("fact")
+        now = utc_now()
+        with self.connection() as connection:
+            connection.execute(
+                """
+                INSERT INTO profile_facts (
+                    id, fact_key, fact_value, verification_state, privacy_level,
+                    notes, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    fact_id,
+                    fact_key,
+                    fact_value,
+                    verification_state,
+                    privacy_level,
+                    notes,
+                    now,
+                    now,
+                ),
+            )
+            self._write_audit(
+                connection,
+                "profile_fact.created",
+                "profile_fact",
+                fact_id,
+                None,
+                {
+                    "fact_key": fact_key,
+                    "fact_value": fact_value,
+                    "verification_state": verification_state,
+                    "privacy_level": privacy_level,
+                    "notes": notes,
+                },
+            )
+        return self.get_profile_fact(fact_id)
+
+    def get_profile_fact(self, fact_id: str) -> ProfileFact:
+        row = self._one("SELECT * FROM profile_facts WHERE id = ?", (fact_id,))
+        return self._profile_fact_from_row(row)
+
+    def list_profile_facts(self) -> list[ProfileFact]:
+        with self.connection() as connection:
+            rows = connection.execute(
+                "SELECT * FROM profile_facts ORDER BY created_at ASC, id ASC"
+            ).fetchall()
+        return [self._profile_fact_from_row(row) for row in rows]
+
+    def create_evidence_item(
+        self,
+        *,
+        claim_text: str,
+        evidence_type: str,
+        verification_state: str,
+        privacy_level: str,
+        source_path: Path | None = None,
+        source_url: str | None = None,
+        source_sha256: str | None = None,
+        notes: str = "",
+    ) -> EvidenceItem:
+        self._validate_verification_state(verification_state)
+        evidence_id = new_id("evd")
+        now = utc_now()
+        with self.connection() as connection:
+            connection.execute(
+                """
+                INSERT INTO evidence_items (
+                    id, claim_text, evidence_type, source_path, source_url,
+                    source_sha256, verification_state, privacy_level, notes,
+                    created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    evidence_id,
+                    claim_text,
+                    evidence_type,
+                    str(source_path) if source_path else None,
+                    source_url,
+                    source_sha256,
+                    verification_state,
+                    privacy_level,
+                    notes,
+                    now,
+                    now,
+                ),
+            )
+            self._write_audit(
+                connection,
+                "evidence_item.created",
+                "evidence_item",
+                evidence_id,
+                None,
+                {
+                    "claim_text": claim_text,
+                    "evidence_type": evidence_type,
+                    "source_path": str(source_path) if source_path else None,
+                    "source_url": source_url,
+                    "source_sha256": source_sha256,
+                    "verification_state": verification_state,
+                    "privacy_level": privacy_level,
+                    "notes": notes,
+                },
+            )
+        return self.get_evidence_item(evidence_id)
+
+    def get_evidence_item(self, evidence_item_id: str) -> EvidenceItem:
+        row = self._one("SELECT * FROM evidence_items WHERE id = ?", (evidence_item_id,))
+        return self._evidence_item_from_row(row)
+
+    def list_evidence_items(self) -> list[EvidenceItem]:
+        with self.connection() as connection:
+            rows = connection.execute(
+                "SELECT * FROM evidence_items ORDER BY created_at ASC, id ASC"
+            ).fetchall()
+        return [self._evidence_item_from_row(row) for row in rows]
+
+    def link_application_evidence(
+        self, application_id: str, evidence_item_id: str
+    ) -> EvidenceItem:
+        now = utc_now()
+        with self.connection() as connection:
+            cursor = connection.execute(
+                """
+                INSERT OR IGNORE INTO application_evidence_links (
+                    application_id, evidence_item_id, created_at
+                ) VALUES (?, ?, ?)
+                """,
+                (application_id, evidence_item_id, now),
+            )
+            if cursor.rowcount == 1:
+                self._write_audit(
+                    connection,
+                    "application.evidence_linked",
+                    "application",
+                    application_id,
+                    None,
+                    {"evidence_item_id": evidence_item_id},
+                )
+        return self.get_evidence_item(evidence_item_id)
+
+    def list_application_evidence(self, application_id: str) -> list[EvidenceItem]:
+        with self.connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT evidence_items.*
+                FROM application_evidence_links
+                JOIN evidence_items
+                  ON evidence_items.id = application_evidence_links.evidence_item_id
+                WHERE application_evidence_links.application_id = ?
+                ORDER BY application_evidence_links.created_at ASC, evidence_items.id ASC
+                """,
+                (application_id,),
+            ).fetchall()
+        return [self._evidence_item_from_row(row) for row in rows]
+
+    def record_application_version(
+        self,
+        application_id: str,
+        event_type: str,
+        snapshot: dict[str, Any],
+    ) -> ApplicationVersion:
+        version_id = new_id("appv")
+        now = utc_now()
+        with self.connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                """
+                SELECT COALESCE(MAX(version_number), 0) + 1
+                FROM application_versions
+                WHERE application_id = ?
+                """,
+                (application_id,),
+            ).fetchone()
+            version_number = row[0]
+            connection.execute(
+                """
+                INSERT INTO application_versions (
+                    id, application_id, version_number, event_type, snapshot_json, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    version_id,
+                    application_id,
+                    version_number,
+                    event_type,
+                    json.dumps(snapshot),
+                    now,
+                ),
+            )
+            self._write_audit(
+                connection,
+                "application.version_recorded",
+                "application",
+                application_id,
+                None,
+                {
+                    "application_version_id": version_id,
+                    "version_number": version_number,
+                    "event_type": event_type,
+                    "snapshot": snapshot,
+                },
+            )
+        return self.get_application_version(version_id)
+
+    def get_application_version(self, version_id: str) -> ApplicationVersion:
+        row = self._one("SELECT * FROM application_versions WHERE id = ?", (version_id,))
+        return self._application_version_from_row(row)
+
+    def list_application_versions(self, application_id: str) -> list[ApplicationVersion]:
+        with self.connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM application_versions
+                WHERE application_id = ?
+                ORDER BY version_number ASC
+                """,
+                (application_id,),
+            ).fetchall()
+        return [self._application_version_from_row(row) for row in rows]
 
     def create_application(
         self,
@@ -69,6 +669,7 @@ class CareerOpsRepository:
         location: str,
         source_url: str,
         jd_text: str,
+        role_type: str = "",
         deadline: str | None = None,
         notes: str = "",
     ) -> Application:
@@ -107,8 +708,8 @@ class CareerOpsRepository:
                     id, company, role_title, location, source_url, source_kind,
                     jd_snapshot_id, status, selected_resume_version_id,
                     latest_report_id, approval_id, submission_state, deadline,
-                    notes, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    notes, created_at, updated_at, role_type, submitted_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     application_id,
@@ -127,6 +728,8 @@ class CareerOpsRepository:
                     notes,
                     now,
                     now,
+                    role_type,
+                    None,
                 ),
             )
             self._write_audit(
@@ -384,13 +987,14 @@ class CareerOpsRepository:
             connection.execute(
                 """
                 UPDATE applications
-                SET status = ?, submission_state = ?, notes = ?, updated_at = ?
+                SET status = ?, submission_state = ?, notes = ?, submitted_at = ?, updated_at = ?
                 WHERE id = ?
                 """,
                 (
                     ApplicationStatus.SUBMITTED_MANUAL.value,
                     SubmissionState.SUBMITTED_MANUAL.value,
                     note,
+                    now,
                     now,
                     application_id,
                 ),
@@ -532,6 +1136,8 @@ class CareerOpsRepository:
             notes=row["notes"],
             created_at=row["created_at"],
             updated_at=row["updated_at"],
+            role_type=row["role_type"],
+            submitted_at=row["submitted_at"],
         )
 
     def _resume_from_row(self, row: sqlite3.Row) -> ResumeVersion:
@@ -550,3 +1156,102 @@ class CareerOpsRepository:
             created_at=row["created_at"],
             updated_at=row["updated_at"],
         )
+
+    def _ai_provider_from_row(self, row: sqlite3.Row) -> AiProviderConfig:
+        return AiProviderConfig(
+            id=row["id"],
+            provider_kind=row["provider_kind"],
+            display_name=row["display_name"],
+            enabled=bool(row["enabled"]),
+            privacy_mode=row["privacy_mode"],
+            endpoint=row["endpoint"],
+            model=row["model"],
+            created_at=row["created_at"],
+            updated_at=row["updated_at"],
+        )
+
+    def _ai_task_from_row(self, row: sqlite3.Row) -> AiTask:
+        return AiTask(
+            id=row["id"],
+            application_id=row["application_id"],
+            task_type=row["task_type"],
+            provider_config_id=row["provider_config_id"],
+            prompt_template_id=row["prompt_template_id"],
+            input_artifact_ids=json.loads(row["input_artifact_ids_json"]),
+            status=row["status"],
+            privacy_mode=row["privacy_mode"],
+            started_at=row["started_at"],
+            completed_at=row["completed_at"],
+            error_summary=row["error_summary"],
+            created_at=row["created_at"],
+            updated_at=row["updated_at"],
+        )
+
+    def _ai_artifact_from_row(self, row: sqlite3.Row) -> AiArtifact:
+        return AiArtifact(
+            id=row["id"],
+            task_id=row["task_id"],
+            artifact_type=row["artifact_type"],
+            path=Path(row["path"]),
+            sha256=row["sha256"],
+            schema_version=row["schema_version"],
+            created_at=row["created_at"],
+        )
+
+    def _ai_finding_from_row(self, row: sqlite3.Row) -> AiFinding:
+        return AiFinding(
+            id=row["id"],
+            task_id=row["task_id"],
+            finding_type=row["finding_type"],
+            severity=row["severity"],
+            claim_text=row["claim_text"],
+            evidence_item_id=row["evidence_item_id"],
+            recommendation=row["recommendation"],
+            verifier_state=row["verifier_state"],
+            decision=row["decision"],
+            payload=json.loads(row["payload_json"]),
+            created_at=row["created_at"],
+            updated_at=row["updated_at"],
+        )
+
+    def _profile_fact_from_row(self, row: sqlite3.Row) -> ProfileFact:
+        return ProfileFact(
+            id=row["id"],
+            fact_key=row["fact_key"],
+            fact_value=row["fact_value"],
+            verification_state=row["verification_state"],
+            privacy_level=row["privacy_level"],
+            notes=row["notes"],
+            created_at=row["created_at"],
+            updated_at=row["updated_at"],
+        )
+
+    def _evidence_item_from_row(self, row: sqlite3.Row) -> EvidenceItem:
+        return EvidenceItem(
+            id=row["id"],
+            claim_text=row["claim_text"],
+            evidence_type=row["evidence_type"],
+            source_path=Path(row["source_path"]) if row["source_path"] else None,
+            source_url=row["source_url"],
+            source_sha256=row["source_sha256"],
+            verification_state=row["verification_state"],
+            privacy_level=row["privacy_level"],
+            notes=row["notes"],
+            created_at=row["created_at"],
+            updated_at=row["updated_at"],
+        )
+
+    def _application_version_from_row(self, row: sqlite3.Row) -> ApplicationVersion:
+        return ApplicationVersion(
+            id=row["id"],
+            application_id=row["application_id"],
+            version_number=row["version_number"],
+            event_type=row["event_type"],
+            snapshot=json.loads(row["snapshot_json"]),
+            created_at=row["created_at"],
+        )
+
+    def _validate_verification_state(self, verification_state: str) -> None:
+        if verification_state not in VERIFICATION_STATES:
+            allowed = ", ".join(sorted(VERIFICATION_STATES))
+            raise ValueError(f"Invalid verification state; expected one of: {allowed}")
