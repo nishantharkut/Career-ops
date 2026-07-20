@@ -2,13 +2,14 @@ from __future__ import annotations
 
 from collections.abc import Iterator
 from contextlib import contextmanager
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 import hashlib
 import json
 from pathlib import Path
 import re
 import secrets
 import sqlite3
+from threading import Lock
 from typing import Any
 from uuid import uuid4
 
@@ -64,10 +65,19 @@ PROVIDER_ERROR_CATEGORIES = frozenset(
     }
 )
 SHA256_PATTERN = re.compile(r"[0-9a-fA-F]{64}\Z")
+UTC_NOW_LOCK = Lock()
+LAST_UTC_NOW: datetime | None = None
 
 
 def utc_now() -> str:
-    return datetime.now(UTC).isoformat(timespec="seconds")
+    global LAST_UTC_NOW
+
+    now = datetime.now(UTC)
+    with UTC_NOW_LOCK:
+        if LAST_UTC_NOW is not None and now <= LAST_UTC_NOW:
+            now = LAST_UTC_NOW + timedelta(microseconds=1)
+        LAST_UTC_NOW = now
+    return now.isoformat(timespec="microseconds")
 
 
 def new_id(prefix: str) -> str:
@@ -80,18 +90,26 @@ def sha256_text(value: str) -> str:
 
 def redact(value: Any) -> Any:
     if isinstance(value, dict):
-        return {
-            key: "[REDACTED]" if SECRET_KEY_PATTERN.search(str(key)) else redact(inner)
-            for key, inner in value.items()
-        }
-    if isinstance(value, list):
+        normalized: dict[str, Any] = {}
+        for key, inner in value.items():
+            if not isinstance(key, str):
+                raise TypeError(f"Unsupported audit key type: {type(key).__name__}")
+            normalized[key] = (
+                "[REDACTED]" if SECRET_KEY_PATTERN.search(key) else redact(inner)
+            )
+        return normalized
+    if isinstance(value, (list, tuple)):
         return [redact(inner) for inner in value]
     if isinstance(value, str):
         redacted = value
         for pattern, replacement in SECRET_PATTERNS:
             redacted = pattern.sub(replacement, redacted)
         return redacted
-    return value
+    if isinstance(value, Path):
+        return redact(str(value))
+    if value is None or isinstance(value, (bool, int, float)):
+        return value
+    raise TypeError(f"Unsupported audit value type: {type(value).__name__}")
 
 
 def provider_error_category(value: str) -> str:
@@ -212,7 +230,12 @@ class CareerOpsRepository:
             if input_artifact_ids:
                 placeholders = ", ".join("?" for _ in input_artifact_ids)
                 rows = connection.execute(
-                    f"SELECT id FROM ai_artifacts WHERE id IN ({placeholders})",
+                    f"""
+                    SELECT artifact.id, owner.application_id
+                    FROM ai_artifacts AS artifact
+                    JOIN ai_tasks AS owner ON owner.id = artifact.task_id
+                    WHERE artifact.id IN ({placeholders})
+                    """,
                     tuple(input_artifact_ids),
                 ).fetchall()
                 found_ids = {row["id"] for row in rows}
@@ -224,6 +247,15 @@ class CareerOpsRepository:
                 if missing_ids:
                     raise ValueError(
                         f"Unknown input artifact IDs: {', '.join(missing_ids)}"
+                    )
+                foreign_ids = [
+                    row["id"]
+                    for row in rows
+                    if row["application_id"] != application_id
+                ]
+                if foreign_ids:
+                    raise ValueError(
+                        "Input artifacts must belong to the same application"
                     )
             connection.execute(
                 """
@@ -249,6 +281,15 @@ class CareerOpsRepository:
                     now,
                 ),
             )
+            for artifact_id in dict.fromkeys(input_artifact_ids):
+                connection.execute(
+                    """
+                    INSERT INTO ai_task_input_artifacts (
+                        task_id, artifact_id, created_at
+                    ) VALUES (?, ?, ?)
+                    """,
+                    (task_id, artifact_id, now),
+                )
         return self.get_ai_task(task_id)
 
     def get_ai_task(self, task_id: str) -> AiTask:
@@ -366,6 +407,7 @@ class CareerOpsRepository:
     def save_ai_artifact(
         self,
         task_id: str,
+        claim_token: str,
         artifact_type: str,
         path: Path,
         sha256: str,
@@ -393,15 +435,19 @@ class CareerOpsRepository:
         artifact_id = new_id("aia")
         now = utc_now()
         with self.connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            self._require_active_ai_claim(connection, task_id, claim_token)
             connection.execute(
                 """
                 INSERT INTO ai_artifacts (
-                    id, task_id, artifact_type, path, sha256, schema_version, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    id, task_id, claim_token, artifact_type, path, sha256,
+                    schema_version, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     artifact_id,
                     task_id,
+                    claim_token,
                     artifact_type,
                     str(artifact_path),
                     normalized_sha256,
@@ -431,6 +477,7 @@ class CareerOpsRepository:
         self,
         *,
         task_id: str,
+        claim_token: str,
         finding_type: str,
         severity: str,
         claim_text: str,
@@ -448,17 +495,20 @@ class CareerOpsRepository:
         finding_id = new_id("aif")
         now = utc_now()
         with self.connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            self._require_active_ai_claim(connection, task_id, claim_token)
             connection.execute(
                 """
                 INSERT INTO ai_findings (
-                    id, task_id, finding_type, severity, claim_text, evidence_item_id,
-                    recommendation, verifier_state, decision, payload_json,
-                    created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    id, task_id, claim_token, finding_type, severity, claim_text,
+                    evidence_item_id, recommendation, verifier_state, decision,
+                    payload_json, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     finding_id,
                     task_id,
+                    claim_token,
                     finding_type,
                     severity,
                     claim_text,
@@ -502,9 +552,25 @@ class CareerOpsRepository:
         )
         if decision == FindingDecision.PENDING.value:
             raise ValueError("Invalid decision transition to pending")
-        before = self.get_ai_finding(finding_id)
-        now = utc_now()
+        if expected_decision != FindingDecision.PENDING.value:
+            raise ValueError("Invalid decision transition from a terminal decision")
         with self.connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            before_row = connection.execute(
+                "SELECT * FROM ai_findings WHERE id = ?", (finding_id,)
+            ).fetchone()
+            if before_row is None:
+                raise KeyError(f"No AI finding: {finding_id}")
+            before = self._ai_finding_from_row(before_row)
+            if before.decision != expected_decision:
+                raise ValueError("AI finding decision no longer matches expected decision")
+            if (
+                decision == FindingDecision.ACCEPTED.value
+                and before.verifier_state != VerifierState.VERIFIED
+            ):
+                raise ValueError("AI finding verifier state does not permit acceptance")
+
+            now = utc_now()
             cursor = connection.execute(
                 """
                 UPDATE ai_findings
@@ -515,15 +581,21 @@ class CareerOpsRepository:
             )
             if cursor.rowcount != 1:
                 raise ValueError("AI finding decision no longer matches expected decision")
+            after_row = connection.execute(
+                "SELECT * FROM ai_findings WHERE id = ?", (finding_id,)
+            ).fetchone()
+            if after_row is None:
+                raise RuntimeError("AI finding disappeared during decision update")
+            after = self._ai_finding_from_row(after_row)
             self._write_audit(
                 connection,
                 "ai_finding.decision_updated",
                 "ai_finding",
                 finding_id,
                 before.__dict__,
-                {"decision": decision},
+                after.__dict__,
             )
-        return self.get_ai_finding(finding_id)
+        return after
 
     def create_profile_fact(
         self,
@@ -1168,7 +1240,9 @@ class CareerOpsRepository:
 
     def list_audit_events(self) -> list[AuditEvent]:
         with self.connection() as connection:
-            rows = connection.execute("SELECT * FROM audit_events ORDER BY created_at ASC, id ASC").fetchall()
+            rows = connection.execute(
+                "SELECT * FROM audit_events ORDER BY rowid ASC"
+            ).fetchall()
         return [
             AuditEvent(
                 id=row["id"],
@@ -1194,6 +1268,22 @@ class CareerOpsRepository:
             raise KeyError(f"No row for query: {query}")
         return row
 
+    def _require_active_ai_claim(
+        self,
+        connection: sqlite3.Connection,
+        task_id: str,
+        claim_token: str,
+    ) -> None:
+        row = connection.execute(
+            """
+            SELECT 1 FROM ai_tasks
+            WHERE id = ? AND status = 'running' AND claim_token = ?
+            """,
+            (task_id, claim_token),
+        ).fetchone()
+        if row is None:
+            raise ValueError("AI task claim is not active")
+
     def _write_audit(
         self,
         connection: sqlite3.Connection,
@@ -1214,8 +1304,8 @@ class CareerOpsRepository:
                 event_type,
                 entity_type,
                 entity_id,
-                json.dumps(redact(before or {}), default=str),
-                json.dumps(redact(after or {}), default=str),
+                json.dumps(redact(before or {})),
+                json.dumps(redact(after or {})),
                 utc_now(),
             ),
         )
@@ -1293,6 +1383,7 @@ class CareerOpsRepository:
         return AiArtifact(
             id=row["id"],
             task_id=row["task_id"],
+            claim_token=row["claim_token"],
             artifact_type=row["artifact_type"],
             path=Path(row["path"]),
             sha256=row["sha256"],
@@ -1304,6 +1395,7 @@ class CareerOpsRepository:
         return AiFinding(
             id=row["id"],
             task_id=row["task_id"],
+            claim_token=row["claim_token"],
             finding_type=row["finding_type"],
             severity=FindingSeverity(row["severity"]),
             claim_text=row["claim_text"],

@@ -139,6 +139,7 @@ class AiTask:
 class AiArtifact:
     id: str
     task_id: str
+    claim_token: str | None
     artifact_type: str
     path: Path
     sha256: str
@@ -150,6 +151,7 @@ class AiArtifact:
 class AiFinding:
     id: str
     task_id: str
+    claim_token: str | None
     finding_type: str
     severity: FindingSeverity
     claim_text: str

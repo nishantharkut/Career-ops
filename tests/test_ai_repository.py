@@ -57,6 +57,12 @@ def create_task(
     )
 
 
+def claim_task(repo: CareerOpsRepository, task_id: str) -> str:
+    claim_token = repo.claim_ai_task(task_id)
+    assert isinstance(claim_token, str)
+    return claim_token
+
+
 def test_database_contexts_commit_or_rollback_and_always_close(tmp_path: Path):
     database_path = tmp_path / "careerops.db"
     with warnings.catch_warnings(record=True) as captured:
@@ -108,10 +114,12 @@ def test_ai_task_is_persisted_pending_before_execution(tmp_path: Path):
     provider = create_provider(repo)
 
     source_task = create_task(repo, application.id, provider.id)
+    source_claim = claim_task(repo, source_task.id)
     input_path = repo.vault_path / "ai-artifacts" / "input.json"
     input_path.write_bytes(b"{}")
     artifact = repo.save_ai_artifact(
         source_task.id,
+        source_claim,
         "context",
         input_path,
         hashlib.sha256(b"{}").hexdigest(),
@@ -211,18 +219,98 @@ def test_audit_and_error_persistence_redact_adversarial_secret_formats(tmp_path:
         assert secret not in persisted_audits
 
 
+def test_audit_redaction_recurses_tuples_and_rejects_unsupported_containers(
+    tmp_path: Path,
+):
+    repo = make_repo(tmp_path)
+    with repo.connection() as connection:
+        repo._write_audit(
+            connection,
+            "redaction.tested",
+            "test",
+            "nested",
+            {
+                "items": (
+                    {"api_key": "before-tuple-secret"},
+                    ("Authorization: Bearer before-bearer-secret",),
+                )
+            },
+            {
+                "nested": [
+                    ({"password": "after-tuple-secret"},),
+                    {"headers": ("Bearer after-bearer-secret",)},
+                ]
+            },
+        )
+
+    event = next(
+        item for item in repo.list_audit_events() if item.event_type == "redaction.tested"
+    )
+    serialized = str((event.before_json, event.after_json))
+    for secret in (
+        "before-tuple-secret",
+        "before-bearer-secret",
+        "after-tuple-secret",
+        "after-bearer-secret",
+    ):
+        assert secret not in serialized
+    assert isinstance(event.before_json["items"], list)
+    assert isinstance(event.after_json["nested"][0], list)
+
+    with pytest.raises(TypeError, match="Unsupported audit value"):
+        with repo.connection() as connection:
+            repo._write_audit(
+                connection,
+                "redaction.rejected",
+                "test",
+                "unsupported",
+                None,
+                {"unsupported": {"token=must-not-stringify"}},
+            )
+
+
+def test_rapid_audit_events_return_in_causal_microsecond_order(tmp_path: Path):
+    repo = make_repo(tmp_path)
+    expected_entity_ids = [f"ordered-{index}" for index in range(20)]
+    with repo.connection() as connection:
+        for entity_id in expected_entity_ids:
+            repo._write_audit(
+                connection,
+                "ordering.tested",
+                "test",
+                entity_id,
+                None,
+                {"entity_id": entity_id},
+            )
+
+    events = [
+        event
+        for event in repo.list_audit_events()
+        if event.event_type == "ordering.tested"
+    ]
+    timestamps = [event.created_at for event in events]
+    assert [event.entity_id for event in events] == expected_entity_ids
+    assert timestamps == sorted(timestamps)
+    assert len(set(timestamps)) == len(timestamps)
+    assert all(
+        len(timestamp.rsplit(".", 1)[-1].split("+", 1)[0]) == 6
+        for timestamp in timestamps
+    )
+
+
 def test_interrupted_tasks_requeue_without_losing_artifacts(tmp_path: Path):
     repo = make_repo(tmp_path)
     application = create_application(repo)
     provider = create_provider(repo)
     task = create_task(repo, application.id, provider.id)
-    repo.start_ai_task(task.id)
+    claim_token = repo.start_ai_task(task.id)
     context_path = tmp_path / "vault" / "ai-tasks" / task.id / "context.json"
     context_path.parent.mkdir(parents=True, exist_ok=True)
     context_path.write_bytes(b"context")
 
     artifact = repo.save_ai_artifact(
         task.id,
+        claim_token,
         "context",
         context_path,
         hashlib.sha256(b"context").hexdigest(),
@@ -241,6 +329,7 @@ def test_ai_artifacts_require_contained_existing_checksum_matched_files(tmp_path
     application = create_application(repo)
     provider = create_provider(repo)
     task = create_task(repo, application.id, provider.id)
+    claim_token = claim_task(repo, task.id)
     valid_path = repo.vault_path / "ai-artifacts" / "valid.json"
     valid_path.write_bytes(b'{"valid": true}')
     valid_sha = hashlib.sha256(valid_path.read_bytes()).hexdigest()
@@ -250,6 +339,7 @@ def test_ai_artifacts_require_contained_existing_checksum_matched_files(tmp_path
     with pytest.raises(ValueError, match="vault"):
         repo.save_ai_artifact(
             task.id,
+            claim_token,
             "context",
             escaped_path,
             hashlib.sha256(b"escaped").hexdigest(),
@@ -258,17 +348,24 @@ def test_ai_artifacts_require_contained_existing_checksum_matched_files(tmp_path
     with pytest.raises(FileNotFoundError):
         repo.save_ai_artifact(
             task.id,
+            claim_token,
             "context",
             repo.vault_path / "ai-artifacts" / "missing.json",
             valid_sha,
             "1",
         )
     with pytest.raises(ValueError, match="SHA-256"):
-        repo.save_ai_artifact(task.id, "context", valid_path, "not-a-checksum", "1")
+        repo.save_ai_artifact(
+            task.id, claim_token, "context", valid_path, "not-a-checksum", "1"
+        )
     with pytest.raises(ValueError, match="checksum"):
-        repo.save_ai_artifact(task.id, "context", valid_path, "0" * 64, "1")
+        repo.save_ai_artifact(
+            task.id, claim_token, "context", valid_path, "0" * 64, "1"
+        )
 
-    artifact = repo.save_ai_artifact(task.id, "context", valid_path, valid_sha, "1")
+    artifact = repo.save_ai_artifact(
+        task.id, claim_token, "context", valid_path, valid_sha, "1"
+    )
     assert artifact.path == valid_path.resolve()
 
 
@@ -279,6 +376,50 @@ def test_ai_tasks_reject_unknown_input_artifact_ids(tmp_path: Path):
 
     with pytest.raises(ValueError, match="artifact"):
         create_task(repo, application.id, provider.id, ["artifact_missing"])
+
+
+def test_ai_task_inputs_must_belong_to_same_application_and_are_normalized(
+    tmp_path: Path,
+):
+    repo = make_repo(tmp_path)
+    first_application = create_application(repo)
+    second_application = repo.create_application(
+        company="Other Corp",
+        role_title="Data Intern",
+        location="Remote",
+        source_url="https://example.com/jobs/2",
+        jd_text="Analyze data.",
+    )
+    provider = create_provider(repo)
+    source_task = create_task(repo, first_application.id, provider.id)
+    source_claim = claim_task(repo, source_task.id)
+    input_path = repo.vault_path / "ai-artifacts" / "scoped-input.json"
+    input_path.write_bytes(b"scoped")
+    artifact = repo.save_ai_artifact(
+        source_task.id,
+        source_claim,
+        "context",
+        input_path,
+        hashlib.sha256(b"scoped").hexdigest(),
+        "1",
+    )
+
+    with pytest.raises(ValueError, match="same application"):
+        create_task(repo, second_application.id, provider.id, [artifact.id])
+
+    target_task = create_task(repo, first_application.id, provider.id, [artifact.id])
+    with repo.connection() as connection:
+        links = connection.execute(
+            """
+            SELECT task_id, artifact_id
+            FROM ai_task_input_artifacts
+            WHERE task_id = ?
+            """,
+            (target_task.id,),
+        ).fetchall()
+    assert [(row["task_id"], row["artifact_id"]) for row in links] == [
+        (target_task.id, artifact.id)
+    ]
 
 
 def test_simultaneous_claims_have_exactly_one_owner(tmp_path: Path):
@@ -327,6 +468,88 @@ def test_requeue_invalidates_stale_worker_claim(tmp_path: Path):
     assert worker_b.complete_ai_task(task.id, current_token).status == "completed"
 
 
+def test_requeue_invalidates_stale_artifact_and_finding_writes(tmp_path: Path):
+    repo = make_repo(tmp_path)
+    application = create_application(repo)
+    provider = create_provider(repo)
+    task = create_task(repo, application.id, provider.id)
+    worker_a = CareerOpsRepository(repo.database_path, repo.vault_path)
+    worker_b = CareerOpsRepository(repo.database_path, repo.vault_path)
+    stale_token = claim_task(worker_a, task.id)
+    first_path = repo.vault_path / "ai-artifacts" / "attempt-a.json"
+    first_path.write_bytes(b"attempt-a")
+
+    first_artifact = worker_a.save_ai_artifact(
+        task.id,
+        stale_token,
+        "raw_output",
+        first_path,
+        hashlib.sha256(b"attempt-a").hexdigest(),
+        "1",
+    )
+    first_finding = worker_a.save_ai_finding(
+        task_id=task.id,
+        claim_token=stale_token,
+        finding_type="risk",
+        severity="warning",
+        claim_text="Attempt A",
+        evidence_item_id=None,
+        recommendation="Review",
+        verifier_state="needs_evidence",
+    )
+    assert repo.requeue_interrupted_ai_tasks() == 1
+    current_token = claim_task(worker_b, task.id)
+    second_path = repo.vault_path / "ai-artifacts" / "attempt-b.json"
+    second_path.write_bytes(b"attempt-b")
+
+    with pytest.raises(ValueError, match="claim"):
+        worker_a.save_ai_artifact(
+            task.id,
+            stale_token,
+            "raw_output",
+            second_path,
+            hashlib.sha256(b"attempt-b").hexdigest(),
+            "1",
+        )
+    with pytest.raises(ValueError, match="claim"):
+        worker_a.save_ai_finding(
+            task_id=task.id,
+            claim_token=stale_token,
+            finding_type="risk",
+            severity="warning",
+            claim_text="Stale attempt A",
+            evidence_item_id=None,
+            recommendation="Review",
+            verifier_state="needs_evidence",
+        )
+
+    second_artifact = worker_b.save_ai_artifact(
+        task.id,
+        current_token,
+        "raw_output",
+        second_path,
+        hashlib.sha256(b"attempt-b").hexdigest(),
+        "1",
+    )
+    second_finding = worker_b.save_ai_finding(
+        task_id=task.id,
+        claim_token=current_token,
+        finding_type="risk",
+        severity="warning",
+        claim_text="Attempt B",
+        evidence_item_id=None,
+        recommendation="Review",
+        verifier_state="needs_evidence",
+    )
+
+    assert first_artifact.claim_token == stale_token
+    assert second_artifact.claim_token == current_token
+    assert first_finding.claim_token == stale_token
+    assert second_finding.claim_token == current_token
+    assert repo.list_ai_artifacts(task.id) == [first_artifact, second_artifact]
+    assert repo.list_ai_findings(task.id) == [first_finding, second_finding]
+
+
 def test_competing_terminal_updates_allow_only_one_claim_owner_update(tmp_path: Path):
     repo = make_repo(tmp_path)
     application = create_application(repo)
@@ -366,9 +589,11 @@ def test_ai_finding_decisions_are_persisted_and_audited(tmp_path: Path):
     application = create_application(repo)
     provider = create_provider(repo)
     task = create_task(repo, application.id, provider.id)
+    claim_token = claim_task(repo, task.id)
 
     finding = repo.save_ai_finding(
         task_id=task.id,
+        claim_token=claim_token,
         finding_type="unsupported_claim",
         severity="blocking",
         claim_text="Improved throughput by 50%",
@@ -396,14 +621,16 @@ def test_ai_findings_only_start_pending_and_decisions_use_compare_and_set(tmp_pa
     application = create_application(repo)
     provider = create_provider(repo)
     task = create_task(repo, application.id, provider.id)
+    claim_token = claim_task(repo, task.id)
     finding_values = {
         "task_id": task.id,
+        "claim_token": claim_token,
         "finding_type": "unsupported_claim",
         "severity": "blocking",
         "claim_text": "Improved throughput by 50%",
         "evidence_item_id": None,
         "recommendation": "Remove the unsupported metric",
-        "verifier_state": "blocked",
+        "verifier_state": "verified",
     }
 
     with pytest.raises(ValueError, match="pending"):
@@ -429,6 +656,97 @@ def test_ai_findings_only_start_pending_and_decisions_use_compare_and_set(tmp_pa
         if event.event_type == "ai_finding.decision_updated"
     ]
     assert len(decision_events) == 1
+
+
+@pytest.mark.parametrize("verifier_state", ["blocked", "rejected", "needs_evidence"])
+def test_unsafe_verifier_states_cannot_be_accepted(
+    tmp_path: Path, verifier_state: str
+):
+    repo = make_repo(tmp_path)
+    application = create_application(repo)
+    provider = create_provider(repo)
+    task = create_task(repo, application.id, provider.id)
+    claim_token = claim_task(repo, task.id)
+    finding = repo.save_ai_finding(
+        task_id=task.id,
+        claim_token=claim_token,
+        finding_type="risk",
+        severity="blocking",
+        claim_text="Unsafe claim",
+        evidence_item_id=None,
+        recommendation="Reject",
+        verifier_state=verifier_state,
+    )
+
+    with pytest.raises(ValueError, match="verifier"):
+        repo.update_ai_finding_decision(
+            finding.id, "accepted", expected_decision="pending"
+        )
+
+    assert repo.get_ai_finding(finding.id).decision == "pending"
+    assert not any(
+        event.entity_id == finding.id
+        for event in repo.list_audit_events()
+        if event.event_type == "ai_finding.decision_updated"
+    )
+
+
+def test_concurrent_finding_decisions_have_one_causal_audit(tmp_path: Path):
+    repo = make_repo(tmp_path)
+    application = create_application(repo)
+    provider = create_provider(repo)
+    task = create_task(repo, application.id, provider.id)
+    claim_token = claim_task(repo, task.id)
+    finding = repo.save_ai_finding(
+        task_id=task.id,
+        claim_token=claim_token,
+        finding_type="verified_claim",
+        severity="info",
+        claim_text="Verified claim",
+        evidence_item_id=None,
+        recommendation="Use",
+        verifier_state="verified",
+    )
+    workers = [
+        CareerOpsRepository(repo.database_path, repo.vault_path),
+        CareerOpsRepository(repo.database_path, repo.vault_path),
+    ]
+    decisions = ["accepted", "rejected"]
+    barrier = Barrier(len(workers))
+
+    def decide(worker_number: int):
+        barrier.wait()
+        return workers[worker_number].update_ai_finding_decision(
+            finding.id,
+            decisions[worker_number],
+            expected_decision="pending",
+        )
+
+    with ThreadPoolExecutor(max_workers=len(workers)) as executor:
+        futures = [executor.submit(decide, index) for index in range(len(workers))]
+        outcomes = []
+        for future in futures:
+            try:
+                outcomes.append(future.result().decision)
+            except ValueError as exc:
+                outcomes.append(str(exc))
+
+    final = repo.get_ai_finding(finding.id)
+    assert sum(item in {"accepted", "rejected"} for item in outcomes) == 1
+    assert sum("decision" in item for item in outcomes) == 1
+    events = [
+        event
+        for event in repo.list_audit_events()
+        if event.event_type == "ai_finding.decision_updated"
+        and event.entity_id == finding.id
+    ]
+    assert len(events) == 1
+    assert events[0].before_json["id"] == finding.id
+    assert events[0].before_json["decision"] == "pending"
+    assert events[0].after_json["id"] == finding.id
+    assert events[0].after_json["decision"] == final.decision
+    assert events[0].before_json["updated_at"] == finding.updated_at
+    assert events[0].after_json["updated_at"] == final.updated_at
 
 
 def test_repository_rejects_non_finite_state_values(tmp_path: Path):
@@ -473,9 +791,11 @@ def test_repository_rejects_non_finite_state_values(tmp_path: Path):
         prompt_template_id="analyze_fit_v1",
         input_artifact_ids=[],
     )
+    claim_token = claim_task(repo, task.id)
     with pytest.raises(ValueError, match="severity"):
         repo.save_ai_finding(
             task_id=task.id,
+            claim_token=claim_token,
             finding_type="risk",
             severity="invented",
             claim_text="Claim",
@@ -486,6 +806,7 @@ def test_repository_rejects_non_finite_state_values(tmp_path: Path):
     with pytest.raises(ValueError, match="verifier state"):
         repo.save_ai_finding(
             task_id=task.id,
+            claim_token=claim_token,
             finding_type="risk",
             severity="warning",
             claim_text="Claim",

@@ -1,4 +1,5 @@
 from collections.abc import Callable
+import json
 import sqlite3
 
 
@@ -74,6 +75,7 @@ def _add_ai_evidence_and_version_tables(connection: sqlite3.Connection) -> None:
         CREATE TABLE IF NOT EXISTS ai_artifacts (
             id TEXT PRIMARY KEY,
             task_id TEXT NOT NULL REFERENCES ai_tasks(id),
+            claim_token TEXT NOT NULL,
             artifact_type TEXT NOT NULL,
             path TEXT NOT NULL,
             sha256 TEXT NOT NULL,
@@ -85,6 +87,7 @@ def _add_ai_evidence_and_version_tables(connection: sqlite3.Connection) -> None:
         CREATE TABLE IF NOT EXISTS ai_findings (
             id TEXT PRIMARY KEY,
             task_id TEXT NOT NULL REFERENCES ai_tasks(id),
+            claim_token TEXT NOT NULL,
             finding_type TEXT NOT NULL,
             severity TEXT NOT NULL CHECK (severity IN ('info', 'warning', 'blocking')),
             claim_text TEXT NOT NULL,
@@ -127,6 +130,14 @@ def _add_ai_evidence_and_version_tables(connection: sqlite3.Connection) -> None:
         )
         """,
         """
+        CREATE TABLE IF NOT EXISTS ai_task_input_artifacts (
+            task_id TEXT NOT NULL REFERENCES ai_tasks(id),
+            artifact_id TEXT NOT NULL REFERENCES ai_artifacts(id),
+            created_at TEXT NOT NULL,
+            PRIMARY KEY(task_id, artifact_id)
+        )
+        """,
+        """
         CREATE TABLE IF NOT EXISTS application_versions (
             id TEXT PRIMARY KEY,
             application_id TEXT NOT NULL REFERENCES applications(id),
@@ -141,12 +152,18 @@ def _add_ai_evidence_and_version_tables(connection: sqlite3.Connection) -> None:
         "CREATE INDEX IF NOT EXISTS idx_ai_tasks_provider ON ai_tasks(provider_config_id)",
         "CREATE INDEX IF NOT EXISTS idx_ai_tasks_status ON ai_tasks(status, created_at)",
         "CREATE INDEX IF NOT EXISTS idx_ai_artifacts_task ON ai_artifacts(task_id, created_at)",
+        "CREATE INDEX IF NOT EXISTS idx_ai_artifacts_claim ON ai_artifacts(task_id, claim_token)",
         "CREATE INDEX IF NOT EXISTS idx_ai_findings_task ON ai_findings(task_id, created_at)",
+        "CREATE INDEX IF NOT EXISTS idx_ai_findings_claim ON ai_findings(task_id, claim_token)",
         "CREATE INDEX IF NOT EXISTS idx_ai_findings_evidence ON ai_findings(evidence_item_id)",
         "CREATE INDEX IF NOT EXISTS idx_profile_facts_key ON profile_facts(fact_key, created_at)",
         """
         CREATE INDEX IF NOT EXISTS idx_application_evidence_item
         ON application_evidence_links(evidence_item_id, created_at)
+        """,
+        """
+        CREATE INDEX IF NOT EXISTS idx_ai_task_input_artifact
+        ON ai_task_input_artifacts(artifact_id, task_id)
         """,
     )
     for statement in statements:
@@ -222,6 +239,72 @@ def _fix_ai_foreign_key_indexes(connection: sqlite3.Connection) -> None:
     connection.execute("DROP INDEX IF EXISTS idx_application_versions_application")
 
 
+def _add_ai_attempt_provenance(connection: sqlite3.Connection) -> None:
+    for table in ("ai_artifacts", "ai_findings"):
+        if "claim_token" not in _column_names(connection, table):
+            connection.execute(f"ALTER TABLE {table} ADD COLUMN claim_token TEXT")
+        connection.execute(
+            f"""
+            CREATE INDEX IF NOT EXISTS idx_{table}_claim
+            ON {table}(task_id, claim_token)
+            """
+        )
+        connection.execute(
+            f"""
+            CREATE TRIGGER IF NOT EXISTS validate_{table}_claim_token
+            BEFORE INSERT ON {table}
+            WHEN NEW.claim_token IS NULL OR NEW.claim_token = ''
+            BEGIN
+                SELECT RAISE(ABORT, 'missing AI attempt claim token');
+            END
+            """
+        )
+
+
+def _add_normalized_ai_task_inputs(connection: sqlite3.Connection) -> None:
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS ai_task_input_artifacts (
+            task_id TEXT NOT NULL REFERENCES ai_tasks(id),
+            artifact_id TEXT NOT NULL REFERENCES ai_artifacts(id),
+            created_at TEXT NOT NULL,
+            PRIMARY KEY(task_id, artifact_id)
+        )
+        """
+    )
+    connection.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_ai_task_input_artifact
+        ON ai_task_input_artifacts(artifact_id, task_id)
+        """
+    )
+    tasks = connection.execute(
+        "SELECT id, input_artifact_ids_json, created_at FROM ai_tasks"
+    ).fetchall()
+    for task_id, artifact_ids_json, created_at in tasks:
+        try:
+            artifact_ids = json.loads(artifact_ids_json)
+        except (TypeError, json.JSONDecodeError):
+            continue
+        if not isinstance(artifact_ids, list):
+            continue
+        for artifact_id in artifact_ids:
+            if not isinstance(artifact_id, str):
+                continue
+            connection.execute(
+                """
+                INSERT OR IGNORE INTO ai_task_input_artifacts (
+                    task_id, artifact_id, created_at
+                )
+                SELECT target.id, artifact.id, ?
+                FROM ai_tasks AS target
+                JOIN ai_artifacts AS artifact ON artifact.id = ?
+                JOIN ai_tasks AS owner ON owner.id = artifact.task_id
+                WHERE target.id = ?
+                  AND target.application_id = owner.application_id
+                """,
+                (created_at, artifact_id, task_id),
+            )
 MIGRATIONS: tuple[tuple[int, Migration], ...] = (
     (1, _add_application_role_type),
     (2, _add_application_submitted_at),
@@ -229,6 +312,8 @@ MIGRATIONS: tuple[tuple[int, Migration], ...] = (
     (4, _add_ai_task_claim_token),
     (5, _add_finite_state_guards),
     (6, _fix_ai_foreign_key_indexes),
+    (7, _add_ai_attempt_provenance),
+    (8, _add_normalized_ai_task_inputs),
 )
 
 LATEST_SCHEMA_VERSION = MIGRATIONS[-1][0]
