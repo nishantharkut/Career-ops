@@ -2,7 +2,18 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from careerops.core.status import ApplicationStatus, SubmissionState
+from careerops.core.status import (
+    AiTaskStatus,
+    AiTaskType,
+    ApplicationStatus,
+    FindingDecision,
+    FindingSeverity,
+    PrivacyLevel,
+    PrivacyMode,
+    SubmissionState,
+    VerificationState,
+    VerifierState,
+)
 
 
 JsonDict = dict[str, Any]
@@ -100,7 +111,7 @@ class AiProviderConfig:
     provider_kind: str
     display_name: str
     enabled: bool
-    privacy_mode: str
+    privacy_mode: PrivacyMode
     endpoint: str
     model: str
     created_at: str
@@ -111,12 +122,12 @@ class AiProviderConfig:
 class AiTask:
     id: str
     application_id: str
-    task_type: str
+    task_type: AiTaskType
     provider_config_id: str
     prompt_template_id: str
     input_artifact_ids: list[str]
-    status: str
-    privacy_mode: str
+    status: AiTaskStatus
+    privacy_mode: PrivacyMode
     started_at: str | None
     completed_at: str | None
     error_summary: str
@@ -140,12 +151,12 @@ class AiFinding:
     id: str
     task_id: str
     finding_type: str
-    severity: str
+    severity: FindingSeverity
     claim_text: str
     evidence_item_id: str | None
     recommendation: str
-    verifier_state: str
-    decision: str
+    verifier_state: VerifierState
+    decision: FindingDecision
     payload: JsonDict
     created_at: str
     updated_at: str
@@ -159,8 +170,8 @@ class EvidenceItem:
     source_path: Path | None
     source_url: str | None
     source_sha256: str | None
-    verification_state: str
-    privacy_level: str
+    verification_state: VerificationState
+    privacy_level: PrivacyLevel
     notes: str
     created_at: str
     updated_at: str
@@ -171,8 +182,8 @@ class ProfileFact:
     id: str
     fact_key: str
     fact_value: str
-    verification_state: str
-    privacy_level: str
+    verification_state: VerificationState
+    privacy_level: PrivacyLevel
     notes: str
     created_at: str
     updated_at: str

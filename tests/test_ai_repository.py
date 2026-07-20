@@ -1,10 +1,16 @@
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import closing
 from dataclasses import FrozenInstanceError
+import gc
+import hashlib
 from pathlib import Path
 import sqlite3
+from threading import Barrier
+import warnings
 
 import pytest
 
-from careerops.core.database import SCHEMA, connect_database
+from careerops.core.database import connect_database, initialize_database
 from careerops.core.repository import CareerOpsRepository
 
 
@@ -35,15 +41,65 @@ def create_provider(repo: CareerOpsRepository):
     )
 
 
-def create_task(repo: CareerOpsRepository, application_id: str, provider_id: str):
+def create_task(
+    repo: CareerOpsRepository,
+    application_id: str,
+    provider_id: str,
+    input_artifact_ids: list[str] | None = None,
+):
     return repo.create_ai_task(
         application_id=application_id,
         task_type="analyze_fit",
         provider_config_id=provider_id,
         privacy_mode="local_private",
         prompt_template_id="analyze_fit_v1",
-        input_artifact_ids=["artifact_input"],
+        input_artifact_ids=input_artifact_ids or [],
     )
+
+
+def test_database_contexts_commit_or_rollback_and_always_close(tmp_path: Path):
+    database_path = tmp_path / "careerops.db"
+    with warnings.catch_warnings(record=True) as captured:
+        warnings.simplefilter("always", ResourceWarning)
+        initialize_database(database_path)
+        repo = CareerOpsRepository(database_path, tmp_path / "vault")
+
+        with repo.connection() as committed:
+            committed.execute(
+                """
+                INSERT INTO profile_facts (
+                    id, fact_key, fact_value, verification_state, privacy_level,
+                    notes, created_at, updated_at
+                ) VALUES ('fact_committed', 'skill', 'Python', 'verified', 'private', '', 'now', 'now')
+                """
+            )
+        with pytest.raises(sqlite3.ProgrammingError, match="closed"):
+            committed.execute("SELECT 1")
+
+        with pytest.raises(RuntimeError, match="rollback"):
+            with repo.connection() as rolled_back:
+                rolled_back.execute(
+                    """
+                    INSERT INTO profile_facts (
+                        id, fact_key, fact_value, verification_state, privacy_level,
+                        notes, created_at, updated_at
+                    ) VALUES ('fact_rolled_back', 'skill', 'SQL', 'verified', 'private', '', 'now', 'now')
+                    """
+                )
+                raise RuntimeError("rollback")
+        with pytest.raises(sqlite3.ProgrammingError, match="closed"):
+            rolled_back.execute("SELECT 1")
+
+        assert repo.get_profile_fact("fact_committed").fact_value == "Python"
+        with pytest.raises(KeyError):
+            repo.get_profile_fact("fact_rolled_back")
+        gc.collect()
+
+    resource_warnings = [item for item in captured if issubclass(item.category, ResourceWarning)]
+    assert resource_warnings == []
+    moved_path = tmp_path / "moved.db"
+    database_path.replace(moved_path)
+    moved_path.unlink()
 
 
 def test_ai_task_is_persisted_pending_before_execution(tmp_path: Path):
@@ -51,14 +107,27 @@ def test_ai_task_is_persisted_pending_before_execution(tmp_path: Path):
     application = create_application(repo)
     provider = create_provider(repo)
 
-    task = create_task(repo, application.id, provider.id)
+    source_task = create_task(repo, application.id, provider.id)
+    input_path = repo.vault_path / "ai-artifacts" / "input.json"
+    input_path.write_bytes(b"{}")
+    artifact = repo.save_ai_artifact(
+        source_task.id,
+        "context",
+        input_path,
+        hashlib.sha256(b"{}").hexdigest(),
+        "1",
+    )
+    task = create_task(repo, application.id, provider.id, [artifact.id])
 
     assert task.status == "pending"
     assert task.started_at is None
     assert task.completed_at is None
-    assert task.input_artifact_ids == ["artifact_input"]
+    assert task.input_artifact_ids == [artifact.id]
     assert repo.get_ai_task(task.id).provider_config_id == provider.id
-    assert [item.id for item in repo.list_ai_tasks(application.id)] == [task.id]
+    assert {item.id for item in repo.list_ai_tasks(application.id)} == {
+        source_task.id,
+        task.id,
+    }
 
 
 def test_only_one_worker_can_claim_pending_task(tmp_path: Path):
@@ -68,8 +137,11 @@ def test_only_one_worker_can_claim_pending_task(tmp_path: Path):
     task = create_task(repo, application.id, provider.id)
     second_worker = CareerOpsRepository(repo.database_path, repo.vault_path)
 
-    assert repo.claim_ai_task(task.id) is True
-    assert second_worker.claim_ai_task(task.id) is False
+    claim_token = repo.claim_ai_task(task.id)
+
+    assert isinstance(claim_token, str)
+    assert len(claim_token) >= 32
+    assert second_worker.claim_ai_task(task.id) is None
     assert repo.get_ai_task(task.id).status == "running"
 
 
@@ -80,10 +152,12 @@ def test_task_start_complete_and_failure_are_durable_and_audited(tmp_path: Path)
     completed_task = create_task(repo, application.id, provider.id)
     failed_task = create_task(repo, application.id, provider.id)
 
-    started = repo.start_ai_task(completed_task.id)
-    completed = repo.complete_ai_task(started.id)
-    repo.start_ai_task(failed_task.id)
-    failed = repo.fail_ai_task(failed_task.id, "api_key=top-secret provider unavailable")
+    completed_token = repo.start_ai_task(completed_task.id)
+    completed = repo.complete_ai_task(completed_task.id, completed_token)
+    failed_token = repo.start_ai_task(failed_task.id)
+    failed = repo.fail_ai_task(
+        failed_task.id, failed_token, "api_key=top-secret provider unavailable"
+    )
 
     assert completed.status == "completed"
     assert completed.completed_at is not None
@@ -95,6 +169,48 @@ def test_task_start_complete_and_failure_are_durable_and_audited(tmp_path: Path)
     assert "top-secret" not in str(failure_event.after_json)
 
 
+def test_audit_and_error_persistence_redact_adversarial_secret_formats(tmp_path: Path):
+    repo = make_repo(tmp_path)
+    application = create_application(repo)
+    provider = create_provider(repo)
+    task = create_task(repo, application.id, provider.id)
+    claim_token = repo.start_ai_task(task.id)
+    secret_payload = """
+    {"api_key": "top secret with spaces", "password": "line one
+    line two"}
+    Authorization: Bearer authorization-token
+    token='quoted token with spaces'
+    secret=unquoted secret value with spaces
+    """
+
+    repo.create_profile_fact(
+        fact_key="review.notes",
+        fact_value="private",
+        verification_state="verified",
+        privacy_level="private",
+        notes=secret_payload,
+    )
+    failed = repo.fail_ai_task(task.id, claim_token, secret_payload)
+
+    assert failed.error_summary == "provider_error"
+    persisted_audits = str(
+        [
+            event.after_json
+            for event in repo.list_audit_events()
+            if event.event_type in {"profile_fact.created", "ai_task.failed"}
+        ]
+    )
+    for secret in (
+        "top secret with spaces",
+        "line one",
+        "line two",
+        "authorization-token",
+        "quoted token with spaces",
+        "unquoted secret value with spaces",
+    ):
+        assert secret not in persisted_audits
+
+
 def test_interrupted_tasks_requeue_without_losing_artifacts(tmp_path: Path):
     repo = make_repo(tmp_path)
     application = create_application(repo)
@@ -102,14 +218,147 @@ def test_interrupted_tasks_requeue_without_losing_artifacts(tmp_path: Path):
     task = create_task(repo, application.id, provider.id)
     repo.start_ai_task(task.id)
     context_path = tmp_path / "vault" / "ai-tasks" / task.id / "context.json"
+    context_path.parent.mkdir(parents=True, exist_ok=True)
+    context_path.write_bytes(b"context")
 
-    artifact = repo.save_ai_artifact(task.id, "context", context_path, "a" * 64, "1")
+    artifact = repo.save_ai_artifact(
+        task.id,
+        "context",
+        context_path,
+        hashlib.sha256(b"context").hexdigest(),
+        "1",
+    )
 
     assert repo.requeue_interrupted_ai_tasks() == 1
     requeued = repo.get_ai_task(task.id)
     assert requeued.status == "pending"
     assert requeued.started_at is None
     assert repo.list_ai_artifacts(task.id) == [artifact]
+
+
+def test_ai_artifacts_require_contained_existing_checksum_matched_files(tmp_path: Path):
+    repo = make_repo(tmp_path)
+    application = create_application(repo)
+    provider = create_provider(repo)
+    task = create_task(repo, application.id, provider.id)
+    valid_path = repo.vault_path / "ai-artifacts" / "valid.json"
+    valid_path.write_bytes(b'{"valid": true}')
+    valid_sha = hashlib.sha256(valid_path.read_bytes()).hexdigest()
+    escaped_path = tmp_path / "escaped.json"
+    escaped_path.write_bytes(b"escaped")
+
+    with pytest.raises(ValueError, match="vault"):
+        repo.save_ai_artifact(
+            task.id,
+            "context",
+            escaped_path,
+            hashlib.sha256(b"escaped").hexdigest(),
+            "1",
+        )
+    with pytest.raises(FileNotFoundError):
+        repo.save_ai_artifact(
+            task.id,
+            "context",
+            repo.vault_path / "ai-artifacts" / "missing.json",
+            valid_sha,
+            "1",
+        )
+    with pytest.raises(ValueError, match="SHA-256"):
+        repo.save_ai_artifact(task.id, "context", valid_path, "not-a-checksum", "1")
+    with pytest.raises(ValueError, match="checksum"):
+        repo.save_ai_artifact(task.id, "context", valid_path, "0" * 64, "1")
+
+    artifact = repo.save_ai_artifact(task.id, "context", valid_path, valid_sha, "1")
+    assert artifact.path == valid_path.resolve()
+
+
+def test_ai_tasks_reject_unknown_input_artifact_ids(tmp_path: Path):
+    repo = make_repo(tmp_path)
+    application = create_application(repo)
+    provider = create_provider(repo)
+
+    with pytest.raises(ValueError, match="artifact"):
+        create_task(repo, application.id, provider.id, ["artifact_missing"])
+
+
+def test_simultaneous_claims_have_exactly_one_owner(tmp_path: Path):
+    repo = make_repo(tmp_path)
+    application = create_application(repo)
+    provider = create_provider(repo)
+    task = create_task(repo, application.id, provider.id)
+    workers = [
+        CareerOpsRepository(repo.database_path, repo.vault_path),
+        CareerOpsRepository(repo.database_path, repo.vault_path),
+    ]
+    barrier = Barrier(len(workers))
+
+    def claim(worker: CareerOpsRepository):
+        barrier.wait()
+        return worker.claim_ai_task(task.id)
+
+    with ThreadPoolExecutor(max_workers=len(workers)) as executor:
+        tokens = list(executor.map(claim, workers))
+
+    owned_tokens = [token for token in tokens if token is not None]
+    assert len(owned_tokens) == 1
+    assert isinstance(owned_tokens[0], str)
+
+
+def test_requeue_invalidates_stale_worker_claim(tmp_path: Path):
+    repo = make_repo(tmp_path)
+    application = create_application(repo)
+    provider = create_provider(repo)
+    task = create_task(repo, application.id, provider.id)
+    worker_a = CareerOpsRepository(repo.database_path, repo.vault_path)
+    worker_b = CareerOpsRepository(repo.database_path, repo.vault_path)
+
+    stale_token = worker_a.claim_ai_task(task.id)
+    assert isinstance(stale_token, str)
+    assert repo.requeue_interrupted_ai_tasks() == 1
+    current_token = worker_b.claim_ai_task(task.id)
+    assert isinstance(current_token, str)
+    assert current_token != stale_token
+
+    with pytest.raises(ValueError, match="claim"):
+        worker_a.complete_ai_task(task.id, stale_token)
+    with pytest.raises(ValueError, match="claim"):
+        worker_a.fail_ai_task(task.id, stale_token, "provider_unavailable")
+
+    assert worker_b.complete_ai_task(task.id, current_token).status == "completed"
+
+
+def test_competing_terminal_updates_allow_only_one_claim_owner_update(tmp_path: Path):
+    repo = make_repo(tmp_path)
+    application = create_application(repo)
+    provider = create_provider(repo)
+    task = create_task(repo, application.id, provider.id)
+    claim_token = repo.claim_ai_task(task.id)
+    assert isinstance(claim_token, str)
+    workers = [
+        CareerOpsRepository(repo.database_path, repo.vault_path),
+        CareerOpsRepository(repo.database_path, repo.vault_path),
+    ]
+    barrier = Barrier(len(workers))
+
+    def complete():
+        barrier.wait()
+        return workers[0].complete_ai_task(task.id, claim_token)
+
+    def fail():
+        barrier.wait()
+        return workers[1].fail_ai_task(task.id, claim_token, "provider_unavailable")
+
+    with ThreadPoolExecutor(max_workers=len(workers)) as executor:
+        futures = [executor.submit(complete), executor.submit(fail)]
+        outcomes = []
+        for future in futures:
+            try:
+                outcomes.append(future.result().status)
+            except ValueError as exc:
+                outcomes.append(str(exc))
+
+    assert sum(item in {"completed", "failed"} for item in outcomes) == 1
+    assert sum("claim" in item for item in outcomes) == 1
 
 
 def test_ai_finding_decisions_are_persisted_and_audited(tmp_path: Path):
@@ -129,7 +378,9 @@ def test_ai_finding_decisions_are_persisted_and_audited(tmp_path: Path):
         decision="pending",
         payload={"reason": "password=hunter2"},
     )
-    decided = repo.update_ai_finding_decision(finding.id, "rejected")
+    decided = repo.update_ai_finding_decision(
+        finding.id, "rejected", expected_decision="pending"
+    )
 
     assert repo.get_ai_finding(finding.id) == decided
     assert decided.decision == "rejected"
@@ -138,6 +389,148 @@ def test_ai_finding_decisions_are_persisted_and_audited(tmp_path: Path):
         item for item in repo.list_audit_events() if item.event_type == "ai_finding.decision_updated"
     )
     assert "hunter2" not in str(event.after_json)
+
+
+def test_ai_findings_only_start_pending_and_decisions_use_compare_and_set(tmp_path: Path):
+    repo = make_repo(tmp_path)
+    application = create_application(repo)
+    provider = create_provider(repo)
+    task = create_task(repo, application.id, provider.id)
+    finding_values = {
+        "task_id": task.id,
+        "finding_type": "unsupported_claim",
+        "severity": "blocking",
+        "claim_text": "Improved throughput by 50%",
+        "evidence_item_id": None,
+        "recommendation": "Remove the unsupported metric",
+        "verifier_state": "blocked",
+    }
+
+    with pytest.raises(ValueError, match="pending"):
+        repo.save_ai_finding(**finding_values, decision="accepted")
+
+    finding = repo.save_ai_finding(**finding_values)
+    accepted = repo.update_ai_finding_decision(
+        finding.id, "accepted", expected_decision="pending"
+    )
+    assert accepted.decision == "accepted"
+    with pytest.raises(ValueError, match="decision"):
+        repo.update_ai_finding_decision(
+            finding.id, "rejected", expected_decision="pending"
+        )
+    with pytest.raises(ValueError, match="decision"):
+        repo.update_ai_finding_decision(
+            finding.id, "invented", expected_decision="accepted"
+        )
+    assert repo.get_ai_finding(finding.id).decision == "accepted"
+    decision_events = [
+        event
+        for event in repo.list_audit_events()
+        if event.event_type == "ai_finding.decision_updated"
+    ]
+    assert len(decision_events) == 1
+
+
+def test_repository_rejects_non_finite_state_values(tmp_path: Path):
+    repo = make_repo(tmp_path)
+    application = create_application(repo)
+
+    with pytest.raises(ValueError, match="privacy mode"):
+        repo.upsert_ai_provider(
+            provider_kind="mock",
+            display_name="Invalid",
+            privacy_mode="invented",
+            endpoint="",
+            model="invalid",
+            enabled=True,
+        )
+
+    provider = create_provider(repo)
+    with pytest.raises(ValueError, match="task type"):
+        repo.create_ai_task(
+            application_id=application.id,
+            task_type="invented",
+            provider_config_id=provider.id,
+            privacy_mode="local_private",
+            prompt_template_id="invalid",
+            input_artifact_ids=[],
+        )
+    with pytest.raises(ValueError, match="privacy mode"):
+        repo.create_ai_task(
+            application_id=application.id,
+            task_type="analyze_fit",
+            provider_config_id=provider.id,
+            privacy_mode="invented",
+            prompt_template_id="analyze_fit_v1",
+            input_artifact_ids=[],
+        )
+
+    task = repo.create_ai_task(
+        application_id=application.id,
+        task_type="analyze_fit",
+        provider_config_id=provider.id,
+        privacy_mode="local_private",
+        prompt_template_id="analyze_fit_v1",
+        input_artifact_ids=[],
+    )
+    with pytest.raises(ValueError, match="severity"):
+        repo.save_ai_finding(
+            task_id=task.id,
+            finding_type="risk",
+            severity="invented",
+            claim_text="Claim",
+            evidence_item_id=None,
+            recommendation="Review",
+            verifier_state="blocked",
+        )
+    with pytest.raises(ValueError, match="verifier state"):
+        repo.save_ai_finding(
+            task_id=task.id,
+            finding_type="risk",
+            severity="warning",
+            claim_text="Claim",
+            evidence_item_id=None,
+            recommendation="Review",
+            verifier_state="invented",
+        )
+    with pytest.raises(ValueError, match="privacy level"):
+        repo.create_profile_fact(
+            fact_key="skill",
+            fact_value="Python",
+            verification_state="verified",
+            privacy_level="invented",
+        )
+    with pytest.raises(ValueError, match="privacy level"):
+        repo.create_evidence_item(
+            claim_text="Claim",
+            evidence_type="project",
+            verification_state="verified",
+            privacy_level="invented",
+        )
+
+
+def test_sqlite_checks_reject_invalid_finite_states(tmp_path: Path):
+    repo = make_repo(tmp_path)
+    application = create_application(repo)
+    provider = create_provider(repo)
+    task = create_task(repo, application.id, provider.id)
+
+    with repo.connection() as connection:
+        table_sql = {
+            row["name"]: row["sql"]
+            for row in connection.execute(
+                """
+                SELECT name, sql FROM sqlite_master
+                WHERE type = 'table'
+                  AND name IN ('ai_provider_configs', 'ai_tasks', 'ai_findings', 'profile_facts')
+                """
+            ).fetchall()
+        }
+        assert all("CHECK" in sql.upper() for sql in table_sql.values())
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute(
+                "UPDATE ai_tasks SET status = 'invented' WHERE id = ?", (task.id,)
+            )
 
 
 def test_provider_upsert_is_stable_and_updates_mutable_fields(tmp_path: Path):
@@ -240,6 +633,32 @@ def test_application_versions_are_append_only_and_monotonic(tmp_path: Path):
     assert event.entity_id == application.id
 
 
+def test_simultaneous_application_versions_allocate_unique_monotonic_numbers(tmp_path: Path):
+    repo = make_repo(tmp_path)
+    application = create_application(repo)
+    worker_count = 6
+    workers = [
+        CareerOpsRepository(repo.database_path, repo.vault_path) for _ in range(worker_count)
+    ]
+    barrier = Barrier(worker_count)
+
+    def record(worker_number: int):
+        barrier.wait()
+        return workers[worker_number].record_application_version(
+            application.id,
+            "ai.reviewed",
+            {"worker": worker_number},
+        )
+
+    with ThreadPoolExecutor(max_workers=worker_count) as executor:
+        versions = list(executor.map(record, range(worker_count)))
+
+    assert sorted(item.version_number for item in versions) == list(range(1, worker_count + 1))
+    assert [
+        item.version_number for item in repo.list_application_versions(application.id)
+    ] == list(range(1, worker_count + 1))
+
+
 def test_initialize_creates_ai_vaults_and_application_defaults(tmp_path: Path):
     repo = make_repo(tmp_path)
 
@@ -282,57 +701,19 @@ def test_new_records_are_frozen_dataclasses(tmp_path: Path):
 
 def test_v0_database_upgrades_without_data_loss(tmp_path: Path):
     database_path = tmp_path / "careerops.db"
-    with sqlite3.connect(database_path) as connection:
-        connection.executescript(SCHEMA)
-        connection.execute(
-            """
-            INSERT INTO applications (
-                id, company, role_title, location, source_url, source_kind,
-                jd_snapshot_id, status, selected_resume_version_id, latest_report_id,
-                approval_id, submission_state, deadline, notes, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                "app_v0", "Legacy Corp", "Engineer", "Remote", "", "manual", "jd_v0",
-                "approved", "res_v0", "rep_v0", "apr_v0", "not_submitted", None,
-                "legacy notes", "2026-07-20T00:00:00+00:00", "2026-07-20T00:00:00+00:00",
-            ),
-        )
-        connection.execute(
-            """
-            INSERT INTO reports (
-                id, application_id, resume_version_id, jd_snapshot_id, fit_json,
-                risks_json, blocking_issue_count, warning_count, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                "rep_v0", "app_v0", "res_v0", "jd_v0", '{"score": 90}',
-                '{"blockers": [], "warnings": []}', 0, 0, "2026-07-20T00:00:00+00:00",
-            ),
-        )
-        connection.execute(
-            """
-            INSERT INTO approvals (
-                id, application_id, resume_version_id, report_id, pdf_sha256,
-                approved_at, approval_note
-            ) VALUES (?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                "apr_v0", "app_v0", "res_v0", "rep_v0", "c" * 64,
-                "2026-07-20T00:00:00+00:00", "legacy approval",
-            ),
-        )
-        connection.execute(
-            """
-            INSERT INTO audit_events (
-                id, event_type, entity_type, entity_id, before_json, after_json, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                "aud_v0", "application.created", "application", "app_v0", "{}",
-                '{"company": "Legacy Corp"}', "2026-07-20T00:00:00+00:00",
-            ),
-        )
+    fixture_path = Path(__file__).parent / "fixtures" / "v0_schema.sql"
+    with closing(sqlite3.connect(database_path)) as connection:
+        connection.executescript(fixture_path.read_text(encoding="utf-8"))
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 0
+        legacy_columns = {
+            row[1] for row in connection.execute("PRAGMA table_info(applications)").fetchall()
+        }
+        assert "role_type" not in legacy_columns
+        assert "submitted_at" not in legacy_columns
+        assert connection.execute("SELECT COUNT(*) FROM applications").fetchone()[0] == 1
+        assert connection.execute("SELECT COUNT(*) FROM reports").fetchone()[0] == 1
+        assert connection.execute("SELECT COUNT(*) FROM approvals").fetchone()[0] == 1
+        assert connection.execute("SELECT COUNT(*) FROM audit_events").fetchone()[0] == 1
 
     repo = CareerOpsRepository(database_path, tmp_path / "vault")
     repo.initialize()
@@ -349,3 +730,26 @@ def test_v0_database_upgrades_without_data_loss(tmp_path: Path):
         assert connection.execute(
             "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'ai_tasks'"
         ).fetchone()
+
+
+def test_ai_foreign_key_indexes_exist_without_redundant_version_index(tmp_path: Path):
+    repo = make_repo(tmp_path)
+
+    def indexed_columns(connection: sqlite3.Connection, table: str) -> dict[str, tuple[str, ...]]:
+        indexes = {}
+        for index in connection.execute(f"PRAGMA index_list({table})").fetchall():
+            indexes[index[1]] = tuple(
+                row[2]
+                for row in connection.execute(f"PRAGMA index_info({index[1]})").fetchall()
+            )
+        return indexes
+
+    with repo.connection() as connection:
+        task_indexes = indexed_columns(connection, "ai_tasks")
+        finding_indexes = indexed_columns(connection, "ai_findings")
+        version_indexes = indexed_columns(connection, "application_versions")
+
+    assert ("provider_config_id",) in task_indexes.values()
+    assert ("evidence_item_id",) in finding_indexes.values()
+    assert "idx_application_versions_application" not in version_indexes
+    assert ("application_id", "version_number") in version_indexes.values()

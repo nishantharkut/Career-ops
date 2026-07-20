@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+from collections.abc import Iterator
+from contextlib import contextmanager
 from datetime import UTC, datetime
 import hashlib
 import json
 from pathlib import Path
 import re
+import secrets
 import sqlite3
 from typing import Any
 from uuid import uuid4
@@ -25,22 +28,42 @@ from careerops.core.models import (
     Report,
     ResumeVersion,
 )
-from careerops.core.status import ApplicationStatus, SubmissionState
+from careerops.core.status import (
+    AiTaskStatus,
+    AiTaskType,
+    ApplicationStatus,
+    FindingDecision,
+    FindingSeverity,
+    PrivacyLevel,
+    PrivacyMode,
+    SubmissionState,
+    VerificationState,
+    VerifierState,
+)
 
 
 SECRET_PATTERNS = (
-    re.compile(r"(?i)(password|secret|token|api[_-]?key)\s*[:=]\s*\S+"),
+    (
+        re.compile(
+            r'''(?is)(?P<prefix>["']?(?:password|secret|token|api[_-]?key|authorization)["']?\s*[:=]\s*)'''
+            r'''(?:"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|[^\r\n,;}]+)'''
+        ),
+        r"\g<prefix>[REDACTED]",
+    ),
+    (re.compile(r"(?i)\bbearer\s+[A-Za-z0-9._~+/=-]+"), "Bearer [REDACTED]"),
 )
-SECRET_KEY_PATTERN = re.compile(r"(?i)(password|secret|token|api[_-]?key)")
-VERIFICATION_STATES = frozenset(
+SECRET_KEY_PATTERN = re.compile(r"(?i)(password|secret|token|api[_-]?key|authorization)")
+PROVIDER_ERROR_CATEGORIES = frozenset(
     {
-        "verified",
-        "user_stated",
-        "needs_verification",
-        "rejected",
-        "private_do_not_publish",
+        "provider_unavailable",
+        "provider_timeout",
+        "provider_error",
+        "invalid_output",
+        "verification_failed",
+        "cancelled",
     }
 )
+SHA256_PATTERN = re.compile(r"[0-9a-fA-F]{64}\Z")
 
 
 def utc_now() -> str:
@@ -65,10 +88,22 @@ def redact(value: Any) -> Any:
         return [redact(inner) for inner in value]
     if isinstance(value, str):
         redacted = value
-        for pattern in SECRET_PATTERNS:
-            redacted = pattern.sub(r"\1=[REDACTED]", redacted)
+        for pattern, replacement in SECRET_PATTERNS:
+            redacted = pattern.sub(replacement, redacted)
         return redacted
     return value
+
+
+def provider_error_category(value: str) -> str:
+    normalized = value.strip().lower()
+    return normalized if normalized in PROVIDER_ERROR_CATEGORIES else "provider_error"
+
+
+def finite_value(enum_type: type[Any], value: str, label: str) -> str:
+    try:
+        return enum_type(value).value
+    except ValueError as exc:
+        raise ValueError(f"Invalid {label}: {value}") from exc
 
 
 class CareerOpsRepository:
@@ -100,6 +135,7 @@ class CareerOpsRepository:
         model: str,
         enabled: bool,
     ) -> AiProviderConfig:
+        privacy_mode = finite_value(PrivacyMode, privacy_mode, "privacy mode")
         provider_id = new_id("aip")
         now = utc_now()
         with self.connection() as connection:
@@ -168,9 +204,27 @@ class CareerOpsRepository:
         input_artifact_ids: list[str],
         privacy_mode: str,
     ) -> AiTask:
+        task_type = finite_value(AiTaskType, task_type, "task type")
+        privacy_mode = finite_value(PrivacyMode, privacy_mode, "privacy mode")
         task_id = new_id("ait")
         now = utc_now()
         with self.connection() as connection:
+            if input_artifact_ids:
+                placeholders = ", ".join("?" for _ in input_artifact_ids)
+                rows = connection.execute(
+                    f"SELECT id FROM ai_artifacts WHERE id IN ({placeholders})",
+                    tuple(input_artifact_ids),
+                ).fetchall()
+                found_ids = {row["id"] for row in rows}
+                missing_ids = [
+                    artifact_id
+                    for artifact_id in input_artifact_ids
+                    if artifact_id not in found_ids
+                ]
+                if missing_ids:
+                    raise ValueError(
+                        f"Unknown input artifact IDs: {', '.join(missing_ids)}"
+                    )
             connection.execute(
                 """
                 INSERT INTO ai_tasks (
@@ -223,39 +277,42 @@ class CareerOpsRepository:
             ).fetchall()
         return [self._ai_task_from_row(row) for row in rows]
 
-    def claim_ai_task(self, task_id: str) -> bool:
+    def claim_ai_task(self, task_id: str) -> str | None:
         now = utc_now()
+        claim_token = secrets.token_urlsafe(32)
         with self.connection() as connection:
             cursor = connection.execute(
                 """
                 UPDATE ai_tasks
                 SET status = 'running', started_at = ?, completed_at = NULL,
-                    error_summary = '', updated_at = ?
+                    error_summary = '', claim_token = ?, updated_at = ?
                 WHERE id = ? AND status = 'pending'
                 """,
-                (now, now, task_id),
+                (now, claim_token, now, task_id),
             )
-        return cursor.rowcount == 1
+        return claim_token if cursor.rowcount == 1 else None
 
-    def start_ai_task(self, task_id: str) -> AiTask:
-        if not self.claim_ai_task(task_id):
+    def start_ai_task(self, task_id: str) -> str:
+        claim_token = self.claim_ai_task(task_id)
+        if claim_token is None:
             raise ValueError("AI task is not pending")
-        return self.get_ai_task(task_id)
+        return claim_token
 
-    def complete_ai_task(self, task_id: str) -> AiTask:
+    def complete_ai_task(self, task_id: str, claim_token: str) -> AiTask:
         before = self.get_ai_task(task_id)
         now = utc_now()
         with self.connection() as connection:
             cursor = connection.execute(
                 """
                 UPDATE ai_tasks
-                SET status = 'completed', completed_at = ?, error_summary = '', updated_at = ?
-                WHERE id = ? AND status = 'running'
+                SET status = 'completed', completed_at = ?, error_summary = '',
+                    claim_token = NULL, updated_at = ?
+                WHERE id = ? AND status = 'running' AND claim_token = ?
                 """,
-                (now, now, task_id),
+                (now, now, task_id, claim_token),
             )
             if cursor.rowcount != 1:
-                raise ValueError("AI task is not running")
+                raise ValueError("AI task claim is not active")
             self._write_audit(
                 connection,
                 "ai_task.completed",
@@ -266,21 +323,22 @@ class CareerOpsRepository:
             )
         return self.get_ai_task(task_id)
 
-    def fail_ai_task(self, task_id: str, error_summary: str) -> AiTask:
+    def fail_ai_task(self, task_id: str, claim_token: str, error_summary: str) -> AiTask:
         before = self.get_ai_task(task_id)
         now = utc_now()
-        safe_error = str(redact(error_summary))
+        safe_error = provider_error_category(error_summary)
         with self.connection() as connection:
             cursor = connection.execute(
                 """
                 UPDATE ai_tasks
-                SET status = 'failed', completed_at = ?, error_summary = ?, updated_at = ?
-                WHERE id = ? AND status = 'running'
+                SET status = 'failed', completed_at = ?, error_summary = ?,
+                    claim_token = NULL, updated_at = ?
+                WHERE id = ? AND status = 'running' AND claim_token = ?
                 """,
-                (now, safe_error, now, task_id),
+                (now, safe_error, now, task_id, claim_token),
             )
             if cursor.rowcount != 1:
-                raise ValueError("AI task is not running")
+                raise ValueError("AI task claim is not active")
             self._write_audit(
                 connection,
                 "ai_task.failed",
@@ -298,7 +356,7 @@ class CareerOpsRepository:
                 """
                 UPDATE ai_tasks
                 SET status = 'pending', started_at = NULL, completed_at = NULL,
-                    error_summary = '', updated_at = ?
+                    error_summary = '', claim_token = NULL, updated_at = ?
                 WHERE status = 'running'
                 """,
                 (now,),
@@ -313,6 +371,25 @@ class CareerOpsRepository:
         sha256: str,
         schema_version: str,
     ) -> AiArtifact:
+        if not SHA256_PATTERN.fullmatch(sha256):
+            raise ValueError(
+                "Artifact SHA-256 must contain exactly 64 hexadecimal characters"
+            )
+        try:
+            artifact_path = Path(path).resolve(strict=True)
+        except FileNotFoundError as exc:
+            raise FileNotFoundError(f"Artifact file does not exist: {path}") from exc
+        vault_root = self.vault_path.resolve(strict=True)
+        if not artifact_path.is_relative_to(vault_root):
+            raise ValueError("Artifact path must remain within the repository vault")
+        if not artifact_path.is_file():
+            raise FileNotFoundError(f"Artifact path is not a file: {artifact_path}")
+        with artifact_path.open("rb") as artifact_file:
+            actual_sha256 = hashlib.file_digest(artifact_file, "sha256").hexdigest()
+        normalized_sha256 = sha256.lower()
+        if actual_sha256 != normalized_sha256:
+            raise ValueError("Artifact checksum does not match file bytes")
+
         artifact_id = new_id("aia")
         now = utc_now()
         with self.connection() as connection:
@@ -326,8 +403,8 @@ class CareerOpsRepository:
                     artifact_id,
                     task_id,
                     artifact_type,
-                    str(path),
-                    sha256,
+                    str(artifact_path),
+                    normalized_sha256,
                     schema_version,
                     now,
                 ),
@@ -363,6 +440,11 @@ class CareerOpsRepository:
         decision: str = "pending",
         payload: dict[str, Any] | None = None,
     ) -> AiFinding:
+        severity = finite_value(FindingSeverity, severity, "severity")
+        verifier_state = finite_value(VerifierState, verifier_state, "verifier state")
+        decision = finite_value(FindingDecision, decision, "decision")
+        if decision != FindingDecision.PENDING.value:
+            raise ValueError("AI findings must start with a pending decision")
         finding_id = new_id("aif")
         now = utc_now()
         with self.connection() as connection:
@@ -407,7 +489,19 @@ class CareerOpsRepository:
             ).fetchall()
         return [self._ai_finding_from_row(row) for row in rows]
 
-    def update_ai_finding_decision(self, finding_id: str, decision: str) -> AiFinding:
+    def update_ai_finding_decision(
+        self,
+        finding_id: str,
+        decision: str,
+        *,
+        expected_decision: str,
+    ) -> AiFinding:
+        decision = finite_value(FindingDecision, decision, "decision")
+        expected_decision = finite_value(
+            FindingDecision, expected_decision, "expected decision"
+        )
+        if decision == FindingDecision.PENDING.value:
+            raise ValueError("Invalid decision transition to pending")
         before = self.get_ai_finding(finding_id)
         now = utc_now()
         with self.connection() as connection:
@@ -415,12 +509,12 @@ class CareerOpsRepository:
                 """
                 UPDATE ai_findings
                 SET decision = ?, updated_at = ?
-                WHERE id = ?
+                WHERE id = ? AND decision = ?
                 """,
-                (decision, now, finding_id),
+                (decision, now, finding_id, expected_decision),
             )
             if cursor.rowcount != 1:
-                raise KeyError(f"No AI finding: {finding_id}")
+                raise ValueError("AI finding decision no longer matches expected decision")
             self._write_audit(
                 connection,
                 "ai_finding.decision_updated",
@@ -440,7 +534,10 @@ class CareerOpsRepository:
         privacy_level: str,
         notes: str = "",
     ) -> ProfileFact:
-        self._validate_verification_state(verification_state)
+        verification_state = finite_value(
+            VerificationState, verification_state, "verification state"
+        )
+        privacy_level = finite_value(PrivacyLevel, privacy_level, "privacy level")
         fact_id = new_id("fact")
         now = utc_now()
         with self.connection() as connection:
@@ -501,7 +598,10 @@ class CareerOpsRepository:
         source_sha256: str | None = None,
         notes: str = "",
     ) -> EvidenceItem:
-        self._validate_verification_state(verification_state)
+        verification_state = finite_value(
+            VerificationState, verification_state, "verification state"
+        )
+        privacy_level = finite_value(PrivacyLevel, privacy_level, "privacy level")
         evidence_id = new_id("evd")
         now = utc_now()
         with self.connection() as connection:
@@ -1082,8 +1182,10 @@ class CareerOpsRepository:
             for row in rows
         ]
 
-    def connection(self) -> sqlite3.Connection:
-        return connect_database(self.database_path)
+    @contextmanager
+    def connection(self) -> Iterator[sqlite3.Connection]:
+        with connect_database(self.database_path) as connection:
+            yield connection
 
     def _one(self, query: str, parameters: tuple[Any, ...]) -> sqlite3.Row:
         with self.connection() as connection:
@@ -1163,7 +1265,7 @@ class CareerOpsRepository:
             provider_kind=row["provider_kind"],
             display_name=row["display_name"],
             enabled=bool(row["enabled"]),
-            privacy_mode=row["privacy_mode"],
+            privacy_mode=PrivacyMode(row["privacy_mode"]),
             endpoint=row["endpoint"],
             model=row["model"],
             created_at=row["created_at"],
@@ -1174,12 +1276,12 @@ class CareerOpsRepository:
         return AiTask(
             id=row["id"],
             application_id=row["application_id"],
-            task_type=row["task_type"],
+            task_type=AiTaskType(row["task_type"]),
             provider_config_id=row["provider_config_id"],
             prompt_template_id=row["prompt_template_id"],
             input_artifact_ids=json.loads(row["input_artifact_ids_json"]),
-            status=row["status"],
-            privacy_mode=row["privacy_mode"],
+            status=AiTaskStatus(row["status"]),
+            privacy_mode=PrivacyMode(row["privacy_mode"]),
             started_at=row["started_at"],
             completed_at=row["completed_at"],
             error_summary=row["error_summary"],
@@ -1203,12 +1305,12 @@ class CareerOpsRepository:
             id=row["id"],
             task_id=row["task_id"],
             finding_type=row["finding_type"],
-            severity=row["severity"],
+            severity=FindingSeverity(row["severity"]),
             claim_text=row["claim_text"],
             evidence_item_id=row["evidence_item_id"],
             recommendation=row["recommendation"],
-            verifier_state=row["verifier_state"],
-            decision=row["decision"],
+            verifier_state=VerifierState(row["verifier_state"]),
+            decision=FindingDecision(row["decision"]),
             payload=json.loads(row["payload_json"]),
             created_at=row["created_at"],
             updated_at=row["updated_at"],
@@ -1219,8 +1321,8 @@ class CareerOpsRepository:
             id=row["id"],
             fact_key=row["fact_key"],
             fact_value=row["fact_value"],
-            verification_state=row["verification_state"],
-            privacy_level=row["privacy_level"],
+            verification_state=VerificationState(row["verification_state"]),
+            privacy_level=PrivacyLevel(row["privacy_level"]),
             notes=row["notes"],
             created_at=row["created_at"],
             updated_at=row["updated_at"],
@@ -1234,8 +1336,8 @@ class CareerOpsRepository:
             source_path=Path(row["source_path"]) if row["source_path"] else None,
             source_url=row["source_url"],
             source_sha256=row["source_sha256"],
-            verification_state=row["verification_state"],
-            privacy_level=row["privacy_level"],
+            verification_state=VerificationState(row["verification_state"]),
+            privacy_level=PrivacyLevel(row["privacy_level"]),
             notes=row["notes"],
             created_at=row["created_at"],
             updated_at=row["updated_at"],
@@ -1250,8 +1352,3 @@ class CareerOpsRepository:
             snapshot=json.loads(row["snapshot_json"]),
             created_at=row["created_at"],
         )
-
-    def _validate_verification_state(self, verification_state: str) -> None:
-        if verification_state not in VERIFICATION_STATES:
-            allowed = ", ".join(sorted(VERIFICATION_STATES))
-            raise ValueError(f"Invalid verification state; expected one of: {allowed}")

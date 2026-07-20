@@ -28,8 +28,12 @@ def _add_ai_evidence_and_version_tables(connection: sqlite3.Connection) -> None:
             id TEXT PRIMARY KEY,
             provider_kind TEXT NOT NULL,
             display_name TEXT NOT NULL,
-            enabled INTEGER NOT NULL,
-            privacy_mode TEXT NOT NULL,
+            enabled INTEGER NOT NULL CHECK (enabled IN (0, 1)),
+            privacy_mode TEXT NOT NULL CHECK (
+                privacy_mode IN (
+                    'local_private', 'trusted_private', 'cloud_external', 'verifier_only'
+                )
+            ),
             endpoint TEXT NOT NULL,
             model TEXT NOT NULL,
             created_at TEXT NOT NULL,
@@ -41,15 +45,27 @@ def _add_ai_evidence_and_version_tables(connection: sqlite3.Connection) -> None:
         CREATE TABLE IF NOT EXISTS ai_tasks (
             id TEXT PRIMARY KEY,
             application_id TEXT NOT NULL REFERENCES applications(id),
-            task_type TEXT NOT NULL,
+            task_type TEXT NOT NULL CHECK (
+                task_type IN (
+                    'analyze_jd', 'analyze_fit', 'suggest_resume_edits',
+                    'draft_cover_letter', 'review_claims'
+                )
+            ),
             provider_config_id TEXT NOT NULL REFERENCES ai_provider_configs(id),
             prompt_template_id TEXT NOT NULL,
             input_artifact_ids_json TEXT NOT NULL,
-            status TEXT NOT NULL,
-            privacy_mode TEXT NOT NULL,
+            status TEXT NOT NULL CHECK (
+                status IN ('pending', 'running', 'completed', 'blocked', 'failed')
+            ),
+            privacy_mode TEXT NOT NULL CHECK (
+                privacy_mode IN (
+                    'local_private', 'trusted_private', 'cloud_external', 'verifier_only'
+                )
+            ),
             started_at TEXT,
             completed_at TEXT,
             error_summary TEXT NOT NULL,
+            claim_token TEXT,
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL
         )
@@ -70,12 +86,14 @@ def _add_ai_evidence_and_version_tables(connection: sqlite3.Connection) -> None:
             id TEXT PRIMARY KEY,
             task_id TEXT NOT NULL REFERENCES ai_tasks(id),
             finding_type TEXT NOT NULL,
-            severity TEXT NOT NULL,
+            severity TEXT NOT NULL CHECK (severity IN ('info', 'warning', 'blocking')),
             claim_text TEXT NOT NULL,
             evidence_item_id TEXT REFERENCES evidence_items(id),
             recommendation TEXT NOT NULL,
-            verifier_state TEXT NOT NULL,
-            decision TEXT NOT NULL,
+            verifier_state TEXT NOT NULL CHECK (
+                verifier_state IN ('pending', 'verified', 'needs_evidence', 'blocked', 'rejected')
+            ),
+            decision TEXT NOT NULL CHECK (decision IN ('pending', 'accepted', 'rejected')),
             payload_json TEXT NOT NULL,
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL
@@ -86,8 +104,15 @@ def _add_ai_evidence_and_version_tables(connection: sqlite3.Connection) -> None:
             id TEXT PRIMARY KEY,
             fact_key TEXT NOT NULL,
             fact_value TEXT NOT NULL,
-            verification_state TEXT NOT NULL,
-            privacy_level TEXT NOT NULL,
+            verification_state TEXT NOT NULL CHECK (
+                verification_state IN (
+                    'verified', 'user_stated', 'needs_verification',
+                    'rejected', 'private_do_not_publish'
+                )
+            ),
+            privacy_level TEXT NOT NULL CHECK (
+                privacy_level IN ('public', 'private', 'sensitive')
+            ),
             notes TEXT NOT NULL,
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL
@@ -113,27 +138,97 @@ def _add_ai_evidence_and_version_tables(connection: sqlite3.Connection) -> None:
         )
         """,
         "CREATE INDEX IF NOT EXISTS idx_ai_tasks_application ON ai_tasks(application_id, created_at)",
+        "CREATE INDEX IF NOT EXISTS idx_ai_tasks_provider ON ai_tasks(provider_config_id)",
         "CREATE INDEX IF NOT EXISTS idx_ai_tasks_status ON ai_tasks(status, created_at)",
         "CREATE INDEX IF NOT EXISTS idx_ai_artifacts_task ON ai_artifacts(task_id, created_at)",
         "CREATE INDEX IF NOT EXISTS idx_ai_findings_task ON ai_findings(task_id, created_at)",
+        "CREATE INDEX IF NOT EXISTS idx_ai_findings_evidence ON ai_findings(evidence_item_id)",
         "CREATE INDEX IF NOT EXISTS idx_profile_facts_key ON profile_facts(fact_key, created_at)",
         """
         CREATE INDEX IF NOT EXISTS idx_application_evidence_item
         ON application_evidence_links(evidence_item_id, created_at)
-        """,
-        """
-        CREATE INDEX IF NOT EXISTS idx_application_versions_application
-        ON application_versions(application_id, version_number)
         """,
     )
     for statement in statements:
         connection.execute(statement)
 
 
+def _add_ai_task_claim_token(connection: sqlite3.Connection) -> None:
+    if "claim_token" not in _column_names(connection, "ai_tasks"):
+        connection.execute("ALTER TABLE ai_tasks ADD COLUMN claim_token TEXT")
+
+
+def _add_finite_state_guards(connection: sqlite3.Connection) -> None:
+    guards = {
+        "ai_provider_configs": """
+            NEW.enabled NOT IN (0, 1)
+            OR NEW.privacy_mode NOT IN (
+                'local_private', 'trusted_private', 'cloud_external', 'verifier_only'
+            )
+        """,
+        "ai_tasks": """
+            NEW.task_type NOT IN (
+                'analyze_jd', 'analyze_fit', 'suggest_resume_edits',
+                'draft_cover_letter', 'review_claims'
+            )
+            OR NEW.status NOT IN ('pending', 'running', 'completed', 'blocked', 'failed')
+            OR NEW.privacy_mode NOT IN (
+                'local_private', 'trusted_private', 'cloud_external', 'verifier_only'
+            )
+        """,
+        "ai_findings": """
+            NEW.severity NOT IN ('info', 'warning', 'blocking')
+            OR NEW.verifier_state NOT IN (
+                'pending', 'verified', 'needs_evidence', 'blocked', 'rejected'
+            )
+            OR NEW.decision NOT IN ('pending', 'accepted', 'rejected')
+        """,
+        "profile_facts": """
+            NEW.verification_state NOT IN (
+                'verified', 'user_stated', 'needs_verification',
+                'rejected', 'private_do_not_publish'
+            )
+            OR NEW.privacy_level NOT IN ('public', 'private', 'sensitive')
+        """,
+        "evidence_items": """
+            NEW.verification_state NOT IN (
+                'verified', 'user_stated', 'needs_verification',
+                'rejected', 'private_do_not_publish'
+            )
+            OR NEW.privacy_level NOT IN ('public', 'private', 'sensitive')
+        """,
+    }
+    for table, invalid_condition in guards.items():
+        for operation in ("INSERT", "UPDATE"):
+            connection.execute(
+                f"""
+                CREATE TRIGGER IF NOT EXISTS validate_{table}_{operation.lower()}_states
+                BEFORE {operation} ON {table}
+                WHEN {invalid_condition}
+                BEGIN
+                    SELECT RAISE(ABORT, 'invalid finite state');
+                END
+                """
+            )
+
+
+def _fix_ai_foreign_key_indexes(connection: sqlite3.Connection) -> None:
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS idx_ai_tasks_provider ON ai_tasks(provider_config_id)"
+    )
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS idx_ai_findings_evidence ON ai_findings(evidence_item_id)"
+    )
+    connection.execute("DROP INDEX IF EXISTS idx_application_versions_application")
+
+
 MIGRATIONS: tuple[tuple[int, Migration], ...] = (
     (1, _add_application_role_type),
     (2, _add_application_submitted_at),
     (3, _add_ai_evidence_and_version_tables),
+    (4, _add_ai_task_claim_token),
+    (5, _add_finite_state_guards),
+    (6, _fix_ai_foreign_key_indexes),
 )
 
 LATEST_SCHEMA_VERSION = MIGRATIONS[-1][0]
