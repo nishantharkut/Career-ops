@@ -30,6 +30,9 @@ build/
 .vite/
 coverage/
 *.tsbuildinfo
+playwright-report/
+test-results/
+vault-e2e/
 
 # Logs
 *.log
