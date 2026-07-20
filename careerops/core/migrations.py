@@ -305,6 +305,102 @@ def _add_normalized_ai_task_inputs(connection: sqlite3.Connection) -> None:
                 """,
                 (created_at, artifact_id, task_id),
             )
+
+
+def _canonicalize_ai_task_inputs(connection: sqlite3.Connection) -> None:
+    connection.execute("DROP TRIGGER IF EXISTS validate_ai_task_input_application_insert")
+    connection.execute("DROP TRIGGER IF EXISTS validate_ai_task_input_application_update")
+    connection.execute("DROP TABLE IF EXISTS ai_task_input_artifacts_v9")
+    connection.execute(
+        """
+        CREATE TABLE ai_task_input_artifacts_v9 (
+            task_id TEXT NOT NULL REFERENCES ai_tasks(id),
+            artifact_id TEXT NOT NULL REFERENCES ai_artifacts(id),
+            ordinal INTEGER NOT NULL CHECK (ordinal >= 0),
+            created_at TEXT NOT NULL,
+            UNIQUE(task_id, ordinal),
+            UNIQUE(task_id, artifact_id)
+        )
+        """
+    )
+
+    artifact_applications = {
+        artifact_id: application_id
+        for artifact_id, application_id in connection.execute(
+            """
+            SELECT artifact.id, owner.application_id
+            FROM ai_artifacts AS artifact
+            JOIN ai_tasks AS owner ON owner.id = artifact.task_id
+            """
+        ).fetchall()
+    }
+    tasks = connection.execute(
+        """
+        SELECT id, application_id, input_artifact_ids_json, created_at
+        FROM ai_tasks
+        """
+    ).fetchall()
+    for task_id, application_id, artifact_ids_json, created_at in tasks:
+        try:
+            legacy_artifact_ids = json.loads(artifact_ids_json)
+        except (TypeError, json.JSONDecodeError):
+            legacy_artifact_ids = []
+        if not isinstance(legacy_artifact_ids, list):
+            legacy_artifact_ids = []
+
+        canonical_artifact_ids: list[str] = []
+        seen_artifact_ids: set[str] = set()
+        for artifact_id in legacy_artifact_ids:
+            if not isinstance(artifact_id, str) or artifact_id in seen_artifact_ids:
+                continue
+            seen_artifact_ids.add(artifact_id)
+            if artifact_applications.get(artifact_id) != application_id:
+                continue
+            connection.execute(
+                """
+                INSERT INTO ai_task_input_artifacts_v9 (
+                    task_id, artifact_id, ordinal, created_at
+                ) VALUES (?, ?, ?, ?)
+                """,
+                (task_id, artifact_id, len(canonical_artifact_ids), created_at),
+            )
+            canonical_artifact_ids.append(artifact_id)
+
+        connection.execute(
+            "UPDATE ai_tasks SET input_artifact_ids_json = ? WHERE id = ?",
+            (json.dumps(canonical_artifact_ids), task_id),
+        )
+
+    connection.execute("DROP TABLE IF EXISTS ai_task_input_artifacts")
+    connection.execute(
+        "ALTER TABLE ai_task_input_artifacts_v9 RENAME TO ai_task_input_artifacts"
+    )
+    connection.execute(
+        """
+        CREATE INDEX idx_ai_task_input_artifact
+        ON ai_task_input_artifacts(artifact_id, task_id)
+        """
+    )
+    for operation in ("INSERT", "UPDATE"):
+        connection.execute(
+            f"""
+            CREATE TRIGGER validate_ai_task_input_application_{operation.lower()}
+            BEFORE {operation} ON ai_task_input_artifacts
+            WHEN NOT EXISTS (
+                SELECT 1
+                FROM ai_tasks AS target
+                JOIN ai_artifacts AS artifact ON artifact.id = NEW.artifact_id
+                JOIN ai_tasks AS owner ON owner.id = artifact.task_id
+                WHERE target.id = NEW.task_id
+                  AND target.application_id = owner.application_id
+            )
+            BEGIN
+                SELECT RAISE(ABORT, 'input artifact application mismatch');
+            END
+            """
+        )
+
+
 MIGRATIONS: tuple[tuple[int, Migration], ...] = (
     (1, _add_application_role_type),
     (2, _add_application_submitted_at),
@@ -314,6 +410,7 @@ MIGRATIONS: tuple[tuple[int, Migration], ...] = (
     (6, _fix_ai_foreign_key_indexes),
     (7, _add_ai_attempt_provenance),
     (8, _add_normalized_ai_task_inputs),
+    (9, _canonicalize_ai_task_inputs),
 )
 
 LATEST_SCHEMA_VERSION = MIGRATIONS[-1][0]

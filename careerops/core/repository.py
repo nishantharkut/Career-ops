@@ -224,9 +224,17 @@ class CareerOpsRepository:
     ) -> AiTask:
         task_type = finite_value(AiTaskType, task_type, "task type")
         privacy_mode = finite_value(PrivacyMode, privacy_mode, "privacy mode")
+        seen_artifact_ids: set[str] = set()
+        for artifact_id in input_artifact_ids:
+            if not isinstance(artifact_id, str):
+                raise ValueError("Input artifact IDs must be strings")
+            if artifact_id in seen_artifact_ids:
+                raise ValueError(f"duplicate input artifact ID: {artifact_id}")
+            seen_artifact_ids.add(artifact_id)
         task_id = new_id("ait")
         now = utc_now()
         with self.connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
             if input_artifact_ids:
                 placeholders = ", ".join("?" for _ in input_artifact_ids)
                 rows = connection.execute(
@@ -281,20 +289,28 @@ class CareerOpsRepository:
                     now,
                 ),
             )
-            for artifact_id in dict.fromkeys(input_artifact_ids):
+            for ordinal, artifact_id in enumerate(input_artifact_ids):
                 connection.execute(
                     """
                     INSERT INTO ai_task_input_artifacts (
-                        task_id, artifact_id, created_at
-                    ) VALUES (?, ?, ?)
+                        task_id, artifact_id, ordinal, created_at
+                    ) VALUES (?, ?, ?, ?)
                     """,
-                    (task_id, artifact_id, now),
+                    (task_id, artifact_id, ordinal, now),
                 )
         return self.get_ai_task(task_id)
 
     def get_ai_task(self, task_id: str) -> AiTask:
-        row = self._one("SELECT * FROM ai_tasks WHERE id = ?", (task_id,))
-        return self._ai_task_from_row(row)
+        with self.connection() as connection:
+            row = connection.execute(
+                "SELECT * FROM ai_tasks WHERE id = ?", (task_id,)
+            ).fetchone()
+            if row is None:
+                raise KeyError("No AI task with that ID")
+            input_artifact_ids = self._ai_task_input_artifact_ids(
+                connection, task_id
+            )
+        return self._ai_task_from_row(row, input_artifact_ids)
 
     def list_ai_tasks(
         self,
@@ -316,7 +332,14 @@ class CareerOpsRepository:
                 f"SELECT * FROM ai_tasks{where} ORDER BY created_at ASC, id ASC",
                 tuple(parameters),
             ).fetchall()
-        return [self._ai_task_from_row(row) for row in rows]
+            input_artifact_ids = {
+                row["id"]: self._ai_task_input_artifact_ids(connection, row["id"])
+                for row in rows
+            }
+        return [
+            self._ai_task_from_row(row, input_artifact_ids[row["id"]])
+            for row in rows
+        ]
 
     def claim_ai_task(self, task_id: str) -> str | None:
         now = utc_now()
@@ -1284,6 +1307,24 @@ class CareerOpsRepository:
         if row is None:
             raise ValueError("AI task claim is not active")
 
+    def _ai_task_input_artifact_ids(
+        self,
+        connection: sqlite3.Connection,
+        task_id: str,
+    ) -> list[str]:
+        return [
+            row["artifact_id"]
+            for row in connection.execute(
+                """
+                SELECT artifact_id
+                FROM ai_task_input_artifacts
+                WHERE task_id = ?
+                ORDER BY ordinal ASC
+                """,
+                (task_id,),
+            ).fetchall()
+        ]
+
     def _write_audit(
         self,
         connection: sqlite3.Connection,
@@ -1362,14 +1403,18 @@ class CareerOpsRepository:
             updated_at=row["updated_at"],
         )
 
-    def _ai_task_from_row(self, row: sqlite3.Row) -> AiTask:
+    def _ai_task_from_row(
+        self,
+        row: sqlite3.Row,
+        input_artifact_ids: list[str],
+    ) -> AiTask:
         return AiTask(
             id=row["id"],
             application_id=row["application_id"],
             task_type=AiTaskType(row["task_type"]),
             provider_config_id=row["provider_config_id"],
             prompt_template_id=row["prompt_template_id"],
-            input_artifact_ids=json.loads(row["input_artifact_ids_json"]),
+            input_artifact_ids=input_artifact_ids,
             status=AiTaskStatus(row["status"]),
             privacy_mode=PrivacyMode(row["privacy_mode"]),
             started_at=row["started_at"],

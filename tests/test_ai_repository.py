@@ -3,6 +3,7 @@ from contextlib import closing
 from dataclasses import FrozenInstanceError
 import gc
 import hashlib
+import json
 from pathlib import Path
 import sqlite3
 from threading import Barrier
@@ -420,6 +421,199 @@ def test_ai_task_inputs_must_belong_to_same_application_and_are_normalized(
     assert [(row["task_id"], row["artifact_id"]) for row in links] == [
         (target_task.id, artifact.id)
     ]
+
+
+def test_ai_task_inputs_are_canonical_ordered_and_reject_duplicates(tmp_path: Path):
+    repo = make_repo(tmp_path)
+    application = create_application(repo)
+    provider = create_provider(repo)
+    source_task = create_task(repo, application.id, provider.id)
+    source_claim = claim_task(repo, source_task.id)
+    artifacts = []
+    for index, content in enumerate((b"first", b"second")):
+        input_path = repo.vault_path / "ai-artifacts" / f"ordered-{index}.json"
+        input_path.write_bytes(content)
+        artifacts.append(
+            repo.save_ai_artifact(
+                source_task.id,
+                source_claim,
+                "context",
+                input_path,
+                hashlib.sha256(content).hexdigest(),
+                "1",
+            )
+        )
+
+    task_ids_before = {task.id for task in repo.list_ai_tasks(application.id)}
+    with pytest.raises(ValueError, match="duplicate"):
+        create_task(
+            repo,
+            application.id,
+            provider.id,
+            [artifacts[0].id, artifacts[0].id],
+        )
+    assert {task.id for task in repo.list_ai_tasks(application.id)} == task_ids_before
+
+    expected_ids = [artifacts[1].id, artifacts[0].id]
+    target_task = create_task(repo, application.id, provider.id, expected_ids)
+    with repo.connection() as connection:
+        rows = connection.execute(
+            """
+            SELECT ordinal, artifact_id
+            FROM ai_task_input_artifacts
+            WHERE task_id = ?
+            ORDER BY ordinal
+            """,
+            (target_task.id,),
+        ).fetchall()
+        connection.execute(
+            "UPDATE ai_tasks SET input_artifact_ids_json = ? WHERE id = ?",
+            (json.dumps(["artifact_not_canonical"]), target_task.id),
+        )
+
+    assert [(row["ordinal"], row["artifact_id"]) for row in rows] == [
+        (0, artifacts[1].id),
+        (1, artifacts[0].id),
+    ]
+    assert repo.get_ai_task(target_task.id).input_artifact_ids == expected_ids
+    listed = {task.id: task for task in repo.list_ai_tasks(application.id)}
+    assert listed[target_task.id].input_artifact_ids == expected_ids
+
+
+def test_ai_task_input_trigger_rejects_cross_application_link(tmp_path: Path):
+    repo = make_repo(tmp_path)
+    first_application = create_application(repo)
+    second_application = repo.create_application(
+        company="Other Corp",
+        role_title="Data Intern",
+        location="Remote",
+        source_url="https://example.com/jobs/2",
+        jd_text="Analyze data.",
+    )
+    provider = create_provider(repo)
+    source_task = create_task(repo, first_application.id, provider.id)
+    source_claim = claim_task(repo, source_task.id)
+    input_path = repo.vault_path / "ai-artifacts" / "trigger-input.json"
+    input_path.write_bytes(b"trigger")
+    artifact = repo.save_ai_artifact(
+        source_task.id,
+        source_claim,
+        "context",
+        input_path,
+        hashlib.sha256(b"trigger").hexdigest(),
+        "1",
+    )
+    target_task = create_task(repo, second_application.id, provider.id)
+
+    with pytest.raises(sqlite3.IntegrityError, match="application"):
+        with repo.connection() as connection:
+            connection.execute(
+                """
+                INSERT INTO ai_task_input_artifacts (
+                    task_id, artifact_id, ordinal, created_at
+                ) VALUES (?, ?, ?, ?)
+                """,
+                (target_task.id, artifact.id, 0, "now"),
+            )
+
+
+def test_v6_ai_task_inputs_upgrade_to_valid_ordered_canonical_links(tmp_path: Path):
+    repo = make_repo(tmp_path)
+    first_application = create_application(repo)
+    second_application = repo.create_application(
+        company="Other Corp",
+        role_title="Data Intern",
+        location="Remote",
+        source_url="https://example.com/jobs/2",
+        jd_text="Analyze data.",
+    )
+    provider = create_provider(repo)
+
+    first_source = create_task(repo, first_application.id, provider.id)
+    first_claim = claim_task(repo, first_source.id)
+    valid_artifacts = []
+    for index, content in enumerate((b"valid-first", b"valid-second")):
+        path = repo.vault_path / "ai-artifacts" / f"migration-valid-{index}.json"
+        path.write_bytes(content)
+        valid_artifacts.append(
+            repo.save_ai_artifact(
+                first_source.id,
+                first_claim,
+                "context",
+                path,
+                hashlib.sha256(content).hexdigest(),
+                "1",
+            )
+        )
+
+    second_source = create_task(repo, second_application.id, provider.id)
+    second_claim = claim_task(repo, second_source.id)
+    cross_path = repo.vault_path / "ai-artifacts" / "migration-cross.json"
+    cross_path.write_bytes(b"cross")
+    cross_artifact = repo.save_ai_artifact(
+        second_source.id,
+        second_claim,
+        "context",
+        cross_path,
+        hashlib.sha256(b"cross").hexdigest(),
+        "1",
+    )
+    target_task = create_task(repo, first_application.id, provider.id)
+    legacy_ids = [
+        valid_artifacts[1].id,
+        cross_artifact.id,
+        valid_artifacts[1].id,
+        "artifact_missing",
+        valid_artifacts[0].id,
+    ]
+    with repo.connection() as connection:
+        connection.execute(
+            "UPDATE ai_tasks SET input_artifact_ids_json = ? WHERE id = ?",
+            (json.dumps(legacy_ids), target_task.id),
+        )
+        connection.execute("DROP TABLE ai_task_input_artifacts")
+        connection.execute("PRAGMA user_version = 6")
+
+    with closing(sqlite3.connect(repo.database_path)) as legacy_connection:
+        assert legacy_connection.execute("PRAGMA user_version").fetchone()[0] == 6
+        assert legacy_connection.execute(
+            """
+            SELECT name FROM sqlite_master
+            WHERE type = 'table' AND name = 'ai_task_input_artifacts'
+            """
+        ).fetchone() is None
+
+    repo.initialize()
+
+    expected_ids = [valid_artifacts[1].id, valid_artifacts[0].id]
+    with repo.connection() as connection:
+        columns = {
+            row["name"]
+            for row in connection.execute(
+                "PRAGMA table_info(ai_task_input_artifacts)"
+            ).fetchall()
+        }
+        rows = connection.execute(
+            """
+            SELECT ordinal, artifact_id
+            FROM ai_task_input_artifacts
+            WHERE task_id = ?
+            ORDER BY ordinal
+            """,
+            (target_task.id,),
+        ).fetchall()
+        compatibility_json = connection.execute(
+            "SELECT input_artifact_ids_json FROM ai_tasks WHERE id = ?",
+            (target_task.id,),
+        ).fetchone()["input_artifact_ids_json"]
+
+    assert "ordinal" in columns
+    assert [(row["ordinal"], row["artifact_id"]) for row in rows] == [
+        (0, valid_artifacts[1].id),
+        (1, valid_artifacts[0].id),
+    ]
+    assert json.loads(compatibility_json) == expected_ids
+    assert repo.get_ai_task(target_task.id).input_artifact_ids == expected_ids
 
 
 def test_simultaneous_claims_have_exactly_one_owner(tmp_path: Path):
