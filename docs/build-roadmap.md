@@ -16,6 +16,7 @@ Deliverables:
 - test runner
 - lint and format commands
 - local config pattern
+- hosted config pattern
 - private data ignored by git
 - initial smoke test
 
@@ -52,6 +53,7 @@ Goal: make the day-1 workflow usable.
 Deliverables:
 
 - local React UI
+- same-origin hosted UI/API mode
 - application list
 - application detail
 - JD editor
@@ -170,16 +172,20 @@ Deliverables:
 - artifact integrity checks
 - secret scanning
 - crash recovery
+- hosted private deployment with auth
+- persistent-volume deployment path
 - documentation refresh
 
 Exit gate:
 
 - day-1 workflow passes
 - full local application packet test passes
+- hosted mode serves the UI and API from one origin
+- hosted mode requires auth for private routes
+- hosted mode uses persistent `data/` and `vault/` storage
 - UI checks pass on required widths
 - all known historical failure fixtures pass
 
 ## Build Principle
 
 Every phase must leave the product usable. Do not add a new subsystem if the previous packet workflow is broken.
-

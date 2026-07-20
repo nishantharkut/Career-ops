@@ -1,7 +1,9 @@
 {
   "scripts": {
     "test:api": ".\\.venv\\Scripts\\python.exe -m pytest -q",
+    "build:web": "npm --prefix apps/web run build",
     "dev:api": ".\\.venv\\Scripts\\python.exe -m uvicorn apps.api.careerops_api.main:app --reload --host 127.0.0.1 --port 8765",
+    "serve:hosted": ".\\.venv\\Scripts\\python.exe -m uvicorn apps.api.careerops_api.main:app --host 127.0.0.1 --port 8765",
     "dev:web": "npm --prefix apps/web run dev -- --host 127.0.0.1 --port 5173",
     "test:web": "npm --prefix apps/web run test -- --run",
     "test:e2e": "npx playwright test",

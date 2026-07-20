@@ -1,0 +1,27 @@
+services:
+  careerops:
+    build: .
+    restart: unless-stopped
+    ports:
+      - "8765:8765"
+    environment:
+      CAREEROPS_DB_PATH: /app/data/careerops.db
+      CAREEROPS_VAULT_PATH: /app/vault
+      CAREEROPS_REQUIRE_AUTH: "true"
+      CAREEROPS_AUTH_USERNAME: ${CAREEROPS_AUTH_USERNAME}
+      CAREEROPS_AUTH_PASSWORD: ${CAREEROPS_AUTH_PASSWORD}
+    volumes:
+      - ./data:/app/data
+      - ./vault:/app/vault
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8765/health', timeout=2).read()"
+        ]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s

@@ -8,7 +8,7 @@ Product slice: Application Desk v0.
 
 ## 1. Objective
 
-CareerOps v0 is a local application desk for one user: Nishant Harkut. It must help turn a job description into a safe application packet without inventing facts, leaking private information, or submitting anything without approval.
+CareerOps v0 is a private application desk for one user: Nishant Harkut. It runs locally by default and can be hosted as a low-cost authenticated single-user app. It must help turn a job description into a safe application packet without inventing facts, leaking private information, or submitting anything without approval.
 
 The first usable workflow must support this loop:
 
@@ -60,6 +60,7 @@ Application Desk v0 must include:
 - local database for applications, resumes, evidence, reports, and approval records
 - file vault for LaTeX sources, PDFs, JD snapshots, and evidence files
 - one clean local UI for the application desk
+- hostable private deployment with same-origin UI/API serving, auth, health checks, and persistent volumes
 - import or manual entry of a job description
 - application record creation
 - profile and evidence record management
@@ -82,7 +83,8 @@ These must not be built first:
 - Resume Worded scraping or paid-site automation
 - fake proprietary ATS score clone
 - multi-user accounts
-- public deployment
+- public multi-user deployment
+- unauthenticated public API exposure
 - mobile app
 - email sending
 - auto-apply
@@ -107,11 +109,13 @@ Minimum successful path:
 
 The system is not ready if any of these fail.
 
+Hosted private mode is ready only if the same workflow runs behind auth with durable `data/` and `vault/` volumes. Ephemeral container storage is not acceptable for real use.
+
 ## 7. Functional Requirements
 
 ### FR1. Local Workspace
 
-CareerOps must store all private data locally by default. Private profile data, resume text, generated answers, evidence, credentials, and scoring results must not be sent to a cloud service.
+CareerOps must store all private data locally by default. Private profile data, resume text, generated answers, evidence, credentials, and scoring results must not be sent to a cloud service unless the user explicitly approves a hosted storage mode.
 
 ### FR2. Application Ledger
 
@@ -339,6 +343,8 @@ The platform must:
 
 Private processing must stay local.
 
+Hosted private deployment may run the same local-open-source processing stack inside a user-controlled VM or container. It must use auth, HTTPS, persistent volumes, and the same approval gates. It must not use a free hosted database or ephemeral filesystem as the only source of truth.
+
 The cloud watcher planned for later must not receive:
 
 - profile data
@@ -385,6 +391,7 @@ The implementation must include:
 - integration test for one complete application packet
 - Playwright UI test for the day-1 workflow
 - responsive UI checks at 320, 375, 414, 768, and desktop widths
+- hostability tests for same-origin serving, auth, configurable CORS, health, and persistent local storage settings
 - secret scan on generated artifacts
 - backup and restore test for local data
 
@@ -399,5 +406,5 @@ Application Desk v0 is complete only when:
 - the report flags known risk cases
 - the UI passes responsive checks
 - no private data is sent to cloud services
+- hosted private mode has auth and durable storage
 - approval cannot be bypassed
-

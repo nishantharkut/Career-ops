@@ -1,10 +1,15 @@
+from base64 import b64decode
+from dataclasses import dataclass
 from pathlib import Path
 import os
+import secrets
 from typing import Any
 from uuid import uuid4
 
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse, PlainTextResponse
+from fastapi.staticfiles import StaticFiles
 
 from apps.api.careerops_api.schemas import (
     AnalyzeRequest,
@@ -19,6 +24,15 @@ from careerops.gates.risk import evaluate_risks
 from careerops.parsers.jd_parser import parse_jd
 from careerops.parsers.pdf_parser import parse_pdf
 from careerops.renderers.latex import render_latex, sha256_file
+
+
+DEFAULT_ALLOWED_ORIGINS = ["http://127.0.0.1:5173", "http://localhost:5173"]
+
+
+@dataclass(frozen=True)
+class BasicAuthConfig:
+    username: str
+    password: str
 
 
 def default_repository() -> CareerOpsRepository:
@@ -38,12 +52,20 @@ def _configured_path(name: str, default: Path, root: Path) -> Path:
     return path if path.is_absolute() else root / path
 
 
-def create_app(repository: CareerOpsRepository | None = None) -> FastAPI:
+def create_app(
+    repository: CareerOpsRepository | None = None,
+    *,
+    allowed_origins: list[str] | None = None,
+    auth: BasicAuthConfig | None = None,
+    static_dir: Path | None = None,
+) -> FastAPI:
     repo = repository or default_repository()
+    root = Path(__file__).resolve().parents[3]
     app = FastAPI(title="CareerOps Local API")
+    _add_basic_auth_middleware(app, auth if auth is not None else _auth_from_env())
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=["http://127.0.0.1:5173", "http://localhost:5173"],
+        allow_origins=allowed_origins or _allowed_origins_from_env(),
         allow_credentials=False,
         allow_methods=["*"],
         allow_headers=["*"],
@@ -191,7 +213,76 @@ def create_app(repository: CareerOpsRepository | None = None) -> FastAPI:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         return _application_payload(application)
 
+    _mount_static_app(app, static_dir if static_dir is not None else root / "apps" / "web" / "dist")
     return app
+
+
+def _allowed_origins_from_env() -> list[str]:
+    raw = os.getenv("CAREEROPS_ALLOWED_ORIGINS")
+    if not raw:
+        return DEFAULT_ALLOWED_ORIGINS
+    origins = [origin.strip() for origin in raw.split(",") if origin.strip()]
+    return origins or DEFAULT_ALLOWED_ORIGINS
+
+
+def _auth_from_env() -> BasicAuthConfig | None:
+    require_auth = os.getenv("CAREEROPS_REQUIRE_AUTH", "").lower() in {"1", "true", "yes", "on"}
+    username = os.getenv("CAREEROPS_AUTH_USERNAME", "")
+    password = os.getenv("CAREEROPS_AUTH_PASSWORD", "")
+    if username and password:
+        return BasicAuthConfig(username=username, password=password)
+    if require_auth:
+        raise RuntimeError("CAREEROPS_REQUIRE_AUTH is set but auth credentials are missing")
+    return None
+
+
+def _add_basic_auth_middleware(app: FastAPI, config: BasicAuthConfig | None) -> None:
+    if config is None:
+        return
+
+    @app.middleware("http")
+    async def require_basic_auth(request, call_next):
+        if request.url.path == "/health":
+            return await call_next(request)
+        authorization = request.headers.get("Authorization", "")
+        if _basic_auth_matches(authorization, config):
+            return await call_next(request)
+        return PlainTextResponse(
+            "Authentication required",
+            status_code=401,
+            headers={"WWW-Authenticate": 'Basic realm="CareerOps"'},
+        )
+
+
+def _basic_auth_matches(authorization: str, config: BasicAuthConfig) -> bool:
+    scheme, _, token = authorization.partition(" ")
+    if scheme.lower() != "basic" or not token:
+        return False
+    try:
+        decoded = b64decode(token, validate=True).decode("utf-8")
+    except Exception:
+        return False
+    username, separator, password = decoded.partition(":")
+    if separator != ":":
+        return False
+    return secrets.compare_digest(username, config.username) and secrets.compare_digest(password, config.password)
+
+
+def _mount_static_app(app: FastAPI, static_dir: Path) -> None:
+    static_dir = Path(static_dir)
+    index_path = static_dir / "index.html"
+    if not index_path.exists():
+        return
+    assets_dir = static_dir / "assets"
+    if assets_dir.exists():
+        app.mount("/assets", StaticFiles(directory=assets_dir), name="assets")
+
+    @app.get("/{full_path:path}", include_in_schema=False)
+    def serve_react_app(full_path: str):
+        candidate = (static_dir / full_path).resolve()
+        if full_path and candidate.is_file() and candidate.is_relative_to(static_dir.resolve()):
+            return FileResponse(candidate)
+        return FileResponse(index_path)
 
 
 app = create_app()

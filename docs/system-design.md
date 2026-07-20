@@ -21,7 +21,7 @@ Chosen stack:
 - UI testing: Playwright.
 - Backend testing: pytest.
 
-This stack is chosen because it is local-first, testable, simple to run, and does not require public deployment.
+This stack is chosen because it is local-first, testable, simple to run, and can also be hosted as a low-cost self-contained container when auth, HTTPS, and persistent volumes are configured.
 
 ## 2. High-Level Components
 
@@ -135,7 +135,7 @@ Required gate families:
 
 ### UI
 
-The UI is a local workbench. It talks only to the local API.
+The UI is a workbench. In development it talks to the local API. In hosted production it is served by the FastAPI app and uses same-origin API requests.
 
 Primary screens:
 
@@ -146,7 +146,7 @@ Primary screens:
 - Report Review
 - Settings
 
-No login is needed for v0 because the app is local and single-user.
+No login is needed for local-only v0 because the app is single-user on the user's machine. Hosted v0 must enable Basic Auth before private data is entered.
 
 ## 3. Data Model
 
@@ -313,6 +313,8 @@ CareerOps/
 
 `data/` and `vault/` must be treated as private local state.
 
+For hosted v0, `data/` and `vault/` must be mounted as persistent volumes. Ephemeral container storage is not acceptable for application history, resume versions, rendered PDFs, reports, or approvals.
+
 ## 5. Data Flow
 
 ### Create Application
@@ -388,11 +390,14 @@ No generic `Something went wrong` messages.
 The app must:
 
 - run locally by default
+- support same-origin hosted serving with auth
 - not send private data to cloud APIs
 - redact secret-like values in logs
 - keep cloud watcher separate from private processing
 - keep approval and submission separate
 - avoid storing raw credentials
+
+Public hosting must not expose the API without auth and HTTPS. Free hosted databases or object stores must not become the source of truth unless the user explicitly approves storing private resume artifacts in cloud services.
 
 The historical session contains secret-handling failures. This system must treat secret leakage as a blocker.
 
@@ -425,4 +430,3 @@ Later phases may add:
 - browser-assisted manual workflows
 
 These must not weaken the local privacy boundary.
-

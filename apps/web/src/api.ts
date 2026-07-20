@@ -54,7 +54,17 @@ export type ApprovalRecord = {
   pdf_sha256: string;
 };
 
-const API_BASE = import.meta.env.VITE_CAREEROPS_API ?? "http://127.0.0.1:8765";
+type ApiEnvironment = {
+  DEV?: boolean;
+  VITE_CAREEROPS_API?: string;
+};
+
+export function resolveApiBase(environment: ApiEnvironment): string {
+  if (environment.VITE_CAREEROPS_API) return environment.VITE_CAREEROPS_API;
+  return environment.DEV ? "http://127.0.0.1:8765" : "";
+}
+
+const API_BASE = resolveApiBase(import.meta.env);
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(`${API_BASE}${path}`, init);
