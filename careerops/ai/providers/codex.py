@@ -45,6 +45,8 @@ _SEMVER = re.compile(
     r"(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$"
 )
 _SAFE_MODEL = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$")
+MAX_CODEX_EXECUTABLE_BYTES = 1024**3
+_CODEX_HASH_CHUNK_BYTES = 1024 * 1024
 _SAFE_ENVIRONMENT_KEYS = (
     "SYSTEMROOT",
     "WINDIR",
@@ -81,7 +83,9 @@ def _read_single_link_file(path: Path, size_limit: int) -> tuple[bytes, os.stat_
     try:
         before = candidate.lstat()
     except OSError as error:
-        raise ProviderUnavailableError("Codex identity file was unavailable") from error
+        raise ProviderUnavailableError(
+            "Codex identity file was unavailable"
+        ) from error
     if (
         stat.S_ISLNK(before.st_mode)
         or not stat.S_ISREG(before.st_mode)
@@ -112,7 +116,9 @@ def _read_single_link_file(path: Path, size_limit: int) -> tuple[bytes, os.stat_
                 raise ProviderUnavailableError("Codex identity file was too large")
         after = os.fstat(descriptor)
     except OSError as error:
-        raise ProviderUnavailableError("Codex identity file was unavailable") from error
+        raise ProviderUnavailableError(
+            "Codex identity file was unavailable"
+        ) from error
     finally:
         if descriptor >= 0:
             os.close(descriptor)
@@ -124,12 +130,89 @@ def _read_single_link_file(path: Path, size_limit: int) -> tuple[bytes, os.stat_
     return b"".join(chunks), after
 
 
+def _stream_sha256(descriptor: int, *, size_limit: int) -> tuple[str, int]:
+    digest = hashlib.sha256()
+    observed = 0
+    while True:
+        chunk = os.read(
+            descriptor,
+            min(_CODEX_HASH_CHUNK_BYTES, size_limit + 1 - observed),
+        )
+        if not chunk:
+            return digest.hexdigest(), observed
+        observed += len(chunk)
+        if observed > size_limit:
+            raise ProviderUnavailableError("Codex identity file was too large")
+        digest.update(chunk)
+
+
+def _file_identity(value: os.stat_result) -> tuple[int, int, int, int, int]:
+    return (
+        value.st_dev,
+        value.st_ino,
+        value.st_size,
+        value.st_mtime_ns,
+        value.st_nlink,
+    )
+
+
+def _hash_single_link_file(path: Path, size_limit: int) -> tuple[Path, str]:
+    candidate = path.expanduser().absolute()
+    try:
+        before = candidate.lstat()
+    except OSError as error:
+        raise ProviderUnavailableError("Codex identity file was unavailable") from error
+    if (
+        stat.S_ISLNK(before.st_mode)
+        or not stat.S_ISREG(before.st_mode)
+        or before.st_nlink != 1
+        or before.st_size > size_limit
+    ):
+        raise ProviderUnavailableError("Codex identity file was unsafe")
+
+    flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = -1
+    try:
+        descriptor = os.open(candidate, flags)
+        opened = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or opened.st_nlink != 1
+            or opened.st_size > size_limit
+            or _file_identity(opened) != _file_identity(before)
+        ):
+            raise ProviderUnavailableError("Codex identity file was unsafe")
+        digest, observed = _stream_sha256(descriptor, size_limit=size_limit)
+        after = os.fstat(descriptor)
+    except OSError as error:
+        raise ProviderUnavailableError("Codex identity file was unavailable") from error
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+
+    if observed != opened.st_size or _file_identity(after) != _file_identity(opened):
+        raise ProviderUnavailableError("Codex identity file changed during read")
+    try:
+        after_path = candidate.lstat()
+        resolved = candidate.resolve(strict=True)
+    except OSError as error:
+        raise ProviderUnavailableError(
+            "Codex identity file changed during read"
+        ) from error
+    if (
+        stat.S_ISLNK(after_path.st_mode)
+        or not stat.S_ISREG(after_path.st_mode)
+        or _file_identity(after_path) != _file_identity(after)
+    ):
+        raise ProviderUnavailableError("Codex identity file changed during read")
+    return resolved, digest
+
+
 def _validate_codex_native(path: str | Path) -> tuple[Path, str]:
     candidate = Path(path).expanduser().absolute()
     if candidate.name.casefold() != "codex.exe":
         raise ProviderUnavailableError("Native Codex executable must be codex.exe")
-    raw, _identity = _read_single_link_file(candidate, 256 * 1024 * 1024)
-    return candidate.resolve(), hashlib.sha256(raw).hexdigest()
+    return _hash_single_link_file(candidate, MAX_CODEX_EXECUTABLE_BYTES)
 
 
 def _validate_codex_home(path: Path) -> Path:
@@ -425,10 +508,18 @@ class CodexProvider:
             capture_limit=4_096,
         )
         try:
-            login = login_result.stdout.decode("utf-8").strip()
+            login_stdout = login_result.stdout.decode("utf-8").strip()
+            login_stderr = login_result.stderr.decode("utf-8").strip()
         except UnicodeError as error:
             raise ProviderUnavailableError("Codex login status was invalid") from error
-        if login_result.returncode != 0 or login != "Logged in using ChatGPT":
+        valid_login_outputs = {
+            ("Logged in using ChatGPT", ""),
+            ("", "Logged in using ChatGPT"),
+        }
+        if (
+            login_result.returncode != 0
+            or (login_stdout, login_stderr) not in valid_login_outputs
+        ):
             raise ProviderUnavailableError("Codex ChatGPT login was not available")
         return version, digest
 

@@ -8,12 +8,15 @@ import importlib
 import json
 import os
 from pathlib import Path
+import re
 import sys
 import threading
 import time
+from types import SimpleNamespace
 from typing import Any
 
 import careerops.ai.contracts as ai_contracts
+import careerops.ai.providers.codex as codex_provider_module
 from pydantic import ValidationError
 import pytest
 
@@ -1032,11 +1035,13 @@ class FakeCodexRunner:
         *,
         version: str = "codex-cli 0.144.5\n",
         login: str = "Logged in using ChatGPT\n",
+        login_stderr: bool = False,
         output_mode: str = "valid",
     ):
         self.output = output or VALID_OUTPUTS["analyze_fit"]
         self.version = version
         self.login = login
+        self.login_stderr = login_stderr
         self.output_mode = output_mode
         self.calls: list[dict[str, Any]] = []
 
@@ -1046,7 +1051,12 @@ class FakeCodexRunner:
         if command[-1] == "--version":
             return outcome(0, self.version.encode(), b"")
         if command[-2:] == ["login", "status"]:
-            return outcome(0, self.login.encode(), b"")
+            encoded = self.login.encode()
+            return (
+                outcome(0, b"", encoded)
+                if self.login_stderr
+                else outcome(0, encoded, b"")
+            )
         if self.output_mode == "timeout":
             raise process_helpers().ProcessDeadlineExceeded()
         if self.output_mode == "nonzero":
@@ -1098,6 +1108,109 @@ def test_hardened_codex_discovers_safe_interchangeable_identities(tmp_path: Path
     assert providers[0].codex_home == fixture["account2_home"].resolve()
     assert providers[1].codex_home == fixture["default_home"].resolve()
     assert all(Path(item.native_executable).suffix.casefold() == ".exe" for item in providers)
+
+
+def test_native_codex_hash_streams_a_legitimate_current_size(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    current_native_size = 341_195_568
+    remaining = current_native_size
+    requested_sizes: list[int] = []
+    expected = hashlib.sha256()
+
+    def bounded_read(_descriptor: int, requested: int) -> bytes:
+        nonlocal remaining
+        requested_sizes.append(requested)
+        chunk = b"x" * min(requested, remaining)
+        remaining -= len(chunk)
+        expected.update(chunk)
+        return chunk
+
+    monkeypatch.setattr(codex_provider_module.os, "read", bounded_read)
+
+    digest, observed = codex_provider_module._stream_sha256(
+        123,
+        size_limit=codex_provider_module.MAX_CODEX_EXECUTABLE_BYTES,
+    )
+
+    assert observed == current_native_size
+    assert digest == expected.hexdigest()
+    assert len(requested_sizes) > 1
+    assert max(requested_sizes) <= 1024 * 1024
+    assert codex_provider_module.MAX_CODEX_EXECUTABLE_BYTES == 1024**3
+
+
+def test_native_codex_identity_tolerates_only_windows_ctime_representation():
+    path_state = SimpleNamespace(
+        st_dev=1,
+        st_ino=2,
+        st_size=341_195_568,
+        st_mtime_ns=3,
+        st_ctime_ns=4,
+        st_nlink=1,
+    )
+    opened_state = SimpleNamespace(**vars(path_state))
+    opened_state.st_ctime_ns = 5
+    changed_state = SimpleNamespace(**vars(opened_state))
+    changed_state.st_mtime_ns = 6
+
+    assert codex_provider_module._file_identity(path_state) == (
+        codex_provider_module._file_identity(opened_state)
+    )
+    assert codex_provider_module._file_identity(opened_state) != (
+        codex_provider_module._file_identity(changed_state)
+    )
+
+
+def test_native_codex_streaming_hash_detects_mutation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    native = tmp_path / "codex.exe"
+    native.write_bytes(b"MZ-fixture")
+    stream_sha256 = codex_provider_module._stream_sha256
+
+    def mutate_then_hash(descriptor: int, *, size_limit: int):
+        with native.open("ab") as output:
+            output.write(b"changed")
+            output.flush()
+            os.fsync(output.fileno())
+        return stream_sha256(descriptor, size_limit=size_limit)
+
+    monkeypatch.setattr(
+        codex_provider_module,
+        "_stream_sha256",
+        mutate_then_hash,
+    )
+
+    with pytest.raises(ProviderUnavailableError, match="changed during read"):
+        codex_provider_module._validate_codex_native(native)
+
+
+def test_native_codex_streaming_hash_rejects_hard_link(tmp_path: Path):
+    original_dir = tmp_path / "original"
+    linked_dir = tmp_path / "linked"
+    original_dir.mkdir()
+    linked_dir.mkdir()
+    original = original_dir / "codex.exe"
+    linked = linked_dir / "codex.exe"
+    original.write_bytes(b"MZ-fixture")
+    os.link(original, linked)
+
+    with pytest.raises(ProviderUnavailableError, match="unsafe"):
+        codex_provider_module._validate_codex_native(linked)
+
+
+def test_codex2_wrapper_reader_remains_capped_at_4_kib(tmp_path: Path):
+    fixture = make_codex_fixture(tmp_path)
+    fixture["wrapper"].write_bytes(b"x" * 4_097)
+
+    providers = discover_codex_providers(
+        which=fixture["which"],
+        environment=fixture["environment"],
+        process_runner=FakeCodexRunner(),
+    )
+
+    assert [item.identity_name for item in providers] == ["codex"]
 
 
 @pytest.mark.parametrize(
@@ -1281,6 +1394,20 @@ def test_hardened_codex_requires_chatgpt_login_without_task_data(tmp_path: Path)
     assert all("exec" not in call["command"] for call in runner.calls)
 
 
+def test_hardened_codex_accepts_exact_chatgpt_login_status_on_stderr(
+    tmp_path: Path,
+):
+    runner = FakeCodexRunner(login_stderr=True)
+    provider, _fixture = make_hardened_codex_provider(tmp_path, runner)
+
+    availability = provider.availability()
+
+    assert availability.available is True
+    assert availability.detail == "available"
+    assert len(runner.calls) == 2
+    assert all("exec" not in call["command"] for call in runner.calls)
+
+
 def test_hardened_codex_missing_selected_identity_never_checks_fallback(
     tmp_path: Path,
 ):
@@ -1427,5 +1554,31 @@ def test_hardened_process_runner_kills_timeout_process_tree(tmp_path: Path):
 )
 def test_hardened_codex_real_machine_identity_smoke_probe():
     providers = discover_codex_providers()
-    assert [item.identity_name for item in providers][:2] == ["codex2", "codex"]
-    assert all(item.availability().available for item in providers[:2])
+    assert [item.identity_name for item in providers] == ["codex2", "codex"]
+    assert [item.is_default for item in providers] == [True, False]
+    assert all(item.model == "gpt-5.6-sol" for item in providers)
+    assert all(
+        item.native_executable.suffix.casefold() == ".exe" for item in providers
+    )
+    assert all(
+        item.native_executable.name.casefold() == "codex.exe" for item in providers
+    )
+    assert providers[0].codex_home != providers[1].codex_home
+
+    availability = [item.availability() for item in providers]
+    assert all(item.available and item.detail == "available" for item in availability)
+    assert [item.identity_name for item in availability] == ["codex2", "codex"]
+    assert all(item.model == "gpt-5.6-sol" for item in availability)
+    assert all(
+        Path(item.executable).name.casefold() == "codex.exe"
+        for item in availability
+    )
+    assert all(
+        re.fullmatch(r"codex-cli \d+\.\d+\.\d+", item.executable_version)
+        for item in availability
+    )
+    assert all(
+        re.fullmatch(r"[0-9a-f]{64}", item.executable_sha256)
+        for item in availability
+    )
+    assert availability[0].codex_home != availability[1].codex_home
