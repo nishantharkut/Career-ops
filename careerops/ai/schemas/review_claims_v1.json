@@ -1,0 +1,74 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$defs": {
+    "ClaimDecision": {
+      "additionalProperties": false,
+      "properties": {
+        "claim_id": {
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$",
+          "title": "Claim Id",
+          "type": "string"
+        },
+        "decision": {
+          "enum": [
+            "supported",
+            "unsupported",
+            "needs_review",
+            "private"
+          ],
+          "title": "Decision",
+          "type": "string"
+        },
+        "reason": {
+          "maxLength": 2000,
+          "minLength": 1,
+          "title": "Reason",
+          "type": "string"
+        },
+        "evidence_refs": {
+          "items": {
+            "maxLength": 128,
+            "minLength": 1,
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$",
+            "type": "string"
+          },
+          "maxItems": 100,
+          "title": "Evidence Refs",
+          "type": "array"
+        }
+      },
+      "required": [
+        "claim_id",
+        "decision",
+        "reason",
+        "evidence_refs"
+      ],
+      "title": "ClaimDecision",
+      "type": "object"
+    }
+  },
+  "additionalProperties": false,
+  "properties": {
+    "task_type": {
+      "const": "review_claims",
+      "title": "Task Type",
+      "type": "string"
+    },
+    "decisions": {
+      "items": {
+        "$ref": "#/$defs/ClaimDecision"
+      },
+      "maxItems": 100,
+      "title": "Decisions",
+      "type": "array"
+    }
+  },
+  "required": [
+    "task_type",
+    "decisions"
+  ],
+  "title": "ClaimReviewOutput",
+  "type": "object"
+}

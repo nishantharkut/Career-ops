@@ -1,0 +1,69 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$defs": {
+    "ResumeEditSuggestion": {
+      "additionalProperties": false,
+      "properties": {
+        "source_text": {
+          "maxLength": 12000,
+          "minLength": 1,
+          "title": "Source Text",
+          "type": "string"
+        },
+        "replacement_text": {
+          "maxLength": 12000,
+          "minLength": 1,
+          "title": "Replacement Text",
+          "type": "string"
+        },
+        "reason": {
+          "maxLength": 2000,
+          "minLength": 1,
+          "title": "Reason",
+          "type": "string"
+        },
+        "evidence_refs": {
+          "items": {
+            "maxLength": 128,
+            "minLength": 1,
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$",
+            "type": "string"
+          },
+          "maxItems": 100,
+          "title": "Evidence Refs",
+          "type": "array"
+        }
+      },
+      "required": [
+        "source_text",
+        "replacement_text",
+        "reason",
+        "evidence_refs"
+      ],
+      "title": "ResumeEditSuggestion",
+      "type": "object"
+    }
+  },
+  "additionalProperties": false,
+  "properties": {
+    "task_type": {
+      "const": "suggest_resume_edits",
+      "title": "Task Type",
+      "type": "string"
+    },
+    "suggestions": {
+      "items": {
+        "$ref": "#/$defs/ResumeEditSuggestion"
+      },
+      "maxItems": 50,
+      "title": "Suggestions",
+      "type": "array"
+    }
+  },
+  "required": [
+    "task_type",
+    "suggestions"
+  ],
+  "title": "ResumeEditsOutput",
+  "type": "object"
+}

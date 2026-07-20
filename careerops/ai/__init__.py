@@ -1,0 +1,31 @@
+from careerops.ai.contracts import (
+    ALLOWED_TASK_TYPES,
+    AnalyzeFitOutput,
+    AnalyzeJdOutput,
+    ClaimReviewOutput,
+    CoverLetterOutput,
+    ProviderAvailability,
+    ProviderRequest,
+    ProviderResult,
+    ResumeEditsOutput,
+    TaskOutput,
+    TaskType,
+    output_schema_for_task,
+    validate_task_output,
+)
+
+__all__ = [
+    "ALLOWED_TASK_TYPES",
+    "AnalyzeFitOutput",
+    "AnalyzeJdOutput",
+    "ClaimReviewOutput",
+    "CoverLetterOutput",
+    "ProviderAvailability",
+    "ProviderRequest",
+    "ProviderResult",
+    "ResumeEditsOutput",
+    "TaskOutput",
+    "TaskType",
+    "output_schema_for_task",
+    "validate_task_output",
+]

@@ -1,0 +1,35 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "task_type": {
+      "const": "draft_cover_letter",
+      "title": "Task Type",
+      "type": "string"
+    },
+    "plain_text": {
+      "maxLength": 12000,
+      "minLength": 1,
+      "title": "Plain Text",
+      "type": "string"
+    },
+    "evidence_refs": {
+      "items": {
+        "maxLength": 128,
+        "minLength": 1,
+        "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$",
+        "type": "string"
+      },
+      "maxItems": 100,
+      "title": "Evidence Refs",
+      "type": "array"
+    }
+  },
+  "required": [
+    "task_type",
+    "plain_text",
+    "evidence_refs"
+  ],
+  "title": "CoverLetterOutput",
+  "type": "object"
+}

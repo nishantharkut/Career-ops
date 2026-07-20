@@ -1,0 +1,67 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "task_type": {
+      "const": "analyze_fit",
+      "title": "Task Type",
+      "type": "string"
+    },
+    "score": {
+      "maximum": 100,
+      "minimum": 0,
+      "title": "Score",
+      "type": "integer"
+    },
+    "matches": {
+      "items": {
+        "maxLength": 1000,
+        "minLength": 1,
+        "type": "string"
+      },
+      "maxItems": 50,
+      "title": "Matches",
+      "type": "array"
+    },
+    "gaps": {
+      "items": {
+        "maxLength": 1000,
+        "minLength": 1,
+        "type": "string"
+      },
+      "maxItems": 50,
+      "title": "Gaps",
+      "type": "array"
+    },
+    "risks": {
+      "items": {
+        "maxLength": 1000,
+        "minLength": 1,
+        "type": "string"
+      },
+      "maxItems": 50,
+      "title": "Risks",
+      "type": "array"
+    },
+    "recommendations": {
+      "items": {
+        "maxLength": 1000,
+        "minLength": 1,
+        "type": "string"
+      },
+      "maxItems": 50,
+      "title": "Recommendations",
+      "type": "array"
+    }
+  },
+  "required": [
+    "task_type",
+    "score",
+    "matches",
+    "gaps",
+    "risks",
+    "recommendations"
+  ],
+  "title": "AnalyzeFitOutput",
+  "type": "object"
+}

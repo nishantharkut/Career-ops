@@ -1,0 +1,92 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "task_type": {
+      "const": "analyze_jd",
+      "title": "Task Type",
+      "type": "string"
+    },
+    "normalized_title": {
+      "maxLength": 300,
+      "minLength": 1,
+      "title": "Normalized Title",
+      "type": "string"
+    },
+    "normalized_company": {
+      "maxLength": 300,
+      "minLength": 1,
+      "title": "Normalized Company",
+      "type": "string"
+    },
+    "normalized_location": {
+      "maxLength": 300,
+      "minLength": 1,
+      "title": "Normalized Location",
+      "type": "string"
+    },
+    "responsibilities": {
+      "items": {
+        "maxLength": 1000,
+        "minLength": 1,
+        "type": "string"
+      },
+      "maxItems": 50,
+      "title": "Responsibilities",
+      "type": "array"
+    },
+    "required_skills": {
+      "items": {
+        "maxLength": 1000,
+        "minLength": 1,
+        "type": "string"
+      },
+      "maxItems": 50,
+      "title": "Required Skills",
+      "type": "array"
+    },
+    "preferred_skills": {
+      "items": {
+        "maxLength": 1000,
+        "minLength": 1,
+        "type": "string"
+      },
+      "maxItems": 50,
+      "title": "Preferred Skills",
+      "type": "array"
+    },
+    "keywords": {
+      "items": {
+        "maxLength": 300,
+        "minLength": 1,
+        "type": "string"
+      },
+      "maxItems": 50,
+      "title": "Keywords",
+      "type": "array"
+    },
+    "uncertainties": {
+      "items": {
+        "maxLength": 1000,
+        "minLength": 1,
+        "type": "string"
+      },
+      "maxItems": 30,
+      "title": "Uncertainties",
+      "type": "array"
+    }
+  },
+  "required": [
+    "task_type",
+    "normalized_title",
+    "normalized_company",
+    "normalized_location",
+    "responsibilities",
+    "required_skills",
+    "preferred_skills",
+    "keywords",
+    "uncertainties"
+  ],
+  "title": "AnalyzeJdOutput",
+  "type": "object"
+}
