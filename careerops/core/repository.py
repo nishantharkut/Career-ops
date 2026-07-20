@@ -190,6 +190,52 @@ class CareerOpsRepository:
             )
         return self.get_resume_version(resume_id)
 
+    def update_resume_render(
+        self,
+        resume_version_id: str,
+        *,
+        pdf_path: Path | None,
+        pdf_sha256: str | None,
+        render_status: str,
+        parse_status: str,
+        page_count: int | None,
+    ) -> ResumeVersion:
+        resume = self.get_resume_version(resume_version_id)
+        now = utc_now()
+        with self.connection() as connection:
+            connection.execute(
+                """
+                UPDATE resume_versions
+                SET pdf_path = ?, pdf_sha256 = ?, render_status = ?, parse_status = ?,
+                    page_count = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    str(pdf_path) if pdf_path else None,
+                    pdf_sha256,
+                    render_status,
+                    parse_status,
+                    page_count,
+                    now,
+                    resume_version_id,
+                ),
+            )
+            self._write_audit(
+                connection,
+                "resume.render_updated",
+                "resume_version",
+                resume_version_id,
+                resume.__dict__,
+                {
+                    "pdf_path": str(pdf_path) if pdf_path else None,
+                    "pdf_sha256": pdf_sha256,
+                    "render_status": render_status,
+                    "parse_status": parse_status,
+                    "page_count": page_count,
+                },
+            )
+        return self.get_resume_version(resume_version_id)
+
     def select_resume(self, application_id: str, resume_version_id: str) -> Application:
         application = self.get_application(application_id)
         self.get_resume_version(resume_version_id)
