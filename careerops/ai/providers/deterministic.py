@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
-import json
 from typing import Any
 
 from careerops.ai.contracts import (
@@ -10,8 +9,13 @@ from careerops.ai.contracts import (
     ProviderAvailability,
     ProviderRequest,
     ProviderResult,
-    validate_task_output,
+    ProviderInvocationError,
+    ProviderOutputError,
+    serialize_provider_output,
+    validate_provider_output,
 )
+from careerops.ai.providers.base import build_provider_result
+from careerops.core.status import PrivacyMode
 
 
 Verifier = Callable[[ProviderRequest], Mapping[str, Any]]
@@ -27,22 +31,32 @@ class DeterministicProvider:
             available=True,
             provider_kind="deterministic_verifier",
             model=self.model,
-            privacy_mode="local_private",
+            privacy_mode=PrivacyMode.VERIFIER_ONLY,
             data_leaves_machine=False,
             is_ai=False,
             detail="available",
         )
 
     def run(self, request: ProviderRequest) -> ProviderResult:
-        payload = dict(self.verifier(request))
-        output = validate_task_output(request.task_type, payload)
-        return ProviderResult(
+        try:
+            verifier_output = self.verifier(request)
+        except Exception:
+            raise ProviderInvocationError("Deterministic verifier failed") from None
+        try:
+            payload = dict(verifier_output)
+        except Exception:
+            raise ProviderOutputError(
+                "Deterministic verifier output was invalid"
+            ) from None
+        output = validate_provider_output(request, payload)
+        raw_output = serialize_provider_output(output)
+        return build_provider_result(
             provider_kind="deterministic_verifier",
             model=self.model,
-            privacy_mode="local_private",
+            privacy_mode=PrivacyMode.VERIFIER_ONLY,
             data_leaves_machine=False,
             is_ai=False,
             structured_output=output,
-            raw_output=json.dumps(payload, sort_keys=True),
+            raw_output=raw_output,
             invocation=InvocationMetadata(mode="verifier_only"),
         )

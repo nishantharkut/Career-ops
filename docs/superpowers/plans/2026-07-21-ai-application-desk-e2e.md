@@ -4,7 +4,7 @@
 
 **Goal:** Deliver a private AI-assisted CareerOps workflow that can take a real JD and LaTeX resume through persisted AI review, verified draft creation, approval, export, backup, and manual submission from a clean browser UI.
 
-**Architecture:** Extend the existing FastAPI, SQLite, file-vault, and React workbench instead of replacing it. AI work is represented by durable tasks and artifacts, executed through bounded provider adapters (Ollama or local Codex), validated against typed schemas, and checked by the existing deterministic safety layer before any suggestion can create a new resume version. The browser polls task state and always shows provider, privacy, verification, and provenance.
+**Architecture:** Extend the existing FastAPI, SQLite, file-vault, and React workbench instead of replacing it. AI work is represented by durable tasks and artifacts, executed through bounded provider adapters (local-private Ollama or ChatGPT-authenticated/cloud-external Codex), validated against typed schemas, and checked by the existing deterministic safety layer before any suggestion can create a new resume version. The browser polls task state and always shows provider, privacy, verification, and provenance.
 
 **Tech Stack:** Python 3.14, FastAPI, Pydantic, SQLite WAL, pytest, React 19, TypeScript, Vite, Vitest, Playwright, local Ollama HTTP API, local `codex exec`, Docker Compose.
 
@@ -277,11 +277,14 @@ def test_ollama_probe_reports_unavailable_without_throwing(http_server):
 
 def test_codex_command_is_read_only_and_bounded(tmp_path):
     provider = CodexProvider(executable="codex2", timeout_seconds=30)
-    command = provider.build_command(tmp_path / "task", tmp_path / "task" / "schema.json", tmp_path / "task" / "output.json")
-    assert command[:2] == ["codex2", "exec"]
+    identity = provider._resolved_identity()
+    command = provider.build_command(identity, tmp_path / "attempt", tmp_path / "attempt" / "schema.json", tmp_path / "attempt" / "output.json")
+    assert Path(command[0]).name.casefold() == "codex.exe"
+    assert command[1] == "exec"
+    assert provider.identity_name == "codex2"
     assert ["--sandbox", "read-only"] == command[command.index("--sandbox"):command.index("--sandbox") + 2]
     assert "--dangerously-bypass-approvals-and-sandbox" not in command
-    assert str(tmp_path / "task") in command
+    assert str(tmp_path / "attempt") in command
 
 
 def test_codex_identities_are_discovered_in_configured_order(monkeypatch):
@@ -338,7 +341,7 @@ class AiProvider(Protocol):
 
 Use a discriminated `TaskOutput` union with `AnalyzeJdOutput`, `AnalyzeFitOutput`, `ResumeEditsOutput`, `CoverLetterOutput`, and `ClaimReviewOutput`. The only allowed task names are `analyze_jd`, `analyze_fit`, `suggest_resume_edits`, `draft_cover_letter`, and `review_claims`. JD output validates normalized fields plus uncertainty; fit output validates matches, gaps, risks, and recommendations; resume suggestions require `source_text`, `replacement_text`, `reason`, and `evidence_refs`; cover letters contain bounded plain text plus evidence references; claim review returns one decision per supplied claim. All string and list fields are length-limited.
 
-Ollama uses `POST /api/chat` with `stream: false`, `format` set to the JSON Schema, and a finite timeout. Codex discovery reads `CAREEROPS_CODEX_COMMANDS` in order (`codex2,codex` for the current machine) or a single `CAREEROPS_CODEX_COMMAND` override. Each resolved executable is registered as a separate provider; `codex2` is preferred, and a running task never falls back to another identity. Codex uses `subprocess.run()` with an argument list, stdin prompt, `--cd <task_dir>`, `--sandbox read-only`, `--skip-git-repo-check`, `--ephemeral`, `--output-schema <schema>`, and `--output-last-message <output>`; shell interpolation is forbidden. The wrapper is executed directly, which is verified on Windows. The deterministic provider returns verifier-only output and has `is_ai=False`.
+Ollama uses a direct, proxy-free loopback HTTP transport for `POST /api/chat` with `stream: false`, `format` set to the JSON Schema, a single finite deadline, and locally installed model provenance verified before inference. Codex discovery reads `CAREEROPS_CODEX_COMMANDS` in order (`codex2,codex` for the current machine) or a single `CAREEROPS_CODEX_COMMAND` override. Each resolved identity is registered as a separate provider; `codex2` is preferred, and a running task never falls back to another identity. A `.cmd` wrapper is an identity descriptor only: CareerOps validates the approved wrapper shape, resolves its `CODEX_HOME`, resolves and hashes the native `codex.exe`, and invokes that native executable directly. Codex uses a managed `Popen` process tree with an argument list, bounded stdin/output, an overall deadline, `--ignore-user-config`, `--ignore-rules`, `--strict-config`, an explicit model and reasoning effort, `--cd <attempt_dir>`, `--sandbox read-only`, `--skip-git-repo-check`, `--ephemeral`, `--output-schema <schema>`, and `--output-last-message <output>`; shell interpolation is forbidden. The deterministic provider returns verifier-only output and has `is_ai=False`.
 
 Codex provider metadata sets `data_leaves_machine=True` for ChatGPT-authenticated runs and exposes the exact command/version. The UI must require per-task acknowledgement before sending private context through that provider. Local Ollama sets `data_leaves_machine=False`.
 

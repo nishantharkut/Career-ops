@@ -27,31 +27,31 @@
     },
     "responsibilities": {
       "items": {
-        "maxLength": 1000,
+        "maxLength": 500,
         "minLength": 1,
         "type": "string"
       },
-      "maxItems": 50,
+      "maxItems": 20,
       "title": "Responsibilities",
       "type": "array"
     },
     "required_skills": {
       "items": {
-        "maxLength": 1000,
+        "maxLength": 500,
         "minLength": 1,
         "type": "string"
       },
-      "maxItems": 50,
+      "maxItems": 30,
       "title": "Required Skills",
       "type": "array"
     },
     "preferred_skills": {
       "items": {
-        "maxLength": 1000,
+        "maxLength": 500,
         "minLength": 1,
         "type": "string"
       },
-      "maxItems": 50,
+      "maxItems": 30,
       "title": "Preferred Skills",
       "type": "array"
     },
@@ -67,11 +67,11 @@
     },
     "uncertainties": {
       "items": {
-        "maxLength": 1000,
+        "maxLength": 500,
         "minLength": 1,
         "type": "string"
       },
-      "maxItems": 30,
+      "maxItems": 20,
       "title": "Uncertainties",
       "type": "array"
     }

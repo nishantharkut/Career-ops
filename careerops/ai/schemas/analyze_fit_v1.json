@@ -15,41 +15,41 @@
     },
     "matches": {
       "items": {
-        "maxLength": 1000,
+        "maxLength": 500,
         "minLength": 1,
         "type": "string"
       },
-      "maxItems": 50,
+      "maxItems": 30,
       "title": "Matches",
       "type": "array"
     },
     "gaps": {
       "items": {
-        "maxLength": 1000,
+        "maxLength": 500,
         "minLength": 1,
         "type": "string"
       },
-      "maxItems": 50,
+      "maxItems": 30,
       "title": "Gaps",
       "type": "array"
     },
     "risks": {
       "items": {
-        "maxLength": 1000,
+        "maxLength": 500,
         "minLength": 1,
         "type": "string"
       },
-      "maxItems": 50,
+      "maxItems": 30,
       "title": "Risks",
       "type": "array"
     },
     "recommendations": {
       "items": {
-        "maxLength": 1000,
+        "maxLength": 500,
         "minLength": 1,
         "type": "string"
       },
-      "maxItems": 50,
+      "maxItems": 30,
       "title": "Recommendations",
       "type": "array"
     }

@@ -22,7 +22,7 @@
           "type": "string"
         },
         "reason": {
-          "maxLength": 2000,
+          "maxLength": 1000,
           "minLength": 1,
           "title": "Reason",
           "type": "string"
@@ -34,7 +34,7 @@
             "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$",
             "type": "string"
           },
-          "maxItems": 100,
+          "maxItems": 20,
           "title": "Evidence Refs",
           "type": "array"
         }
@@ -60,7 +60,7 @@
       "items": {
         "$ref": "#/$defs/ClaimDecision"
       },
-      "maxItems": 100,
+      "maxItems": 40,
       "title": "Decisions",
       "type": "array"
     }

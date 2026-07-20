@@ -1,18 +1,23 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
-from typing import Annotated, Any, Literal, Mapping, TypeAlias, Union
+import stat
+from typing import Annotated, Any, Literal, Mapping, TypeAlias, Union, get_origin
 
 from pydantic import (
     BaseModel,
     ConfigDict,
     Field,
+    PrivateAttr,
     StringConstraints,
     TypeAdapter,
     ValidationError,
     model_validator,
 )
+
+from careerops.core.status import PrivacyMode
 
 
 ALLOWED_TASK_TYPES = (
@@ -30,7 +35,11 @@ TaskType: TypeAlias = Literal[
     "draft_cover_letter",
     "review_claims",
 ]
-PrivacyMode: TypeAlias = Literal["local_private", "cloud_review"]
+
+MAX_PROVIDER_PROMPT_BYTES = 64_000
+MAX_PROVIDER_CONTEXT_BYTES = 120_000
+MAX_PROVIDER_SCHEMA_BYTES = 256_000
+MAX_PROVIDER_OUTPUT_BYTES = 512_000
 
 Identifier = Annotated[
     str,
@@ -41,12 +50,14 @@ Identifier = Annotated[
     ),
 ]
 ShortText = Annotated[str, StringConstraints(min_length=1, max_length=300)]
-ListText = Annotated[str, StringConstraints(min_length=1, max_length=1_000)]
-LongText = Annotated[str, StringConstraints(min_length=1, max_length=12_000)]
-ReasonText = Annotated[str, StringConstraints(min_length=1, max_length=2_000)]
+ListText = Annotated[str, StringConstraints(min_length=1, max_length=500)]
+LongText = Annotated[str, StringConstraints(min_length=1, max_length=4_000)]
+CoverLetterText = Annotated[str, StringConstraints(min_length=1, max_length=12_000)]
+ReasonText = Annotated[str, StringConstraints(min_length=1, max_length=1_000)]
 MetadataText = Annotated[str, StringConstraints(max_length=2_048)]
-RawOutputText = Annotated[str, StringConstraints(max_length=2_000_000)]
-MAX_RAW_OUTPUT_CHARACTERS = 2_000_000
+RawOutputText = Annotated[
+    str, StringConstraints(max_length=MAX_PROVIDER_OUTPUT_BYTES)
+]
 
 
 class ProviderError(RuntimeError):
@@ -72,56 +83,69 @@ class ProviderOutputError(ProviderError):
 class StrictModel(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True, frozen=True)
 
+    @model_validator(mode="before")
+    @classmethod
+    def convert_json_arrays_to_tuples(cls, value: Any) -> Any:
+        if not isinstance(value, Mapping):
+            return value
+        converted = dict(value)
+        for name, field_info in cls.model_fields.items():
+            if get_origin(field_info.annotation) is tuple and isinstance(
+                converted.get(name), list
+            ):
+                converted[name] = tuple(converted[name])
+        return converted
+
 
 class AnalyzeJdOutput(StrictModel):
     task_type: Literal["analyze_jd"]
     normalized_title: ShortText
     normalized_company: ShortText
     normalized_location: ShortText
-    responsibilities: list[ListText] = Field(max_length=50)
-    required_skills: list[ListText] = Field(max_length=50)
-    preferred_skills: list[ListText] = Field(max_length=50)
-    keywords: list[ShortText] = Field(max_length=50)
-    uncertainties: list[ListText] = Field(max_length=30)
+    responsibilities: tuple[ListText, ...] = Field(max_length=20)
+    required_skills: tuple[ListText, ...] = Field(max_length=30)
+    preferred_skills: tuple[ListText, ...] = Field(max_length=30)
+    keywords: tuple[ShortText, ...] = Field(max_length=50)
+    uncertainties: tuple[ListText, ...] = Field(max_length=20)
 
 
 class AnalyzeFitOutput(StrictModel):
     task_type: Literal["analyze_fit"]
     score: int = Field(ge=0, le=100)
-    matches: list[ListText] = Field(max_length=50)
-    gaps: list[ListText] = Field(max_length=50)
-    risks: list[ListText] = Field(max_length=50)
-    recommendations: list[ListText] = Field(max_length=50)
+    matches: tuple[ListText, ...] = Field(max_length=30)
+    gaps: tuple[ListText, ...] = Field(max_length=30)
+    risks: tuple[ListText, ...] = Field(max_length=30)
+    recommendations: tuple[ListText, ...] = Field(max_length=30)
 
 
 class ResumeEditSuggestion(StrictModel):
     source_text: LongText
     replacement_text: LongText
     reason: ReasonText
-    evidence_refs: list[Identifier] = Field(max_length=100)
+    evidence_refs: tuple[Identifier, ...] = Field(max_length=20)
 
 
 class ResumeEditsOutput(StrictModel):
     task_type: Literal["suggest_resume_edits"]
-    suggestions: list[ResumeEditSuggestion] = Field(max_length=50)
+    suggestions: tuple[ResumeEditSuggestion, ...] = Field(max_length=8)
 
 
 class CoverLetterOutput(StrictModel):
     task_type: Literal["draft_cover_letter"]
-    plain_text: LongText
-    evidence_refs: list[Identifier] = Field(max_length=100)
+    plain_text: CoverLetterText
+    evidence_refs: tuple[Identifier, ...] = Field(max_length=40)
 
 
 class ClaimDecision(StrictModel):
     claim_id: Identifier
     decision: Literal["supported", "unsupported", "needs_review", "private"]
     reason: ReasonText
-    evidence_refs: list[Identifier] = Field(max_length=100)
+    evidence_refs: tuple[Identifier, ...] = Field(max_length=20)
 
 
 class ClaimReviewOutput(StrictModel):
     task_type: Literal["review_claims"]
-    decisions: list[ClaimDecision] = Field(max_length=100)
+    decisions: tuple[ClaimDecision, ...] = Field(max_length=40)
 
 
 TaskOutput = Annotated[
@@ -169,6 +193,91 @@ def output_schema_for_task(task_type: str) -> dict[str, Any]:
     }
 
 
+def _stat_identity(value: os.stat_result) -> tuple[int, int, int, int, int, int]:
+    return (
+        value.st_dev,
+        value.st_ino,
+        value.st_size,
+        value.st_mtime_ns,
+        value.st_ctime_ns,
+        value.st_nlink,
+    )
+
+
+def _cross_stat_identity(value: os.stat_result) -> tuple[int, int, int, int, int]:
+    return (
+        value.st_dev,
+        value.st_ino,
+        value.st_size,
+        value.st_mtime_ns,
+        value.st_nlink,
+    )
+
+
+def _seal_regular_file(path: Path, task_dir: Path, size_limit: int) -> tuple[Path, bytes]:
+    candidate = path.expanduser().absolute()
+    try:
+        before_path = candidate.lstat()
+    except OSError as error:
+        raise ValueError("Provider input must be an existing regular file") from error
+    if stat.S_ISLNK(before_path.st_mode):
+        raise ValueError("Provider input must not be a symlink")
+    if not stat.S_ISREG(before_path.st_mode):
+        raise ValueError("Provider input must be a regular file")
+    if before_path.st_nlink != 1:
+        raise ValueError("Provider input must be a single-link file")
+
+    try:
+        resolved = candidate.resolve(strict=True)
+        resolved.relative_to(task_dir)
+    except (OSError, ValueError) as error:
+        raise ValueError("Provider input must stay inside task_dir") from error
+
+    flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = -1
+    try:
+        descriptor = os.open(resolved, flags)
+        before_fd = os.fstat(descriptor)
+        if not stat.S_ISREG(before_fd.st_mode) or before_fd.st_nlink != 1:
+            raise ValueError("Provider input must be a single-link regular file")
+        if (before_fd.st_dev, before_fd.st_ino) != (
+            before_path.st_dev,
+            before_path.st_ino,
+        ):
+            raise ValueError("Provider input identity changed before read")
+        if before_fd.st_size > size_limit:
+            raise ValueError("Provider input exceeded its size limit")
+
+        chunks: list[bytes] = []
+        observed = 0
+        while True:
+            chunk = os.read(descriptor, min(64 * 1024, size_limit + 1 - observed))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            observed += len(chunk)
+            if observed > size_limit:
+                raise ValueError("Provider input exceeded its size limit")
+        after_fd = os.fstat(descriptor)
+    except OSError as error:
+        raise ValueError("Provider input could not be sealed") from error
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+
+    try:
+        after_path = resolved.lstat()
+    except OSError as error:
+        raise ValueError("Provider input identity changed after read") from error
+    if _stat_identity(before_fd) != _stat_identity(after_fd):
+        raise ValueError("Provider input identity changed during read")
+    if _stat_identity(before_path) != _stat_identity(after_path):
+        raise ValueError("Provider input identity changed after read")
+    if _cross_stat_identity(after_fd) != _cross_stat_identity(after_path):
+        raise ValueError("Provider input identity changed after read")
+    return resolved, b"".join(chunks)
+
+
 class ProviderRequest(StrictModel):
     task_id: Identifier
     task_type: TaskType
@@ -176,41 +285,125 @@ class ProviderRequest(StrictModel):
     prompt_path: Path
     context_path: Path
     schema_path: Path
+    expected_claim_ids: tuple[Identifier, ...] = Field(default=(), max_length=40)
+
+    _prompt_snapshot: bytes = PrivateAttr(default=b"")
+    _context_snapshot: bytes = PrivateAttr(default=b"")
+    _schema_snapshot: bytes = PrivateAttr(default=b"")
 
     @model_validator(mode="after")
-    def validate_paths(self) -> ProviderRequest:
+    def validate_and_seal_inputs(self) -> ProviderRequest:
+        candidate_task_dir = self.task_dir.expanduser().absolute()
         try:
-            task_dir = self.task_dir.expanduser().resolve(strict=True)
+            task_lstat = candidate_task_dir.lstat()
+            if stat.S_ISLNK(task_lstat.st_mode):
+                raise ValueError("task_dir must not be a symlink")
+            task_dir = candidate_task_dir.resolve(strict=True)
         except OSError as error:
             raise ValueError("task_dir must be an existing directory") from error
         if not task_dir.is_dir():
             raise ValueError("task_dir must be an existing directory")
 
+        if len(set(self.expected_claim_ids)) != len(self.expected_claim_ids):
+            raise ValueError("expected claim IDs must be unique")
+        if self.task_type != "review_claims" and self.expected_claim_ids:
+            raise ValueError("expected claim IDs are only valid for review_claims")
+
+        prompt_path, prompt = _seal_regular_file(
+            self.prompt_path, task_dir, MAX_PROVIDER_PROMPT_BYTES
+        )
+        context_path, context = _seal_regular_file(
+            self.context_path, task_dir, MAX_PROVIDER_CONTEXT_BYTES
+        )
+        schema_path, schema = _seal_regular_file(
+            self.schema_path, task_dir, MAX_PROVIDER_SCHEMA_BYTES
+        )
+        try:
+            prompt.decode("utf-8")
+            context.decode("utf-8")
+            parsed_schema = json.loads(schema.decode("utf-8"))
+        except (UnicodeError, ValueError) as error:
+            raise ValueError("Provider input snapshot was not valid UTF-8 JSON/text") from error
+        if parsed_schema != output_schema_for_task(self.task_type):
+            raise ValueError("Provider schema snapshot did not match the task type")
+
         object.__setattr__(self, "task_dir", task_dir)
-        for field_name in ("prompt_path", "context_path", "schema_path"):
-            source = getattr(self, field_name)
-            try:
-                resolved = source.expanduser().resolve(strict=True)
-            except OSError as error:
-                raise ValueError(
-                    f"{field_name} must be an existing regular file"
-                ) from error
-            if not resolved.is_file():
-                raise ValueError(f"{field_name} must be an existing regular file")
-            try:
-                resolved.relative_to(task_dir)
-            except ValueError as error:
-                raise ValueError(f"{field_name} must stay inside task_dir") from error
-            object.__setattr__(self, field_name, resolved)
+        object.__setattr__(self, "prompt_path", prompt_path)
+        object.__setattr__(self, "context_path", context_path)
+        object.__setattr__(self, "schema_path", schema_path)
+        object.__setattr__(self, "_prompt_snapshot", prompt)
+        object.__setattr__(self, "_context_snapshot", context)
+        object.__setattr__(self, "_schema_snapshot", schema)
         return self
+
+    @property
+    def prompt_snapshot(self) -> bytes:
+        return self._prompt_snapshot
+
+    @property
+    def context_snapshot(self) -> bytes:
+        return self._context_snapshot
+
+    @property
+    def schema_snapshot(self) -> bytes:
+        return self._schema_snapshot
+
+    def prompt_text(self) -> str:
+        return self._prompt_snapshot.decode("utf-8")
+
+    def context_text(self) -> str:
+        return self._context_snapshot.decode("utf-8")
+
+    def schema_object(self) -> dict[str, Any]:
+        value = json.loads(self._schema_snapshot)
+        if not isinstance(value, dict):
+            raise ProviderOutputError("Provider schema snapshot was invalid")
+        return value
+
+
+def validate_provider_output(request: ProviderRequest, payload: Any) -> TaskOutput:
+    output = validate_task_output(request.task_type, payload)
+    if isinstance(output, ClaimReviewOutput):
+        decision_ids = tuple(item.claim_id for item in output.decisions)
+        if (
+            len(decision_ids) != len(set(decision_ids))
+            or set(decision_ids) != set(request.expected_claim_ids)
+        ):
+            raise ProviderOutputError("Provider claim coverage was not exact")
+    return output
+
+
+def serialize_provider_output_bytes(output: TaskOutput) -> bytes:
+    try:
+        raw = json.dumps(
+            output.model_dump(mode="json"),
+            ensure_ascii=False,
+            allow_nan=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+    except (TypeError, ValueError, UnicodeError) as error:
+        raise ProviderOutputError("Provider output could not be serialized") from error
+    if len(raw) > MAX_PROVIDER_OUTPUT_BYTES:
+        raise ProviderOutputError("Provider output exceeded the size limit")
+    return raw
+
+
+def serialize_provider_output(output: TaskOutput) -> str:
+    return serialize_provider_output_bytes(output).decode("utf-8")
 
 
 class InvocationMetadata(StrictModel):
     mode: MetadataText
     endpoint: MetadataText = ""
+    identity_name: MetadataText = ""
     executable: MetadataText = ""
+    executable_sha256: MetadataText = ""
     executable_version: MetadataText = ""
-    command: tuple[MetadataText, ...] = Field(default=(), max_length=32)
+    codex_home: MetadataText = ""
+    model_digest: MetadataText = ""
+    reasoning_effort: MetadataText = ""
+    command: tuple[MetadataText, ...] = Field(default=(), max_length=40)
 
 
 class ProviderAvailability(StrictModel):
@@ -221,8 +414,13 @@ class ProviderAvailability(StrictModel):
     data_leaves_machine: bool
     is_ai: bool
     detail: MetadataText
+    identity_name: MetadataText = ""
     executable: MetadataText = ""
+    executable_sha256: MetadataText = ""
     executable_version: MetadataText = ""
+    codex_home: MetadataText = ""
+    model_digest: MetadataText = ""
+    reasoning_effort: MetadataText = ""
 
 
 class ProviderResult(StrictModel):
@@ -236,12 +434,16 @@ class ProviderResult(StrictModel):
     invocation: InvocationMetadata
 
 
-def parse_json_object(raw_output: str) -> Mapping[str, Any]:
-    if len(raw_output) > MAX_RAW_OUTPUT_CHARACTERS:
+def parse_json_object(raw_output: str | bytes) -> Mapping[str, Any]:
+    try:
+        raw = raw_output if isinstance(raw_output, bytes) else raw_output.encode("utf-8")
+    except UnicodeError as error:
+        raise ProviderOutputError("Provider output was not valid UTF-8") from error
+    if len(raw) > MAX_PROVIDER_OUTPUT_BYTES:
         raise ProviderOutputError("Provider output exceeded the size limit")
     try:
-        value = json.loads(raw_output)
-    except (TypeError, ValueError) as error:
+        value = json.loads(raw)
+    except (TypeError, ValueError, UnicodeError) as error:
         raise ProviderOutputError("Provider output was not valid JSON") from error
     if not isinstance(value, dict):
         raise ProviderOutputError("Provider output must be a JSON object")

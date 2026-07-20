@@ -26,7 +26,7 @@ This means CareerOps should become an AI-assisted career operations system with 
   - `C:\Users\nhnis\Desktop\Core-Subjects\DE_SHAW_PROJECT_CODE_GRILLING_DOSSIER.md`, lines 79, 99, 123, 226, 262, 699, 784, 788.
   - `C:\Users\nhnis\Desktop\Core-Subjects\DE_SHAW_SYSTEMS_INTERN_30_DAY_DEEP_DIVE_PLAN.md`, lines 115, 121, 432, 853, 894.
   - `C:\Users\nhnis\Desktop\Core-Subjects\github-profile-readme\README.md`, lines 12, 25, 47.
-- Local Codex is installed and authenticated. `codex --help` exposes `exec`, `mcp-server`, `--oss`, and local provider support. `codex doctor` reports ChatGPT auth configured under `C:\Users\nhnis\codex-account2\.codex`.
+- The Codex CLI is installed locally and ChatGPT-authenticated. `codex --help` exposes `exec`, `mcp-server`, `--oss`, and local provider support. `codex doctor` reports ChatGPT auth configured under `C:\Users\nhnis\codex-account2\.codex`; normal ChatGPT-authenticated inference is cloud-external.
 
 ## 3. Product Position
 
@@ -126,7 +126,7 @@ The copy must be non-bloated, direct, and not AI-slop. It must avoid invented me
 
 ### Codex-Assisted Deep Work
 
-CareerOps can call local Codex as an optional worker for deeper tasks:
+CareerOps can call the locally installed, ChatGPT-authenticated Codex CLI as an optional cloud-external worker for deeper tasks:
 
 - inspect repository code before accepting project metrics
 - reconstruct context from selected `.codex` sessions
@@ -157,17 +157,17 @@ CareerOps must make privacy mode explicit.
 
 - Resume text, profile facts, evidence, and generated drafts stay on the user's machine.
 - Uses local model runtime when available.
-- Can invoke local Codex only if the user enables it.
+- Does not include ChatGPT-authenticated Codex; that provider is cloud-external and requires explicit enablement.
 - Best default for day-to-day work.
 
-### Codex Local Worker Mode
+### ChatGPT-Authenticated Codex Worker Mode
 
-- Uses the local Codex installation and its authenticated account.
+- Uses the locally installed Codex CLI and its ChatGPT-authenticated cloud account.
 - Can read selected local files and session files when explicitly scoped.
 - Should run with a constrained working directory and explicit prompt contract.
 - Must write artifacts back through CareerOps, not silently mutate user files.
 - A normal ChatGPT-authenticated Codex run sends the bounded task context to OpenAI. The UI must say this before launch; it must not label Codex mode as fully local or claim that all task data stays on the machine.
-- Multiple local Codex identities are selectable. `codex2` is preferred on the current machine, with `codex` available as another explicit choice.
+- Multiple locally configured Codex identities are selectable. `codex2` is preferred on the current machine, with `codex` available as another explicit choice.
 - CareerOps stores the chosen executable on the provider/task record and never silently falls back to a different Codex identity after a task starts.
 
 ### Cloud AI Mode
@@ -311,8 +311,8 @@ The proper integration is a controlled Codex worker:
 Codex executable discovery is interchangeable but explicit:
 
 - `CAREEROPS_CODEX_COMMANDS` is an ordered comma-separated list, defaulting to `codex2,codex` for the current Windows installation.
-- Each available command becomes a separate provider choice, labelled with the exact resolved command and CLI version.
-- `codex2` is the default when available because it selects `C:\Users\nhnis\codex-account2\.codex` through its wrapper.
+- Each validated identity descriptor becomes a separate provider choice, labelled with its identity name, native executable, executable hash, CLI version, and explicit `CODEX_HOME`.
+- `codex2` is the default when available. Its approved `.cmd` wrapper is validated only as an identity descriptor; production resolves and invokes the native `codex.exe` directly with `CODEX_HOME=C:\Users\nhnis\codex-account2\.codex`.
 - `CAREEROPS_CODEX_COMMAND` may pin a single command for a deployment.
 - If a selected identity becomes unavailable, that task fails with a recoverable provider error. It is not rerouted to another account.
 - The worker uses read-only sandboxing, a bounded task directory, structured output, and ephemeral sessions. Prompt content goes through stdin; shell interpolation is not used.
@@ -393,7 +393,7 @@ These are the best default choices for the first AI implementation:
 2. First implementation task: AI JD analysis plus semantic fit review, because resume tailoring and cover letters depend on understanding the role correctly.
 3. Codex worker mode: implement after the local provider path is stable, then use it for evidence and repository deep review.
 4. OpenAI API mode: keep documented but disabled and unimplemented in the first AI build unless explicitly approved later.
-5. Secret storage for v1: do not store cloud AI secrets in SQLite. Use environment variables for optional providers. Local Ollama needs no API secret. Codex uses the existing local Codex authentication rather than app-managed credentials.
+5. Secret storage for v1: do not store cloud AI secrets in SQLite. Use environment variables for optional providers. Local Ollama needs no API secret. The ChatGPT-authenticated Codex provider uses the selected CLI identity's explicit `CODEX_HOME` rather than app-managed credentials.
 6. Normal CI: use mock providers only. Live local model and Codex tests are opt-in.
 7. UI: add an `AI tasks` panel to the existing application desk, not a chatbot-first interface.
 

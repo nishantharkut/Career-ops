@@ -1,16 +1,22 @@
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping
+from collections.abc import Mapping
 from dataclasses import dataclass, field
+import hashlib
 import json
 import math
 import os
 from pathlib import Path
+import re
 import shutil
-import subprocess
+import stat
+import tempfile
+import time
+from types import MappingProxyType
 from typing import Any
 
 from careerops.ai.contracts import (
+    MAX_PROVIDER_OUTPUT_BYTES,
     InvocationMetadata,
     ProviderAvailability,
     ProviderInvocationError,
@@ -19,87 +25,466 @@ from careerops.ai.contracts import (
     ProviderResult,
     ProviderTimeoutError,
     ProviderUnavailableError,
-    output_schema_for_task,
     parse_json_object,
-    validate_task_output,
+    serialize_provider_output,
+    validate_provider_output,
 )
+from careerops.ai.providers.base import build_provider_result
+from careerops.ai.providers.process import (
+    ProcessDeadlineExceeded,
+    ProcessRunner,
+    ProcessStartError,
+)
+from careerops.core.status import PrivacyMode
 
 
-ProcessRunner = Callable[..., subprocess.CompletedProcess[str]]
-Which = Callable[[str], str | None]
-MAX_CODEX_OUTPUT_BYTES = 2_000_000
+Which = Any
+_SEMVER = re.compile(
+    r"^codex-cli (0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)"
+    r"(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?"
+    r"(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$"
+)
+_SAFE_MODEL = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$")
+_SAFE_ENVIRONMENT_KEYS = (
+    "SYSTEMROOT",
+    "WINDIR",
+    "TEMP",
+    "TMP",
+    "USERPROFILE",
+    "HOME",
+    "LOCALAPPDATA",
+    "APPDATA",
+    "LANG",
+    "LC_ALL",
+)
+_WRAPPER_HOME = "%USERPROFILE%\\codex-account2\\.codex"
+
+
+@dataclass(frozen=True)
+class _CodexIdentity:
+    name: str
+    descriptor: Path
+    native_executable: Path
+    native_sha256: str
+    codex_home: Path
+
+
+def _remaining(deadline: float) -> float:
+    value = deadline - time.monotonic()
+    if value <= 0:
+        raise ProviderTimeoutError("Codex provider timed out")
+    return value
+
+
+def _read_single_link_file(path: Path, size_limit: int) -> tuple[bytes, os.stat_result]:
+    candidate = path.expanduser().absolute()
+    try:
+        before = candidate.lstat()
+    except OSError as error:
+        raise ProviderUnavailableError("Codex identity file was unavailable") from error
+    if (
+        stat.S_ISLNK(before.st_mode)
+        or not stat.S_ISREG(before.st_mode)
+        or before.st_nlink != 1
+        or before.st_size > size_limit
+    ):
+        raise ProviderUnavailableError("Codex identity file was unsafe")
+    flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = -1
+    try:
+        descriptor = os.open(candidate, flags)
+        opened = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or opened.st_nlink != 1
+            or (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino)
+        ):
+            raise ProviderUnavailableError("Codex identity file was unsafe")
+        chunks: list[bytes] = []
+        observed = 0
+        while True:
+            chunk = os.read(descriptor, min(64 * 1024, size_limit + 1 - observed))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            observed += len(chunk)
+            if observed > size_limit:
+                raise ProviderUnavailableError("Codex identity file was too large")
+        after = os.fstat(descriptor)
+    except OSError as error:
+        raise ProviderUnavailableError("Codex identity file was unavailable") from error
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+    if (
+        (opened.st_dev, opened.st_ino, opened.st_size, opened.st_mtime_ns)
+        != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)
+    ):
+        raise ProviderUnavailableError("Codex identity file changed during read")
+    return b"".join(chunks), after
+
+
+def _validate_codex_native(path: str | Path) -> tuple[Path, str]:
+    candidate = Path(path).expanduser().absolute()
+    if candidate.name.casefold() != "codex.exe":
+        raise ProviderUnavailableError("Native Codex executable must be codex.exe")
+    raw, _identity = _read_single_link_file(candidate, 256 * 1024 * 1024)
+    return candidate.resolve(), hashlib.sha256(raw).hexdigest()
+
+
+def _validate_codex_home(path: Path) -> Path:
+    candidate = path.expanduser().absolute()
+    try:
+        if candidate.is_symlink():
+            raise ProviderUnavailableError("CODEX_HOME must not be a symlink")
+        resolved = candidate.resolve(strict=True)
+    except OSError as error:
+        raise ProviderUnavailableError("CODEX_HOME was unavailable") from error
+    if not resolved.is_dir():
+        raise ProviderUnavailableError("CODEX_HOME was unavailable")
+    return resolved
+
+
+def _parse_codex2_wrapper(path: str | Path, environment: Mapping[str, str]) -> Path:
+    wrapper = Path(path).expanduser().absolute()
+    if wrapper.suffix.casefold() != ".cmd":
+        raise ProviderUnavailableError("codex2 must resolve to the approved .cmd descriptor")
+    raw, _identity = _read_single_link_file(wrapper, 4_096)
+    try:
+        lines = raw.decode("utf-8-sig").splitlines()
+    except UnicodeError as error:
+        raise ProviderUnavailableError("codex2 descriptor was invalid") from error
+    if lines and lines[0].casefold() == "@echo off":
+        lines = lines[1:]
+    expected = [
+        f'set "CODEX_HOME={_WRAPPER_HOME}"',
+        "codex %*",
+        "exit /b %ERRORLEVEL%",
+    ]
+    if [line.casefold() for line in lines] != [line.casefold() for line in expected]:
+        raise ProviderUnavailableError("codex2 descriptor was not the approved wrapper")
+    user_profile = environment.get("USERPROFILE", "").strip()
+    if not user_profile:
+        raise ProviderUnavailableError("USERPROFILE was unavailable for codex2")
+    return _validate_codex_home(
+        Path(user_profile) / "codex-account2" / ".codex"
+    )
+
+
+def _default_codex_home(environment: Mapping[str, str]) -> Path:
+    override = environment.get("CAREEROPS_CODEX_HOME", "").strip()
+    if override:
+        return _validate_codex_home(Path(override))
+    root = environment.get("USERPROFILE") or environment.get("HOME")
+    if not root:
+        raise ProviderUnavailableError("User home was unavailable for Codex")
+    return _validate_codex_home(Path(root) / ".codex")
+
+
+def _write_exclusive(path: Path, value: bytes) -> None:
+    flags = (
+        os.O_WRONLY
+        | os.O_CREAT
+        | os.O_EXCL
+        | getattr(os, "O_BINARY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    descriptor = -1
+    try:
+        descriptor = os.open(path, flags, 0o600)
+        offset = 0
+        while offset < len(value):
+            offset += os.write(descriptor, value[offset:])
+        os.fsync(descriptor)
+    except OSError as error:
+        raise ProviderInvocationError("Could not create isolated Codex input") from error
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+
+
+def _read_codex_output(path: Path, attempt_dir: Path) -> bytes:
+    # A random provider-owned directory narrows same-user races; path APIs cannot
+    # make another process under the same OS account fully non-adversarial.
+    try:
+        before = path.lstat()
+        resolved = path.resolve(strict=True)
+        resolved.relative_to(attempt_dir)
+    except (OSError, ValueError) as error:
+        raise ProviderOutputError("Codex did not create a safe output file") from error
+    if (
+        stat.S_ISLNK(before.st_mode)
+        or not stat.S_ISREG(before.st_mode)
+        or before.st_nlink != 1
+        or before.st_size > MAX_PROVIDER_OUTPUT_BYTES
+    ):
+        raise ProviderOutputError("Codex output was not a bounded single-link file")
+    flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = -1
+    try:
+        descriptor = os.open(path, flags)
+        opened = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or opened.st_nlink != 1
+            or (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino)
+        ):
+            raise ProviderOutputError("Codex output identity was unsafe")
+        chunks: list[bytes] = []
+        observed = 0
+        while True:
+            chunk = os.read(
+                descriptor,
+                min(64 * 1024, MAX_PROVIDER_OUTPUT_BYTES + 1 - observed),
+            )
+            if not chunk:
+                break
+            chunks.append(chunk)
+            observed += len(chunk)
+            if observed > MAX_PROVIDER_OUTPUT_BYTES:
+                raise ProviderOutputError("Codex output exceeded the size limit")
+        after = os.fstat(descriptor)
+    except OSError as error:
+        raise ProviderOutputError("Codex output could not be read") from error
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+    if (
+        (opened.st_dev, opened.st_ino, opened.st_size, opened.st_mtime_ns)
+        != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)
+    ):
+        raise ProviderOutputError("Codex output changed during read")
+    return b"".join(chunks)
 
 
 @dataclass(frozen=True)
 class CodexProvider:
     executable: str
     executable_name: str | None = None
-    model: str = "account-default"
+    model: str | None = None
+    reasoning_effort: str | None = None
     timeout_seconds: float = 180
     is_default: bool = False
     which: Which = field(default=shutil.which, repr=False, compare=False)
-    run_process: ProcessRunner = field(
-        default=subprocess.run, repr=False, compare=False
+    environment: Mapping[str, str] | None = field(
+        default=None, repr=False, compare=False
+    )
+    process_runner: Any = field(
+        default_factory=ProcessRunner, repr=False, compare=False
+    )
+    _identity: _CodexIdentity | None = field(
+        init=False, default=None, repr=False, compare=False
     )
 
     def __post_init__(self) -> None:
-        executable = self.executable.strip()
-        if not executable:
+        configured = self.executable.strip()
+        if not configured:
             raise ValueError("Codex executable must not be empty")
         if not math.isfinite(self.timeout_seconds) or self.timeout_seconds <= 0:
             raise ValueError("timeout_seconds must be finite and positive")
-        object.__setattr__(self, "executable", executable)
-        if self.executable_name is None:
-            object.__setattr__(self, "executable_name", Path(executable).stem)
+        environment = MappingProxyType(
+            dict(os.environ if self.environment is None else self.environment)
+        )
+        model = self.model or environment.get(
+            "CAREEROPS_CODEX_MODEL", "gpt-5.6-sol"
+        )
+        effort = self.reasoning_effort or environment.get(
+            "CAREEROPS_CODEX_REASONING_EFFORT", "xhigh"
+        )
+        if _SAFE_MODEL.fullmatch(model) is None:
+            raise ValueError("CAREEROPS_CODEX_MODEL was invalid")
+        if effort not in {"low", "medium", "high", "xhigh"}:
+            raise ValueError("CAREEROPS_CODEX_REASONING_EFFORT was invalid")
+        object.__setattr__(self, "executable", configured)
+        object.__setattr__(self, "environment", environment)
+        object.__setattr__(self, "model", model)
+        object.__setattr__(self, "reasoning_effort", effort)
+
+    @property
+    def identity_name(self) -> str:
+        return self._resolved_identity().name
+
+    @property
+    def native_executable(self) -> Path:
+        return self._resolved_identity().native_executable
+
+    @property
+    def codex_home(self) -> Path:
+        return self._resolved_identity().codex_home
+
+    def _resolved_identity(self) -> _CodexIdentity:
+        if self._identity is not None:
+            return self._identity
+        environment = self.environment or {}
+        configured_path = Path(self.executable).expanduser()
+        explicit_native = configured_path.is_absolute() or any(
+            separator in self.executable for separator in ("/", "\\")
+        )
+        if explicit_native:
+            if configured_path.suffix.casefold() != ".exe":
+                raise ProviderUnavailableError("Only native Codex .exe overrides are allowed")
+            native, digest = _validate_codex_native(configured_path)
+            name = self.executable_name or "codex"
+            descriptor = native
+            codex_home = _default_codex_home(environment)
+        else:
+            name = (self.executable_name or self.executable).strip()
+            if name not in {"codex2", "codex"}:
+                raise ProviderUnavailableError(f"Unsupported Codex identity: {name}")
+            try:
+                selected = self.which(name)
+            except Exception as error:
+                raise ProviderUnavailableError(
+                    f"Selected Codex identity is unavailable: {name}"
+                ) from error
+            if not selected:
+                raise ProviderUnavailableError(
+                    f"Selected Codex identity is unavailable: {name}"
+                )
+            descriptor = Path(selected).expanduser().absolute()
+            if name == "codex2":
+                codex_home = _parse_codex2_wrapper(descriptor, environment)
+                try:
+                    native_value = self.which("codex")
+                except Exception as error:
+                    raise ProviderUnavailableError(
+                        "Native Codex executable was unavailable for codex2"
+                    ) from error
+                if not native_value:
+                    raise ProviderUnavailableError(
+                        "Native Codex executable was unavailable for codex2"
+                    )
+                native, digest = _validate_codex_native(native_value)
+            else:
+                native, digest = _validate_codex_native(descriptor)
+                codex_home = _default_codex_home(environment)
+        identity = _CodexIdentity(name, descriptor, native, digest, codex_home)
+        object.__setattr__(self, "_identity", identity)
+        return identity
+
+    def _safe_environment(self, identity: _CodexIdentity) -> dict[str, str]:
+        source = self.environment or {}
+        safe = {
+            key: source[key]
+            for key in _SAFE_ENVIRONMENT_KEYS
+            if key in source and isinstance(source[key], str)
+        }
+        safe["CODEX_HOME"] = str(identity.codex_home)
+        return safe
+
+    def _run_boundary(
+        self,
+        identity: _CodexIdentity,
+        command: list[str],
+        *,
+        input_bytes: bytes,
+        deadline: float,
+        capture_limit: int,
+    ):
+        try:
+            return self.process_runner.run(
+                command,
+                input_bytes=input_bytes,
+                timeout_seconds=_remaining(deadline),
+                environment=self._safe_environment(identity),
+                capture_limit=capture_limit,
+            )
+        except ProcessDeadlineExceeded as error:
+            raise ProviderTimeoutError(
+                f"Codex provider timed out ({identity.name})"
+            ) from error
+        except ProcessStartError as error:
+            raise ProviderUnavailableError(
+                f"Selected Codex identity is unavailable: {identity.name}"
+            ) from error
+
+    def _probe_identity(
+        self, identity: _CodexIdentity, deadline: float
+    ) -> tuple[str, str]:
+        native, digest = _validate_codex_native(identity.native_executable)
+        if native != identity.native_executable or digest != identity.native_sha256:
+            raise ProviderUnavailableError("Native Codex executable identity changed")
+        version_result = self._run_boundary(
+            identity,
+            [str(native), "--version"],
+            input_bytes=b"",
+            deadline=deadline,
+            capture_limit=4_096,
+        )
+        try:
+            version = version_result.stdout.decode("utf-8").strip()
+        except UnicodeError as error:
+            raise ProviderUnavailableError("Codex version output was invalid") from error
+        if version_result.returncode != 0 or _SEMVER.fullmatch(version) is None:
+            raise ProviderUnavailableError("Codex version could not be verified")
+        login_result = self._run_boundary(
+            identity,
+            [str(native), "login", "status"],
+            input_bytes=b"",
+            deadline=deadline,
+            capture_limit=4_096,
+        )
+        try:
+            login = login_result.stdout.decode("utf-8").strip()
+        except UnicodeError as error:
+            raise ProviderUnavailableError("Codex login status was invalid") from error
+        if login_result.returncode != 0 or login != "Logged in using ChatGPT":
+            raise ProviderUnavailableError("Codex ChatGPT login was not available")
+        return version, digest
 
     def availability(self) -> ProviderAvailability:
-        resolved = ""
-        version = ""
         try:
-            resolved = self._resolve_selected()
-            version = self._verify_version(resolved)
+            identity = self._resolved_identity()
+            version, digest = self._probe_identity(
+                identity, time.monotonic() + min(self.timeout_seconds, 20)
+            )
             available = True
             detail = "available"
         except Exception:
+            identity = self._identity
+            version = ""
+            digest = ""
             available = False
             detail = "unavailable"
         return ProviderAvailability(
             available=available,
             provider_kind="codex",
             model=self.model,
-            privacy_mode="cloud_review",
+            privacy_mode=PrivacyMode.CLOUD_EXTERNAL,
             data_leaves_machine=True,
             is_ai=True,
             detail=detail,
-            executable=resolved,
+            identity_name=identity.name if identity else "",
+            executable=str(identity.native_executable) if identity else "",
+            executable_sha256=digest,
             executable_version=version,
+            codex_home=str(identity.codex_home) if identity else "",
+            reasoning_effort=self.reasoning_effort,
         )
 
     def build_command(
         self,
-        task_dir: Path,
+        identity: _CodexIdentity,
+        attempt_dir: Path,
         schema_path: Path,
         output_path: Path,
-        resolved_executable: str | None = None,
     ) -> list[str]:
-        task_dir = task_dir.resolve(strict=True)
-        schema_path = schema_path.resolve(strict=True)
-        output_path = output_path.resolve(strict=False)
-        for path, label in ((schema_path, "schema"), (output_path, "output")):
-            try:
-                path.relative_to(task_dir)
-            except ValueError as error:
-                raise ProviderOutputError(
-                    f"Codex {label} path escaped task_dir"
-                ) from error
-        executable = resolved_executable or self._resolve_selected()
         return [
-            executable,
+            str(identity.native_executable),
             "exec",
+            "--ignore-user-config",
+            "--ignore-rules",
+            "--strict-config",
+            "--model",
+            self.model,
+            "-c",
+            f'model_reasoning_effort="{self.reasoning_effort}"',
+            "-c",
+            'shell_environment_policy.inherit="none"',
             "--sandbox",
             "read-only",
             "--cd",
-            str(task_dir),
+            str(attempt_dir),
             "--skip-git-repo-check",
             "--ephemeral",
             "--output-schema",
@@ -109,136 +494,62 @@ class CodexProvider:
         ]
 
     def run(self, request: ProviderRequest) -> ProviderResult:
-        self._load_matching_schema(request)
-        resolved = self._resolve_selected()
-        version = self._verify_version(resolved)
-        output_path = request.task_dir / f"codex-output-{request.task_id}.json"
-        if output_path.is_symlink():
-            raise ProviderOutputError("Codex output path was not a regular file")
-        if output_path.exists():
-            if not output_path.is_file():
-                raise ProviderOutputError("Codex output path was not a regular file")
-            output_path.unlink()
+        deadline = time.monotonic() + self.timeout_seconds
+        identity = self._resolved_identity()
+        version, digest = self._probe_identity(identity, deadline)
+        try:
+            attempt_dir = Path(
+                tempfile.mkdtemp(prefix=".careerops-attempt-", dir=request.task_dir)
+            ).resolve(strict=True)
+            attempt_dir.relative_to(request.task_dir)
+        except (OSError, ValueError) as error:
+            raise ProviderInvocationError("Could not isolate Codex attempt") from error
+        schema_path = attempt_dir / "schema.json"
+        output_path = attempt_dir / "output.json"
+        _write_exclusive(schema_path, request.schema_snapshot)
         command = self.build_command(
-            request.task_dir,
-            request.schema_path,
-            output_path,
-            resolved_executable=resolved,
+            identity, attempt_dir, schema_path, output_path
         )
-        try:
-            prompt = request.prompt_path.read_text(encoding="utf-8")
-            context = request.context_path.read_text(encoding="utf-8")
-        except (OSError, UnicodeError) as error:
-            raise ProviderInvocationError("Provider input could not be read") from error
-        stdin = f"{prompt}\n\n<careerops_context>\n{context}\n</careerops_context>"
-        try:
-            completed = self.run_process(
-                command,
-                input=stdin,
-                capture_output=True,
-                text=True,
-                timeout=self.timeout_seconds,
-                shell=False,
-                check=False,
-            )
-        except (subprocess.TimeoutExpired, TimeoutError) as error:
-            raise ProviderTimeoutError(
-                f"Codex provider timed out ({self.executable_name})"
-            ) from error
-        except (FileNotFoundError, OSError) as error:
-            raise ProviderUnavailableError(
-                f"Selected Codex executable is unavailable: {self.executable_name}"
-            ) from error
+        stdin = (
+            request.prompt_snapshot
+            + b"\n\n<careerops_context>\n"
+            + request.context_snapshot
+            + b"\n</careerops_context>"
+        )
+        completed = self._run_boundary(
+            identity,
+            command,
+            input_bytes=stdin,
+            deadline=deadline,
+            capture_limit=0,
+        )
         if completed.returncode != 0:
             raise ProviderInvocationError(
                 f"Codex provider failed with exit code {completed.returncode}"
             )
-        if output_path.is_symlink():
-            raise ProviderOutputError("Codex output path was not a regular file")
-        if not output_path.is_file():
-            raise ProviderOutputError("Codex did not create its output file")
-        try:
-            if output_path.stat().st_size > MAX_CODEX_OUTPUT_BYTES:
-                raise ProviderOutputError("Codex output exceeded the size limit")
-            raw_output = output_path.read_text(encoding="utf-8")
-        except (OSError, UnicodeError) as error:
-            raise ProviderOutputError("Codex output could not be read") from error
-        payload = parse_json_object(raw_output)
-        output = validate_task_output(request.task_type, payload)
-        return ProviderResult(
+        raw = _read_codex_output(output_path, attempt_dir)
+        payload = parse_json_object(raw)
+        output = validate_provider_output(request, payload)
+        raw_output = serialize_provider_output(output)
+        return build_provider_result(
             provider_kind="codex",
             model=self.model,
-            privacy_mode="cloud_review",
+            privacy_mode=PrivacyMode.CLOUD_EXTERNAL,
             data_leaves_machine=True,
             is_ai=True,
             structured_output=output,
             raw_output=raw_output,
             invocation=InvocationMetadata(
                 mode="codex_exec",
-                executable=resolved,
+                identity_name=identity.name,
+                executable=str(identity.native_executable),
+                executable_sha256=digest,
                 executable_version=version,
+                codex_home=str(identity.codex_home),
+                reasoning_effort=self.reasoning_effort,
                 command=tuple(command),
             ),
         )
-
-    def _resolve_selected(self) -> str:
-        executable_path = Path(self.executable).expanduser()
-        path_like = executable_path.is_absolute() or any(
-            separator in self.executable for separator in ("/", "\\")
-        )
-        if path_like:
-            if executable_path.is_file():
-                return str(executable_path.resolve())
-            resolved = None
-        else:
-            try:
-                resolved = self.which(self.executable)
-            except Exception as error:
-                raise ProviderUnavailableError(
-                    f"Selected Codex executable is unavailable: {self.executable_name}"
-                ) from error
-        if not resolved:
-            raise ProviderUnavailableError(
-                f"Selected Codex executable is unavailable: {self.executable_name}"
-            )
-        return str(Path(resolved).expanduser().resolve())
-
-    def _verify_version(self, resolved_executable: str) -> str:
-        try:
-            completed = self.run_process(
-                [resolved_executable, "--version"],
-                capture_output=True,
-                text=True,
-                timeout=min(self.timeout_seconds, 10),
-                shell=False,
-                check=False,
-            )
-        except Exception as error:
-            raise ProviderUnavailableError(
-                f"Selected Codex executable is unavailable: {self.executable_name}"
-            ) from error
-        if completed.returncode != 0:
-            raise ProviderUnavailableError(
-                f"Selected Codex executable is unavailable: {self.executable_name}"
-            )
-        version = next(
-            (line.strip() for line in completed.stdout.splitlines() if line.strip()), ""
-        )
-        if not version:
-            raise ProviderUnavailableError(
-                f"Selected Codex executable is unavailable: {self.executable_name}"
-            )
-        return version[:2_048]
-
-    @staticmethod
-    def _load_matching_schema(request: ProviderRequest) -> dict[str, Any]:
-        try:
-            schema = json.loads(request.schema_path.read_text(encoding="utf-8"))
-        except (OSError, UnicodeError, ValueError) as error:
-            raise ProviderOutputError("Task schema input was invalid") from error
-        if schema != output_schema_for_task(request.task_type):
-            raise ProviderOutputError("Task schema did not match the task type")
-        return schema
 
 
 def _configured_commands(environment: Mapping[str, str]) -> list[str]:
@@ -267,29 +578,29 @@ def _configured_commands(environment: Mapping[str, str]) -> list[str]:
 def discover_codex_providers(
     *,
     which: Which = shutil.which,
-    run_process: ProcessRunner = subprocess.run,
     environment: Mapping[str, str] | None = None,
     timeout_seconds: float = 180,
+    process_runner: Any | None = None,
 ) -> list[CodexProvider]:
-    configured = _configured_commands(
-        os.environ if environment is None else environment
-    )
+    environment = dict(os.environ if environment is None else environment)
     providers: list[CodexProvider] = []
-    for name in configured:
-        try:
-            resolved = which(name)
-        except Exception:
-            resolved = None
-        if not resolved:
-            continue
-        providers.append(
-            CodexProvider(
-                executable=resolved,
-                executable_name=name,
-                timeout_seconds=timeout_seconds,
-                is_default=not providers,
-                which=which,
-                run_process=run_process,
-            )
+    for configured in _configured_commands(environment):
+        provider = CodexProvider(
+            executable=configured,
+            executable_name=(
+                Path(configured).stem
+                if Path(configured).is_absolute()
+                else configured
+            ),
+            timeout_seconds=timeout_seconds,
+            is_default=not providers,
+            which=which,
+            environment=environment,
+            process_runner=process_runner or ProcessRunner(),
         )
+        try:
+            provider._resolved_identity()
+        except ProviderUnavailableError:
+            continue
+        providers.append(provider)
     return providers
