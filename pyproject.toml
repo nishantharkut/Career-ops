@@ -20,6 +20,10 @@ dev = [
   "httpx>=0.28",
 ]
 
+[tool.setuptools.packages.find]
+include = ["careerops*", "apps", "apps.api", "apps.api.*"]
+exclude = ["apps.web*"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["."]
