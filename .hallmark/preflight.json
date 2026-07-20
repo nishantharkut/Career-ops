@@ -1,0 +1,13 @@
+{
+  "date": "2026-07-21",
+  "framework": "Vite React",
+  "font_stack": "IBM Plex Sans and IBM Plex Mono via @fontsource",
+  "palette": "OKLCH tokens in apps/web/src/tokens.css",
+  "motion": "motion-cut with button microinteraction only",
+  "spacing": "4pt token scale",
+  "preserve": [
+    "operational three-pane workbench",
+    "minimal copy",
+    "local-first UI"
+  ]
+}
