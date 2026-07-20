@@ -8,6 +8,7 @@ exports/
 
 # Secrets and local config
 .env
+.worktrees/
 .env.*
 !.env.example
 secrets/
