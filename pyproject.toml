@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "careerops"
+version = "0.1.0"
+requires-python = ">=3.14"
+dependencies = [
+  "fastapi>=0.116",
+  "uvicorn[standard]>=0.35",
+  "pydantic>=2.11",
+  "python-multipart>=0.0.20",
+  "pypdf>=5.0",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.4",
+  "httpx>=0.28",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
