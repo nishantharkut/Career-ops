@@ -1,12 +1,12 @@
 # CareerOps System Design
 
-Status: approved direction, not implemented.
+Status: approved direction with AI-first correction pending review.
 
-Source of truth: `docs/context-reconstruction.md` and `docs/prd.md`.
+Source of truth: `docs/context-reconstruction.md`, `docs/prd.md`, and `docs/superpowers/specs/2026-07-21-ai-first-careerops-design.md`.
 
 ## 1. Architecture Decision
 
-CareerOps should be a local web application with a Python backend, a SQLite database, a local file vault, and a React UI.
+CareerOps should be a local AI-assisted web application with a Python backend, a SQLite database, a local file vault, provider adapters, deterministic verification, and a React UI.
 
 Chosen stack:
 
@@ -16,12 +16,16 @@ Chosen stack:
 - Database migrations: Alembic or a simple migration runner for v0.
 - Frontend: React with TypeScript and Vite.
 - UI style: token-based CSS, minimal operational design, Hallmark-informed audit rules.
+- AI orchestration: explicit AI task records with provider adapters and structured output schemas.
+- Primary AI target: local OSS runtime when installed.
+- Deep-review AI target: optional local Codex worker.
+- Cloud AI target: optional OpenAI API provider, disabled by default.
 - PDF and resume processing: local Python tools.
 - LaTeX rendering: local compiler adapter.
 - UI testing: Playwright.
 - Backend testing: pytest.
 
-This stack is chosen because it is local-first, testable, simple to run, and can also be hosted as a low-cost self-contained container when auth, HTTPS, and persistent volumes are configured.
+This stack is chosen because it is local-first, AI-capable, testable, simple to run, and can also be hosted as a low-cost self-contained container when auth, HTTPS, and persistent volumes are configured.
 
 ## 2. High-Level Components
 
@@ -36,8 +40,66 @@ Owns:
 - approval state
 - file indexing
 - audit logs
+- AI task orchestration
+- provider configuration
+- deterministic verification of AI output
 
 The API must fail closed. If validation, rendering, parsing, or report generation fails, the application cannot be approved.
+
+### AI Task Orchestrator
+
+The orchestrator owns model-facing work.
+
+It must:
+
+- build bounded context packets from selected artifacts
+- choose a configured provider
+- call the provider adapter
+- validate structured output
+- store output as versioned artifacts
+- run deterministic verifiers
+- expose status to the UI
+
+AI tasks are asynchronous and resumable. Provider failure must leave application, resume, and approval state unchanged.
+
+### Provider Adapter Layer
+
+Provider adapters normalize different AI runtimes into one contract.
+
+Required provider kinds:
+
+- `local_oss`: local model runtime, with Ollama as the recommended first target and LM Studio or another OpenAI-compatible runtime later.
+- `codex_worker`: local Codex worker for deep repository, evidence, and session review.
+- `openai_api`: optional cloud AI provider, disabled by default.
+- `deterministic`: rule-based fallback and verifier.
+
+Provider output must include:
+
+- provider kind
+- model or runtime name
+- privacy mode
+- prompt version
+- structured JSON
+- raw output artifact path when safe
+- error summary when failed
+
+### Deterministic Verifier
+
+The verifier is authoritative over AI confidence.
+
+It checks:
+
+- output schema
+- unsupported claims
+- evidence mismatch
+- stale PDF
+- unsafe title phrasing
+- NDA-sensitive wording
+- secret-like text
+- prompt-injection artifacts
+- approval bypass attempts
+
+If the verifier blocks an AI suggestion, the suggestion can be shown as blocked but cannot be accepted into an approved packet.
 
 ### Local Database
 
@@ -88,19 +150,13 @@ It must check:
 
 The parser extracts structured requirements from the job description.
 
-It should start deterministic:
+It should be hybrid:
 
-- headings
-- required skills
-- preferred skills
-- responsibilities
-- eligibility constraints
-- location
-- duration
-- work mode
-- year or graduation constraints
+- AI extracts semantic requirements, hidden expectations, role family, and likely ATS terms.
+- Deterministic parsing extracts headings, required skills, preferred skills, responsibilities, eligibility constraints, location, duration, work mode, and year constraints.
+- The final result preserves uncertainty and records the provider.
 
-It may add local open-source NLP later, but v0 must remain useful without cloud calls.
+The deterministic parser remains a fallback and verifier. It is not the full product.
 
 ### Fit Analyzer
 
@@ -116,7 +172,7 @@ It should produce:
 - profile evidence gaps
 - resume quality issues
 
-The analyzer must explain each finding. A score without reasons is not acceptable.
+AI should handle semantic reasoning and edit suggestions. Deterministic checks should verify parse health, keyword coverage, evidence status, and blockers. A score without reasons is not acceptable.
 
 ### Risk Gate Engine
 
@@ -145,6 +201,7 @@ Primary screens:
 - Evidence Vault
 - Report Review
 - Settings
+- AI Tasks
 
 No login is needed for local-only v0 because the app is single-user on the user's machine. Hosted v0 must enable Basic Auth before private data is entered.
 
@@ -256,6 +313,75 @@ Fields:
 - `warning_count`
 - `created_at`
 
+### AiProviderConfig
+
+Fields:
+
+- `id`
+- `provider_kind`
+- `display_name`
+- `enabled`
+- `privacy_mode`
+- `endpoint`
+- `model`
+- `created_at`
+- `updated_at`
+
+Secrets must not be stored in plaintext in SQLite.
+
+### AiTask
+
+Fields:
+
+- `id`
+- `application_id`
+- `task_type`
+- `provider_config_id`
+- `input_artifact_ids`
+- `output_artifact_ids`
+- `status`
+- `privacy_mode`
+- `started_at`
+- `completed_at`
+- `error_summary`
+
+### AiArtifact
+
+Fields:
+
+- `id`
+- `task_id`
+- `artifact_type`
+- `path`
+- `sha256`
+- `schema_version`
+- `created_at`
+
+### AiFinding
+
+Fields:
+
+- `id`
+- `task_id`
+- `finding_type`
+- `severity`
+- `claim_text`
+- `evidence_item_id`
+- `recommendation`
+- `verifier_state`
+
+### PromptTemplate
+
+Fields:
+
+- `id`
+- `name`
+- `task_type`
+- `version`
+- `template_path`
+- `sha256`
+- `created_at`
+
 ### Approval
 
 Fields:
@@ -298,6 +424,7 @@ CareerOps/
     core/
     parsers/
     analyzers/
+    ai/
     renderers/
     gates/
   tests/
@@ -308,6 +435,7 @@ CareerOps/
     resumes/
     evidence/
     reports/
+    ai-tasks/
     exports/
 ```
 
@@ -321,8 +449,9 @@ For hosted v0, `data/` and `vault/` must be mounted as persistent volumes. Ephem
 
 1. User enters company, role, source URL, and JD text.
 2. API writes a JD snapshot.
-3. JD parser extracts requirements.
-4. Application status becomes `draft`.
+3. AI task extracts semantic requirements when a provider is enabled.
+4. Deterministic parser extracts fallback requirements and verifier facts.
+5. Application status becomes `draft`.
 
 ### Attach Resume
 
@@ -334,11 +463,22 @@ For hosted v0, `data/` and `vault/` must be mounted as persistent volumes. Ephem
 
 ### Analyze Application
 
-1. Fit analyzer compares JD requirements with resume text and evidence.
-2. Risk gate engine evaluates blocking issues.
-3. Report is saved.
-4. Application status becomes `ready_for_review` if no blockers exist.
-5. Application status becomes `needs_evidence` or `needs_resume_update` if blockers exist.
+1. AI task compares JD requirements with resume text, profile facts, and evidence.
+2. Fit analyzer computes deterministic exact-match, parse-health, and evidence checks.
+3. Risk gate engine evaluates blocking issues.
+4. Report and AI artifacts are saved.
+5. Application status becomes `ready_for_review` if no blockers exist.
+6. Application status becomes `needs_evidence` or `needs_resume_update` if blockers exist.
+
+### Run AI Task
+
+1. User selects a structured task such as `Analyze JD`, `Suggest resume edits`, or `Codex deep review`.
+2. API builds a bounded context packet from approved artifacts only.
+3. Provider adapter runs the task.
+4. Output is validated against schema.
+5. Verifier evaluates safety and evidence.
+6. UI shows accepted, warning, and blocked suggestions separately.
+7. Accepting a suggestion creates a new draft artifact version.
 
 ### Approve
 
@@ -358,7 +498,7 @@ The app never auto-submits in v0.
 
 ## 6. Scoring Design
 
-The score is local and explainable. It is not a Resume Worded score and not an employer ATS score.
+The score is local, AI-assisted, and explainable. It is not a Resume Worded score and not an employer ATS score.
 
 Suggested score parts:
 
@@ -369,6 +509,8 @@ Suggested score parts:
 - evidence confidence
 - resume parse health
 - resume quality checks
+- AI semantic match confidence
+- AI edit usefulness after verification
 
 The UI must show the parts before the total. If a total score is shown, it should be treated as a summary, not a truth.
 
@@ -391,11 +533,13 @@ The app must:
 
 - run locally by default
 - support same-origin hosted serving with auth
-- not send private data to cloud APIs
+- not send private data to cloud APIs unless cloud AI mode is explicitly configured and approved
 - redact secret-like values in logs
 - keep cloud watcher separate from private processing
 - keep approval and submission separate
 - avoid storing raw credentials
+- treat model prompts and outputs as private artifacts
+- prevent prompt injection from JD, resume, or session text
 
 Public hosting must not expose the API without auth and HTTPS. Free hosted databases or object stores must not become the source of truth unless the user explicitly approves storing private resume artifacts in cloud services.
 
@@ -415,6 +559,11 @@ Required test layers:
 - UI Playwright tests
 - visual and responsive checks
 - artifact integrity checks
+- AI provider adapter tests
+- AI task schema tests
+- prompt-injection tests
+- mock-provider CI tests
+- Codex worker command-construction tests
 
 The known historical failure modes must become test fixtures.
 
@@ -423,10 +572,11 @@ The known historical failure modes must become test fixtures.
 Later phases may add:
 
 - repository inspection service
-- local embeddings
+- local embeddings and vector search
 - richer resume tailoring
 - cloud watcher for public job discovery
 - email alert ingestion
 - browser-assisted manual workflows
+- optional cloud AI provider
 
 These must not weaken the local privacy boundary.

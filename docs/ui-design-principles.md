@@ -1,6 +1,6 @@
 # CareerOps UI Design Principles
 
-Status: required UI direction for v0.
+Status: required UI direction for the AI-assisted application desk.
 
 Inputs:
 
@@ -11,7 +11,7 @@ Inputs:
 
 ## 1. UI Position
 
-CareerOps is an operational tool. It is not a landing page, not a chatbot wrapper, and not a motivational dashboard.
+CareerOps is an operational tool. It is not a landing page, not a chat-first wrapper, and not a motivational dashboard.
 
 The UI should feel like a private workbench:
 
@@ -50,6 +50,7 @@ Bad labels:
 - `Seamless application intelligence`
 - `Transform your career journey`
 - `Smart insights`
+- `AI autopilot`
 
 ## 3. First Screen
 
@@ -60,6 +61,7 @@ Layout:
 - left rail: applications
 - center pane: selected application and JD
 - right pane: checks, resume status, reports, and approval
+- right pane extension: AI tasks, provider status, and verifier status
 
 No hero section. No welcome banner. No decorative empty dashboard.
 
@@ -82,6 +84,8 @@ Use a small, plain navigation structure:
 - `Settings`
 
 Do not use a generic SaaS nav with marketing links. No pricing, blog, resources, or CTA nav.
+
+AI belongs inside structured task controls, not as the primary navigation.
 
 ## 5. Visual Rules
 
@@ -269,3 +273,28 @@ For CareerOps, Hallmark means:
 
 The product should still look like a focused internal tool.
 
+## 14. AI Task UI
+
+AI controls must be explicit and plain.
+
+Required labels:
+
+- `Run AI review`
+- `Local model`
+- `Codex deep review`
+- `Cloud AI disabled`
+- `Private data stays local`
+- `Verifier only`
+- `Creates draft only`
+- `Accept suggestion`
+- `Reject suggestion`
+
+Required metadata:
+
+- provider
+- privacy mode
+- task status
+- generated artifact version
+- verifier result
+
+Do not hide provider failure behind optimistic copy. If AI is unavailable, say so and show the deterministic verifier state separately.

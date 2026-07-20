@@ -93,7 +93,28 @@ The following known issues must be encoded as regression tests:
 - Generic model-name dumping in skills is blocked.
 - Keyword banners are blocked.
 
-## 7. Approval Gates
+## 7. AI Gates
+
+Block approval when:
+
+- an AI-generated claim has no linked evidence
+- an AI suggestion contradicts a verified profile fact
+- an AI suggestion revives a rejected claim
+- an AI task output fails schema validation
+- an AI task output has no provider, model, prompt version, privacy mode, or checksum
+- a cloud AI provider handled private data without explicit configuration and task approval
+- an AI draft overwrote a resume source or approved artifact instead of creating a new version
+- prompt-injection text from a JD, resume, or session file appears to control system behavior
+- the UI hides that the output came from verifier-only fallback instead of full AI review
+
+Warnings:
+
+- local AI provider is unavailable and only deterministic verifier output exists
+- AI confidence is low but no blocker is present
+- AI found a semantic match that still lacks public wording or evidence
+- Codex deep review used selected local files that should be reviewed before storing long-term
+
+## 8. Approval Gates
 
 Block approval when:
 
@@ -102,17 +123,20 @@ Block approval when:
 - selected resume changed after report
 - approval record checksum does not match current PDF
 - application has blocking risks
+- latest accepted AI suggestions have not been verified
 
 The user must be able to approve only after seeing:
 
 - selected PDF
 - fit report
 - risk report
+- AI task output when AI was used
+- provider and privacy mode when AI was used
 - blocking issue count
 - warning count
 - exact resume version
 
-## 8. Submission Gates
+## 9. Submission Gates
 
 The app must not submit applications in v0.
 
@@ -122,7 +146,7 @@ Manual submission record can be saved only after:
 - user confirms they submitted outside the app
 - timestamp and note are recorded
 
-## 9. UI Gates
+## 10. UI Gates
 
 Block completion of the UI when:
 
@@ -146,7 +170,7 @@ Required status labels:
 - `Submitted manually`
 - `Archived`
 
-## 10. Artifact Gates
+## 11. Artifact Gates
 
 Block completion when:
 
@@ -156,7 +180,7 @@ Block completion when:
 - export packet omits approval record
 - generated files overwrite user files silently
 
-## 11. Test Gates
+## 12. Test Gates
 
 Before v0 is complete:
 
@@ -170,8 +194,10 @@ Before v0 is complete:
 - invented metric fixture must block approval
 - unsupported title fixture must block approval
 - NDA wording fixture must block approval
+- AI-generated unsupported claim fixture must block approval
+- cloud AI disabled-by-default fixture must pass
+- provider-unavailable fallback fixture must show `Verifier only`
 
-## 12. Done Means
+## 13. Done Means
 
-Done means the system can stop a bad application packet, not just generate a polished one.
-
+Done means the system can stop a bad application packet and unsafe AI output, not just generate a polished one.

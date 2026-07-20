@@ -1,26 +1,26 @@
 # CareerOps PRD
 
-Status: approved direction, not implemented.
+Status: approved direction with AI-first correction pending review.
 
-Source of truth: `docs/context-reconstruction.md`.
+Source of truth: `docs/context-reconstruction.md` and `docs/superpowers/specs/2026-07-21-ai-first-careerops-design.md`.
 
 Product slice: Application Desk v0.
 
 ## 1. Objective
 
-CareerOps v0 is a private application desk for one user: Nishant Harkut. It runs locally by default and can be hosted as a low-cost authenticated single-user app. It must help turn a job description into a safe application packet without inventing facts, leaking private information, or submitting anything without approval.
+CareerOps v0 is a private AI-assisted application desk for one user: Nishant Harkut. It runs locally by default and can be hosted as a low-cost authenticated single-user app. It must help turn a job description into a safe application packet without inventing facts, leaking private information, or submitting anything without approval.
 
 The first usable workflow must support this loop:
 
 1. Add a job description or application link.
 2. Create an application record.
-3. Compare the role against the verified profile and evidence vault.
+3. Use AI to understand the role against the verified profile and evidence vault.
 4. Select or create a LaTeX resume version.
 5. Render the PDF locally.
-6. Produce a local fit and risk report.
+6. Produce an AI-assisted fit report and deterministic risk report.
 7. Require user approval before the application is marked ready.
 
-The product is not a chat memory. It is a controlled local system with explicit records, evidence, versions, and gates.
+The product is not a chat memory. It is a controlled local AI system with explicit records, evidence, versions, provider metadata, and gates.
 
 ## 2. Why This Slice Comes First
 
@@ -49,7 +49,7 @@ Context from reconstruction:
 - Uses LaTeX resumes.
 - Wants reliable, direct, non-bloated guidance.
 - Wants repository inspection before accepting metrics.
-- Wants local and open-source resume analysis.
+- Wants AI-based resume and application help, preferably local/open-source for private processing.
 - Requires user approval before submission.
 
 ## 4. v0 Scope
@@ -61,13 +61,16 @@ Application Desk v0 must include:
 - file vault for LaTeX sources, PDFs, JD snapshots, and evidence files
 - one clean local UI for the application desk
 - hostable private deployment with same-origin UI/API serving, auth, health checks, and persistent volumes
+- AI task framework with versioned prompts, provider records, artifacts, and verifier output
+- local OSS AI provider support when a local model runtime is installed
+- optional Codex worker mode for deeper repo/session/evidence review
 - import or manual entry of a job description
 - application record creation
 - profile and evidence record management
 - resume version tracking separate from application version tracking
-- local JD parsing and requirement extraction
+- AI-assisted JD parsing and deterministic requirement extraction fallback
 - local resume parsing from rendered PDF
-- local fit report with explainable checks
+- AI-assisted fit report with explainable deterministic checks
 - risk report for unsupported claims, NDA-sensitive wording, stale PDFs, chronology issues, title mismatch, and missing evidence
 - LaTeX render command integration through a compiler adapter
 - approval gate before ready/submitted state
@@ -89,6 +92,9 @@ These must not be built first:
 - email sending
 - auto-apply
 - AI chatbot interface as the primary UI
+- deterministic-only resume checking as the final product
+- hidden AI calls with no provider, privacy, or provenance record
+- cloud AI calls without explicit configuration and approval
 
 The v0 app may prepare a packet. It must not submit it.
 
@@ -102,7 +108,7 @@ Minimum successful path:
 2. Create one application from a JD.
 3. Attach or create one LaTeX resume version.
 4. Render a fresh one-page PDF.
-5. See a fit report and risk report.
+5. Run AI review and see a fit report and risk report.
 6. See all blocking issues before approval.
 7. Approve the packet manually.
 8. Export or open the PDF and report.
@@ -115,7 +121,9 @@ Hosted private mode is ready only if the same workflow runs behind auth with dur
 
 ### FR1. Local Workspace
 
-CareerOps must store all private data locally by default. Private profile data, resume text, generated answers, evidence, credentials, and scoring results must not be sent to a cloud service unless the user explicitly approves a hosted storage mode.
+CareerOps must store all private data locally by default. Private profile data, resume text, generated answers, evidence, credentials, and scoring results must not be sent to a cloud AI or hosted storage service unless the user explicitly approves that mode.
+
+Local/private AI is the default target. Cloud AI mode is disabled unless the user configures it and approves the task.
 
 ### FR2. Application Ledger
 
@@ -205,7 +213,7 @@ Changing the resume after approval must invalidate the approval for that applica
 
 ### FR6. JD Analysis
 
-The system must extract:
+The system must use AI plus deterministic fallback to extract:
 
 - role title
 - company when possible
@@ -221,6 +229,8 @@ The system must extract:
 - terms that should not be over-optimized
 
 Extraction must show uncertainty. Unknown fields stay unknown.
+
+The AI result must be stored with provider, model, prompt version, timestamp, input artifact IDs, and output checksum.
 
 ### FR7. Resume Analysis
 
@@ -243,7 +253,7 @@ The system must warn if PDF text extraction differs from the intended LaTeX cont
 
 ### FR8. Fit Report
 
-The fit report must be transparent. It may include a local numeric score, but the score must be explained by checks.
+The fit report must be transparent. It should use AI for semantic reasoning and deterministic checks for verification. It may include a local numeric score, but the score must be explained by checks.
 
 Required report sections:
 
@@ -258,6 +268,8 @@ Required report sections:
 - recommended edits
 
 The report must state that it is a local evaluator and not a Resume Worded or employer ATS score.
+
+AI recommendations must be tied to evidence or marked as suggestions needing verification. A model-generated claim cannot become approved resume content without passing the risk gates.
 
 ### FR9. Risk Report
 
@@ -322,6 +334,44 @@ The user must be able to open or export:
 - JD snapshot
 - approval record
 
+### FR13. AI Task Framework
+
+CareerOps must treat AI as a structured subsystem, not as free-form chat.
+
+Each AI task must record:
+
+- task type
+- provider
+- model or runtime
+- privacy mode
+- prompt version
+- input artifacts
+- output artifacts
+- status
+- errors
+- verification result
+
+Required v0 task types:
+
+- `analyze_jd`
+- `analyze_fit`
+- `suggest_resume_edits`
+- `draft_cover_letter`
+- `review_claims`
+
+Every AI task must return structured output that can be validated before the UI displays or applies it.
+
+### FR14. Provider Modes
+
+The provider layer must support these modes:
+
+- `local_oss`: local model runtime, with Ollama as the recommended first target and LM Studio or another OpenAI-compatible runtime later.
+- `codex_worker`: local Codex worker invoked for deep evidence, repository, or session review.
+- `openai_api`: optional cloud provider, disabled by default.
+- `deterministic`: rule-based fallback and verifier.
+
+The UI must show which provider produced a result and whether private data left the machine.
+
 ## 8. Reliability Requirements
 
 Reliability is more important than speed.
@@ -338,12 +388,18 @@ The platform must:
 - make warnings visible before approval
 - fail closed on submissions and approvals
 - redact secret-like values from logs
+- treat JDs, resumes, and session files as prompt-injection capable input
+- validate every AI output against a schema
+- create drafts for AI edits instead of overwriting approved artifacts
+- keep deterministic verification authoritative over AI confidence
 
 ## 9. Privacy Requirements
 
-Private processing must stay local.
+Private processing must stay local by default.
 
 Hosted private deployment may run the same local-open-source processing stack inside a user-controlled VM or container. It must use auth, HTTPS, persistent volumes, and the same approval gates. It must not use a free hosted database or ephemeral filesystem as the only source of truth.
+
+If hosted mode uses a remote VM for AI, private data lives on that VM. If cloud AI is enabled, the app must record the exact task and provider that received private data.
 
 The cloud watcher planned for later must not receive:
 
@@ -392,6 +448,11 @@ The implementation must include:
 - Playwright UI test for the day-1 workflow
 - responsive UI checks at 320, 375, 414, 768, and desktop widths
 - hostability tests for same-origin serving, auth, configurable CORS, health, and persistent local storage settings
+- AI provider config tests
+- AI output schema tests
+- AI prompt-injection tests
+- mock-provider tests for CI
+- Codex worker command-construction tests before enabling it
 - secret scan on generated artifacts
 - backup and restore test for local data
 
@@ -406,5 +467,7 @@ Application Desk v0 is complete only when:
 - the report flags known risk cases
 - the UI passes responsive checks
 - no private data is sent to cloud services
+- AI task provenance is recorded for generated drafts and reports
+- deterministic verification blocks unsafe AI output
 - hosted private mode has auth and durable storage
 - approval cannot be bypassed

@@ -1,6 +1,6 @@
 # CareerOps Day-1 Workflow
 
-Status: target workflow for the first usable release.
+Status: target workflow for the first AI-assisted usable release.
 
 Purpose: define the exact path the user should be able to use for a real application tomorrow.
 
@@ -12,7 +12,7 @@ Expected screen:
 
 - application list on the left
 - selected application or empty state in the center
-- checks and approval panel on the right
+- AI tasks, checks, and approval panel on the right
 
 If no applications exist, the empty state says:
 
@@ -113,13 +113,27 @@ The app must not hide LaTeX errors.
 
 User clicks:
 
-`Analyze`
+`Run AI review`
+
+The app builds a bounded context packet:
+
+- JD snapshot
+- selected resume version
+- rendered resume text
+- verified profile facts
+- linked evidence
+- rejected or risky claims
+- user writing preferences
+
+The provider runs only through an explicit task. In local private mode this should use a local OSS model when configured. If no AI provider is configured, the app may run the deterministic verifier, but the UI must label the output as `Verifier only`.
 
 The app generates:
 
 - fit report
 - risk report
 - recommended edits
+- AI suggestions with verifier status
+- provider and privacy metadata
 
 Fit report shows:
 
@@ -129,6 +143,7 @@ Fit report shows:
 - exact keyword gaps
 - evidence confidence
 - knockout risks
+- semantic matches and missing context
 
 Risk report shows:
 
@@ -136,6 +151,8 @@ Risk report shows:
 - warnings
 - source for each issue
 - suggested next action
+
+AI suggestions must not overwrite the resume. Accepted suggestions create a draft resume or application artifact version.
 
 ## 7. Fix Issues
 
@@ -145,7 +162,7 @@ The user handles blockers:
 - remove or rewrite a claim
 - update LaTeX
 - rerender PDF
-- rerun analysis
+- rerun AI review or verifier
 
 The app must keep the previous report for history. It must not overwrite a report silently.
 
@@ -161,6 +178,8 @@ The review panel shows:
 - selected resume version
 - PDF checksum
 - report ID
+- AI task ID if AI was used
+- provider and privacy mode
 - warning count
 - approval button
 
@@ -223,11 +242,11 @@ The implementation must ship with an automated test that does this:
 2. Imports a sample LaTeX resume.
 3. Renders a PDF.
 4. Parses the PDF text.
-5. Generates fit and risk reports.
-6. Blocks approval when a fixture claim lacks evidence.
-7. Passes after the claim is fixed or evidence is linked.
-8. Approves the packet.
-9. Marks it submitted manually.
+5. Runs AI review through a mock provider.
+6. Generates fit and risk reports.
+7. Blocks approval when the AI suggests or preserves a fixture claim without evidence.
+8. Passes after the claim is fixed, rejected, or evidence is linked.
+9. Approves the packet.
+10. Marks it submitted manually.
 
 The test must run locally.
-

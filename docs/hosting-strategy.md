@@ -7,7 +7,14 @@ CareerOps must support two deployment shapes:
 1. **Private local mode** for day-to-day resume processing.
 2. **Hostable self-contained mode** for a low/no-cost VM or container host.
 
-The hosted v0 serves the React app and FastAPI API from the same origin, requires Basic Auth for private routes, uses SQLite plus file-vault persistent volumes, and exposes `/health` for uptime checks. It must not depend on paid AI APIs, hosted resume analysis, or cloud-only storage.
+The hosted v0 serves the React app and FastAPI API from the same origin, requires Basic Auth for private routes, uses SQLite plus file-vault persistent volumes, and exposes `/health` for uptime checks. It must not depend on hidden paid AI APIs, hosted resume analysis, or cloud-only storage.
+
+AI processing is a core product requirement, but the hosting boundary stays explicit:
+
+- Local/private mode should use a local OSS model runtime when available.
+- Codex worker mode should run on the user's machine or an explicitly trusted host.
+- Cloud AI mode is disabled by default and requires explicit provider configuration and per-task approval for private data.
+- The deterministic verifier remains available when AI is unavailable, but it is not the full intended product.
 
 ## Recommended Low/No-Cost Path
 
@@ -19,8 +26,19 @@ The recommended architecture is:
 - `restart: unless-stopped` restarts the service after process or VM restarts.
 - `/health` verifies the API can reach SQLite.
 - `CAREEROPS_AUTH_USERNAME` and `CAREEROPS_AUTH_PASSWORD` are required for public hosted use.
+- AI tasks run as resumable jobs so a provider failure or container restart does not corrupt application state.
+- Local OSS and Codex-worker AI modes can run outside the hosted container when the user wants private processing on their own machine.
 
 This fits an Always Free VM or any cheap VPS. It is more reliable than a free serverless app with ephemeral storage because resume PDFs, LaTeX files, approval records, and SQLite data live on persistent volumes.
+
+Maximum uptime at low cost means:
+
+- one small always-on service, not many fragile services;
+- persistent `data/` and `vault/` volumes as the source of truth;
+- health checks plus restart policy;
+- explicit backups before trusting the hosted copy;
+- no hidden dependency on a paid AI API for normal operation;
+- clear labels when the app is using local AI, Codex worker, cloud AI, or verifier-only fallback.
 
 ## Options Compared
 
@@ -38,6 +56,7 @@ Cons:
 
 - Browser-to-localhost access from a hosted HTTPS page can be fragile.
 - The local worker still has to run when processing is needed.
+- AI tasks still require a local model runtime, Codex worker, or explicitly approved cloud provider.
 - Not enough for true always-available use.
 
 Use this later only if we build a robust local bridge and browser security checks.
@@ -60,7 +79,7 @@ Cons:
 - Free VM capacity and idle policies are provider-dependent.
 - Public access must use auth and HTTPS before real personal data is entered.
 
-This is the v0 hosting target.
+This is the v0 hosting target and the recommended first production-like deployment path.
 
 ### Option C: Cloud Run Or Similar Serverless Container
 
@@ -95,6 +114,7 @@ Cons:
 - Free projects can pause after inactivity.
 - Private resume artifacts would move to cloud storage.
 - Not compatible with the current local-private-processing requirement without client-side encryption and a local worker.
+- Cloud AI calls would also need explicit task-level approval and provenance records.
 
 Not the v0 target.
 
@@ -121,9 +141,12 @@ The codebase supports:
 
 ## Sources Checked
 
+- Checked again on 2026-07-21 because free-tier limits and pricing can change.
 - Cloudflare Pages free limits: https://developers.cloudflare.com/pages/platform/limits/
+- Cloudflare Workers free limits: https://developers.cloudflare.com/workers/platform/limits/
 - Cloudflare Pages pricing page: https://pages.cloudflare.com/
 - Google Cloud Run pricing/free tier: https://cloud.google.com/run/pricing
 - Google Cloud free tier billing requirement: https://docs.cloud.google.com/free/docs/free-cloud-features
 - Supabase pricing/free-tier pause behavior: https://supabase.com/pricing
+- Supabase free project pausing: https://supabase.com/docs/guides/platform/free-project-pausing
 - Oracle Always Free resources and idle reclaim policy: https://docs.oracle.com/en-us/iaas/Content/FreeTier/freetier_topic-Always_Free_Resources.htm

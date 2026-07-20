@@ -1,6 +1,6 @@
 # CareerOps
 
-Private application desk for India-focused internship applications. The v0 workflow creates an application packet from a JD, imports a LaTeX resume, renders a PDF locally, runs fit and risk checks, blocks unsafe approval, and records manual submission.
+Private AI-assisted application desk for India-focused internship applications. The current v0 workflow creates an application packet from a JD, imports a LaTeX resume, renders a PDF locally, runs fit and risk checks, blocks unsafe approval, and records manual submission.
 
 ## Current Shape
 
@@ -8,9 +8,10 @@ Private application desk for India-focused internship applications. The v0 workf
 - Frontend: React, TypeScript, Vite.
 - Resume rendering: local LaTeX through `latexmk` or `pdflatex`.
 - Resume parsing: local PDF text extraction.
+- AI direction: local/open-source AI first, optional Codex worker for deep review, deterministic verifier for safety.
 - Hosting: local by default, hostable as one authenticated container.
 
-No paid AI API, Resume Worded scraping, auto-apply, or cloud resume processing is in the v0 path.
+The current implementation has the deterministic verifier path. The corrected product direction adds AI as a core subsystem. Resume Worded scraping, auto-apply, and hidden cloud resume processing are not in scope.
 
 ## Install
 

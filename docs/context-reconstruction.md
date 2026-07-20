@@ -1,6 +1,6 @@
 # CareerOps Context Reconstruction
 
-Status: awaiting user approval before PRD or implementation.
+Status: approved reconstruction basis, amended with the AI-first correction. Implementation architecture still requires user approval before the next build phase.
 
 This document reconstructs context from the current CareerOps thread and the historical application/resume session. It is not a product design, PRD, architecture, or implementation plan.
 
@@ -31,6 +31,10 @@ This document reconstructs context from the current CareerOps thread and the his
    - Snapshot SHA-256 at first use: `9350d253047ab5378f6b22826cb2d5695cb6757e7f7ccf2d50799d66d6dcb551`
    - First timestamp at first use: `2026-07-20T18:32:26.530Z`
    - Last timestamp at first use: `2026-07-20T18:35:19.236Z`
+   - AI-correction snapshot size: `5,308,266` bytes
+   - AI-correction snapshot SHA-256: `8bfe177ab39114daff795646213d37c772a09f3ed8c4017839bb17a532f1b1a5`
+   - AI-correction first timestamp: `2026-07-20T18:32:26.530Z`
+   - AI-correction last timestamp: `2026-07-20T20:17:10.473Z`
    - Status: used as a point-in-time active-session snapshot. The file was locked by the running client, so the hash was computed through a shared-read stream.
 
 3. Historical application/resume session
@@ -81,6 +85,7 @@ This document reconstructs context from the current CareerOps thread and the his
 - The user states `Covid-RARS` and `CuKD-XAI` are research-paper-related repositories with paper writing in progress. [HIST20:L5325]
 - The user states PocketBuddy was built for Amazon HackOn finals and deployed on AWS. [HIST20:L5325]
 - The user states Amazon HackOn 6.0 finalist and MLSS 2026 selection are true personal achievements. [HIST20:L6823, HIST20:L6872]
+- The user has prior Core-Subjects material where AI/LLM systems are described with deterministic boundaries, retrieval fallbacks, and controlled use of model output. [CORE-PLAN:L115, CORE-PLAN:L121, CORE-PLAN:L432, CORE-PLAN:L853, CORE-PLAN:L894, CORE-DOSSIER:L123, CORE-DOSSIER:L226, CORE-DOSSIER:L699]
 
 ## 2. Unconfirmed Or Contradictory Facts
 
@@ -92,17 +97,23 @@ This document reconstructs context from the current CareerOps thread and the his
 - `Resume Worded` is a real user concern in the current CareerOps thread, but it should not be automated, scraped, or treated as an API-backed dependency. [CUR20:L334, CUR20:L427]
 - Exact ATS or resume score targets like `90-95` are a user goal pattern, but no local system can truthfully reproduce Resume Worded's proprietary score. It can build a transparent local scorer and calibrate against user-provided reports. [CUR20:L427, CUR20:L481]
 - The historical June 20 session contains a pasted Supabase DB password and later assistant secret-handling mistakes. The value must not be copied into CareerOps. Treat that credential as compromised and rotate if still active. [HIST20:L1805, HIST20:L1825, HIST20:L2213, HIST20:L2223]
+- "Fully local/open-source resume analysis" was previously misread as "no AI." The user's later correction says that without AI the app will not work. The corrected interpretation is local/open-source AI analysis with deterministic verification, not deterministic-only analysis. [CUR21:L7, CUR21:L2207, CUR21:L2214, CUR21:L2215]
+- Whether the live Codex assistant can be "attached" to CareerOps is not guaranteed as an embedded app dependency. The feasible design is a controlled Codex worker or `codex exec` integration for explicit deep-review tasks, with scoped file access and stored artifacts. [CUR21:L2214, CUR21:L2215, CORE-DOSSIER:L784, CORE-DOSSIER:L788]
+- The first local AI runtime is undecided. Ollama and LM Studio are plausible targets, but neither should be assumed installed or reliable until implementation checks the machine and exposes provider status. [CUR21:L2214, CUR21:L2325]
 
 ## 3. User Preferences
 
 - Reliability over speed. The user explicitly rejected a prototype-like system and wants something genuinely usable. [CUR20:L511]
 - India-first job discovery and application workflow. [CUR20:L334, CUR20:L372]
-- Free and open-source/local resume analysis. The user rejected paid Resume Worded automation and wanted a system built from the ground up. [CUR20:L427]
+- AI is a core requirement. The user explicitly corrected the deterministic-only app by saying nothing works without AI. [CUR21:L2197, CUR21:L2206, CUR21:L2207, CUR21:L2214, CUR21:L2215]
+- Free and open-source/local resume analysis means local or user-controlled AI where possible, not paid Resume Worded automation and not hidden cloud AI calls. [CUR20:L427, CUR21:L7, CUR21:L2214]
 - Strict human approval before any submission or real application action. [CUR20:L334, CUR20:L516, CUR20:L527]
 - Repository inspection before accepting project metrics or resume claims. [CUR20:L334, HIST20:L378, HIST20:L669]
 - Separate tracking of resume versions and application versions, including which resume was submitted to which application. [CUR20:L334]
 - LaTeX-only resumes. [CUR20:L334]
 - Avoid AI-sounding wording. The user repeatedly asked for non-AI-slop, humanized, concise wording. [HIST20:L4028, HIST20:L4737, HIST20:L7754, HIST20:L7965]
+- Keep the product UI clean, minimal, and non-jargon-heavy. The user explicitly rejected complex UI, AI slop, and jargon. [CUR21:L414, CUR21:L415]
+- Prefer maximum uptime with low or no recurring cost. The app should be hostable, not only a local process that must run endlessly on the user's machine. [CUR21:L1434, CUR21:L1435, CUR21:L1561, CUR21:L1562]
 - Avoid em dashes and semicolons in resume/cover-letter writing. [HIST20:L4737, HIST20:L7335]
 - Do not include NDA-sensitive module names in public application text. [HIST20:L4044]
 - Use XYZ-style resume bullets where defensible: result, metric or scale, and method. [HIST20:L4839, HIST20:L6210]
@@ -153,6 +164,7 @@ This document reconstructs context from the current CareerOps thread and the his
 - Treating a long chat as a database and mixing facts, drafts, preferences, rejected wording, and speculative metrics. [CUR20:L183, CUR20:L328]
 - Giving unrelated or corrupted assistant output in the current CareerOps thread: the company-name list, `~`, and `842/900` style text. [CUR20:L558, CUR20:L591, CUR20:L664, CUR20:L686]
 - Creating or referencing the wrong project path in the prior thread, including `C:\N Drive\Internships +\CareerOps`, while the approved path is `C:\N Drive\Internships + Placements\CareerOps`. [CUR20:L602, CUR21:L7]
+- Misinterpreting "fully local/open-source resume analysis" as "no AI" and building a deterministic-only v0. The correction is that AI is mandatory, while deterministic checks remain evidence and safety gates. [CUR21:L7, CUR21:L2207, CUR21:L2214, CUR21:L2215]
 - Making claims before adequate repository/code inspection. The user repeatedly objected to lack of repo cloning or deep code review. [HIST20:L378, HIST20:L669, HIST20:L4516]
 - Overproducing documentation or bloated content instead of focused action. [HIST20:L1123, HIST20:L1902]
 - Producing resumes with too much whitespace, stale renders, layout issues, or mobile/responsive UI issues. [HIST20:L4455, HIST20:L2819, HIST20:L2865]
@@ -164,13 +176,16 @@ This document reconstructs context from the current CareerOps thread and the his
 ## 6. Requirements For The New System
 
 - Build a local, evidence-locked Career Operations System, not another unbounded chat that "knows everything". [CUR20:L328]
+- Build an AI-assisted Career Operations System, not a deterministic-only checker. AI should perform JD understanding, semantic fit analysis, resume tailoring, draft generation, and deep review, while deterministic gates verify claims and block unsafe packets. [CUR21:L2214, CUR21:L2215, CORE-PLAN:L115, CORE-PLAN:L121, CORE-DOSSIER:L226, CORE-DOSSIER:L699]
 - Maintain a canonical private profile/evidence vault separate from job descriptions, generated artifacts, and feedback. [CUR20:L347]
 - Keep resume versions and application records separate but linked: job description, resume PDF/source, answers, score report, approval, submission state, and post-submission feedback. [CUR20:L334, CUR20:L516]
-- Implement fully local/open-source resume analysis. Do not automate, scrape, or depend on Resume Worded. [CUR20:L427]
+- Implement fully local/open-source resume analysis as local or user-controlled AI plus deterministic verification. Do not automate, scrape, or depend on Resume Worded. [CUR20:L427, CUR21:L7, CUR21:L2214]
 - Model ATS behavior as an explainable ensemble rather than a single fake percentage: parsing, knockout gates, literal keyword retrieval, structured fields, semantic skill equivalence, and separate resume-quality checks. [CUR20:L445, CUR20:L462]
 - Label unknowable employer-side factors such as hidden configurations, knockout thresholds, and applicant-pool-relative ranking. [CUR20:L495]
 - Use India-focused discovery: company career portals and ATS feeds where allowed, and saved alerts/email or user-opened links for LinkedIn, Naukri, Unstop, Internshala, and similar platforms unless terms/API allow more. [CUR20:L372, CUR20:L471]
 - Use a cloud watcher only for public job discovery and notifications. Private profile, resumes, credentials, evidence, answers, scoring, and application preparation stay local. [CUR20:L527, CUR20:L540]
+- Use explicit AI provider modes: local OSS provider first, Codex worker for scoped deep review, optional cloud AI only after configuration and task approval, and deterministic fallback/verifier for safety. [CUR21:L2214, CUR21:L2325, CORE-DOSSIER:L784, CORE-DOSSIER:L788]
+- Track AI provenance for every model-generated artifact: provider, model, prompt version, input artifact IDs, privacy mode, output checksum, and verifier status. [CUR21:L2214, CUR21:L2366]
 - Require final user approval before any submission. [CUR20:L516, CUR20:L527]
 - Inspect repositories, branches, PRs, tests, logs, and artifacts before accepting project metrics. [CUR20:L334, HIST20:L6424, HIST20:L6499]
 - Treat every prior assistant/user correction as a regression test for the system: no invented metrics, no stale PDF, no wrong chronology, no title mismatch, no unsupported paper ownership, no NDA module names, no unapproved submission. [HIST20:L4635, HIST20:L5111, HIST20:L6746]
@@ -181,13 +196,16 @@ This document reconstructs context from the current CareerOps thread and the his
 - Project name/location: `C:\N Drive\Internships + Placements\CareerOps`. [CUR21:L7]
 - India-focused job search. [CUR20:L334, CUR21:L7]
 - Reliability over speed. [CUR20:L511, CUR21:L7]
-- Fully local/open-source resume analysis. [CUR20:L427, CUR21:L7]
+- AI is core to the app; deterministic-only is not acceptable. [CUR21:L2197, CUR21:L2206, CUR21:L2207, CUR21:L2214, CUR21:L2215]
+- Fully local/open-source resume analysis, interpreted as local/open-source AI analysis plus deterministic verification. [CUR20:L427, CUR21:L7, CUR21:L2214]
 - Cloud watcher plus local private processing. [CUR20:L527, CUR20:L540, CUR21:L7]
 - Separate resume and application version history. [CUR20:L334, CUR21:L7]
 - Repository inspection before accepting project metrics. [CUR20:L334, CUR21:L7]
 - User approval before submission. [CUR20:L516, CUR20:L527, CUR21:L7]
 - PRD before implementation. [CUR20:L378, CUR21:L7]
 - Do not treat the 1.44 GB June 13 session as definitely correct. Search for the 91.6 MB June 20 historical session first. [CUR21:L7]
+- Clean, minimal UI with no complex AI-slop interface and no jargon-heavy product copy. [CUR21:L414, CUR21:L415]
+- Hostable low/no-cost architecture with stronger uptime than an endlessly running local-only app. [CUR21:L1434, CUR21:L1435, CUR21:L1561, CUR21:L1562]
 
 ## 8. Open Decisions
 
@@ -198,6 +216,11 @@ This document reconstructs context from the current CareerOps thread and the his
 - The cloud watcher provider and deployment target. [CUR20:L527, CUR20:L540]
 - Which sources are allowed for automated monitoring versus user-provided links or email alerts. [CUR20:L372, CUR20:L471]
 - The scoring thresholds and calibration method for the local ATS/resume evaluator. [CUR20:L427, CUR20:L445, CUR20:L462, CUR20:L481]
+- Whether the user approves the recommended first AI runtime: Ollama first, with LM Studio or another OpenAI-compatible local server later. [CUR21:L2214]
+- Whether the user approves the recommended sequencing: local OSS provider first, then Codex worker for deep evidence/repository review. [CUR21:L2214, CUR21:L2215]
+- Whether optional OpenAI API mode should remain deferred until the local provider and Codex worker are stable. [CUR21:L2214]
+- Whether environment variables are acceptable for optional provider secrets in v1, with Windows Credential Manager deferred. [CUR21:L2214]
+- Whether the user approves the recommended first AI task: JD analysis plus semantic fit review before resume tailoring, cover-letter drafting, or Codex evidence review. [CUR21:L2186, CUR21:L2187, CUR21:L2214]
 - The exact LaTeX resume template baseline and how version diffs should be reviewed. [CUR20:L334, HIST20:L3919, HIST20:L3980]
 - How private repository access will be authenticated, audited, cached, and redacted. [CUR20:L334, HIST20:L6424, HIST20:L6499, HIST20:L1805]
 - Whether old accidental folders, especially `C:\N Drive\Internships +\CareerOps`, should be deleted, ignored, or migrated. No deletion should happen without explicit user approval. [CUR20:L602, CUR21:L7]
@@ -210,5 +233,8 @@ This document reconstructs context from the current CareerOps thread and the his
 - `HIST20`: `C:\Users\nhnis\.codex\sessions\2026\06\20\rollout-2026-06-20T01-58-04-019ee191-ba3c-7610-9478-15836e4a7cbc.jsonl`
 - `HIST13-REJECTED`: `C:\Users\nhnis\.codex\sessions\2026\06\13\rollout-2026-06-13T19-30-56-019ec149-21c7-7371-9d83-8bdf8e03636d.jsonl`
 - `HIST21-SECONDARY`: `C:\Users\nhnis\.codex\sessions\2026\06\21\rollout-2026-06-21T14-32-37-019ee96a-e782-7691-86f8-37957bbb23d2.jsonl`
+- `CORE-PLAN`: `C:\Users\nhnis\Desktop\Core-Subjects\DE_SHAW_SYSTEMS_INTERN_30_DAY_DEEP_DIVE_PLAN.md`
+- `CORE-DOSSIER`: `C:\Users\nhnis\Desktop\Core-Subjects\DE_SHAW_PROJECT_CODE_GRILLING_DOSSIER.md`
+- `CORE-README`: `C:\Users\nhnis\Desktop\Core-Subjects\github-profile-readme\README.md`
 
 Line references in this document refer to JSONL physical line numbers in those files.
