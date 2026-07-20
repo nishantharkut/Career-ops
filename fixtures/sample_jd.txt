@@ -1,0 +1,25 @@
+Company: Swiggy
+Role: Data Science Intern
+Location: Bangalore
+Work mode: Remote or WFO Bangalore
+Duration: 6 months
+
+Responsibilities:
+- Build analytics dashboards for food delivery operations.
+- Work with product and engineering teams on experiment analysis.
+- Write Python and SQL for data cleaning, feature analysis, and reporting.
+
+Required skills:
+- Python
+- SQL
+- Basic machine learning
+- Data analysis
+
+Preferred skills:
+- Statistics
+- A/B testing
+- Communication
+
+Eligibility:
+- Pre-final year students may apply.
+- Internship availability for 6 months is required.
