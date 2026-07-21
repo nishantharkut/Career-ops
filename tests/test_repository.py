@@ -1,6 +1,8 @@
 import hashlib
 from pathlib import Path
 
+import pytest
+
 from careerops.core.repository import CareerOpsRepository
 from careerops.core.status import ApplicationStatus
 
@@ -116,3 +118,89 @@ def test_repository_writes_audit_events(tmp_path: Path):
     assert events[0].entity_id == application.id
     assert events[0].entity_type == "application"
     assert events[0].event_type == "application.created"
+
+
+def test_atomic_resume_create_and_select_rolls_back_every_row_on_audit_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    repo = make_repo(tmp_path)
+    application = repo.create_application(
+        company="Example Corp",
+        role_title="Engineer",
+        location="Remote",
+        source_url="",
+        jd_text="Python role",
+    )
+    source_dir = repo.vault_path / "resumes" / "upload_atomic"
+    source_dir.mkdir()
+    tex_path = source_dir / "resume.tex"
+    tex_path.write_text("Python developer", encoding="utf-8")
+    before_application = repo.get_application(application.id)
+    before_resume_ids = [item.id for item in repo.list_resume_versions()]
+    original_write_audit = repo._write_audit
+
+    def fail_after_selection(connection, event_type, *args, **kwargs):
+        if event_type == "application.resume_selected":
+            raise RuntimeError("injected selection audit failure")
+        return original_write_audit(connection, event_type, *args, **kwargs)
+
+    monkeypatch.setattr(repo, "_write_audit", fail_after_selection)
+
+    with pytest.raises(RuntimeError, match="selection audit failure"):
+        repo.create_and_select_resume_version(
+            application_id=application.id,
+            name="Atomic resume",
+            role_family="software",
+            tex_path=tex_path,
+            tex_sha256=hashlib.sha256(tex_path.read_bytes()).hexdigest(),
+        )
+
+    assert repo.get_application(application.id) == before_application
+    assert [item.id for item in repo.list_resume_versions()] == before_resume_ids
+
+
+def test_atomic_resume_create_and_select_rejects_approved_application_without_insert(
+    tmp_path: Path,
+):
+    repo = make_repo(tmp_path)
+    application = repo.create_application(
+        company="Example Corp",
+        role_title="Engineer",
+        location="Remote",
+        source_url="",
+        jd_text="Python role",
+    )
+    pdf_path = repo.vault_path / "resumes" / "approved.pdf"
+    pdf_path.write_bytes(b"%PDF-1.4\napproved")
+    selected = repo.create_resume_version(
+        name="Approved resume",
+        role_family="software",
+        tex_path=tmp_path / "approved.tex",
+        tex_sha256="a" * 64,
+        pdf_path=pdf_path,
+        pdf_sha256=hashlib.sha256(pdf_path.read_bytes()).hexdigest(),
+    )
+    repo.select_resume(application.id, selected.id)
+    report = repo.save_report(
+        application_id=application.id,
+        resume_version_id=selected.id,
+        jd_snapshot_id=application.jd_snapshot_id,
+        fit={"score": 100},
+        risks={"blockers": [], "warnings": []},
+    )
+    repo.approve_application(application.id, report.id, "Reviewed")
+    tex_path = repo.vault_path / "resumes" / "rejected-upload.tex"
+    tex_path.write_text("Replacement", encoding="utf-8")
+    before = repo.list_resume_versions()
+
+    with pytest.raises(ValueError, match="approved or submitted"):
+        repo.create_and_select_resume_version(
+            application_id=application.id,
+            name="Replacement",
+            role_family="software",
+            tex_path=tex_path,
+            tex_sha256=hashlib.sha256(tex_path.read_bytes()).hexdigest(),
+        )
+
+    assert repo.list_resume_versions() == before
+    assert repo.get_application(application.id).approval_id is not None

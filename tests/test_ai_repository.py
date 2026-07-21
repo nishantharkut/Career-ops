@@ -4381,6 +4381,37 @@ def test_evidence_items_enforce_states_and_link_idempotently(tmp_path: Path):
         )
 
 
+def test_atomic_evidence_create_and_link_rolls_back_item_when_link_audit_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    repo = make_repo(tmp_path)
+    application = create_application(repo)
+    before_items = repo.list_evidence_items()
+    before_events = repo.list_audit_events()
+    original_write_audit = repo._write_audit
+
+    def fail_link_audit(connection, event_type, *args, **kwargs):
+        if event_type == "application.evidence_linked":
+            raise RuntimeError("injected evidence link failure")
+        return original_write_audit(connection, event_type, *args, **kwargs)
+
+    monkeypatch.setattr(repo, "_write_audit", fail_link_audit)
+
+    with pytest.raises(RuntimeError, match="evidence link failure"):
+        repo.create_and_link_evidence_item(
+            application_id=application.id,
+            claim_text="Built a Python service",
+            evidence_type="project",
+            source_url="https://example.com/project",
+            verification_state="verified",
+            privacy_level="public",
+        )
+
+    assert repo.list_evidence_items() == before_items
+    assert repo.list_application_evidence(application.id) == []
+    assert repo.list_audit_events() == before_events
+
+
 def test_application_versions_are_append_only_and_monotonic(tmp_path: Path):
     repo = make_repo(tmp_path)
     application = create_application(repo)

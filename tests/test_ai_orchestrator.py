@@ -433,6 +433,34 @@ def test_enqueue_persists_pending_task_without_running_provider(tmp_path: Path):
     assert provider.calls == 0
 
 
+def test_heartbeat_setup_failure_fails_exact_claim_without_invoking_provider(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    from careerops.ai.orchestrator import AiOrchestrator
+
+    repo = make_repo(tmp_path)
+    application = create_application(repo)
+    config = create_provider_config(repo)
+    provider = ScriptedProvider(availability())
+    orchestrator = AiOrchestrator(repo, {config.id: provider})
+    task = orchestrator.enqueue(application.id, "analyze_jd", config.id)
+
+    def fail_heartbeat_setup(_task_id: str, _claim_token: str):
+        raise RuntimeError("heartbeat secret=do-not-store")
+
+    monkeypatch.setattr(orchestrator, "_start_claim_heartbeat", fail_heartbeat_setup)
+
+    result = orchestrator.run(task.id)
+    rerun = orchestrator.run(task.id)
+
+    assert result.status == "failed"
+    assert result.error_summary == "provider_error"
+    assert repo.get_ai_task(task.id) == result
+    assert rerun == result
+    assert provider.calls == 0
+    assert "do-not-store" not in str(result)
+
+
 def test_heartbeat_renewal_exception_fails_closed(tmp_path: Path, monkeypatch):
     from careerops.ai.orchestrator import AiOrchestrator
 

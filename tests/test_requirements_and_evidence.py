@@ -265,6 +265,42 @@ def test_evidence_create_link_and_list_keeps_private_and_rejected_visible(tmp_pa
     assert "source_path" not in str(listed.json())
 
 
+@pytest.mark.parametrize(
+    ("verification_state", "privacy_level", "publishable"),
+    [
+        ("verified", "public", True),
+        ("user_stated", "public", False),
+        ("needs_verification", "public", False),
+        ("rejected", "public", False),
+        ("private_do_not_publish", "public", False),
+        ("verified", "private", False),
+        ("verified", "sensitive", False),
+    ],
+)
+def test_evidence_publishable_requires_verified_public_state(
+    tmp_path: Path,
+    verification_state: str,
+    privacy_level: str,
+    publishable: bool,
+):
+    repo = make_repo(tmp_path)
+    application = create_application(repo)
+    client = TestClient(create_app(repo, provider_registry={}))
+
+    response = client.post(
+        f"/applications/{application.id}/evidence",
+        json={
+            "claim_text": "Bound publication claim",
+            "evidence_type": "note",
+            "verification_state": verification_state,
+            "privacy_level": privacy_level,
+        },
+    )
+
+    assert response.status_code == 201
+    assert response.json()["publishable"] is publishable
+
+
 def test_evidence_api_rejects_arbitrary_paths_unknown_fields_and_missing_ids(tmp_path: Path):
     repo = make_repo(tmp_path)
     application = create_application(repo)

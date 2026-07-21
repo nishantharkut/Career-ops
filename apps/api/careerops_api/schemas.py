@@ -9,6 +9,7 @@ from pydantic import (
     ConfigDict,
     Field,
     StringConstraints,
+    StrictBool,
     field_validator,
     model_validator,
 )
@@ -54,8 +55,16 @@ class CreateApplicationRequest(ApiRequest):
     notes: OptionalText = ""
 
 
+class AnalyzeClaim(ApiRequest):
+    text: Annotated[
+        str, StringConstraints(strip_whitespace=True, min_length=1, max_length=4_000)
+    ]
+    verification_state: VerificationState
+    public_safe: StrictBool
+
+
 class AnalyzeRequest(ApiRequest):
-    claims: list[dict[str, Any]] = Field(default_factory=list, max_length=100)
+    claims: list[AnalyzeClaim] = Field(default_factory=list, max_length=100)
 
 
 class ApproveRequest(ApiRequest):

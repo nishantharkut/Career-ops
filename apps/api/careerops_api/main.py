@@ -197,18 +197,18 @@ def _default_provider_registry(
         enabled=True,
     )
 
-    if environment.get("CAREEROPS_OLLAMA_URL") or environment.get("CAREEROPS_OLLAMA_MODEL"):
-        ollama = OllamaProvider(
-            endpoint=environment.get("CAREEROPS_OLLAMA_URL", "http://127.0.0.1:11434"),
-            model=environment.get("CAREEROPS_OLLAMA_MODEL", "qwen2.5:7b"),
-        )
-        _register_provider(
-            repository,
-            registry,
-            ollama,
-            display_name=f"Ollama {ollama.model}",
-            enabled=False,
-        )
+    ollama = OllamaProvider(
+        endpoint=environment.get("CAREEROPS_OLLAMA_URL")
+        or "http://127.0.0.1:11434",
+        model=environment.get("CAREEROPS_OLLAMA_MODEL") or "qwen2.5:7b",
+    )
+    _register_provider(
+        repository,
+        registry,
+        ollama,
+        display_name=f"Ollama {ollama.model}",
+        enabled=False,
+    )
 
     if environment.get("CAREEROPS_CODEX_ENABLED", "").strip().lower() in {
         "1",
@@ -294,12 +294,17 @@ def create_app(
         tex_file: UploadFile = File(...),
     ) -> dict[str, Any]:
         application = _get_application(repo, application_id)
-        if application.submission_state.value != "not_submitted":
+        if (
+            application.approval_id is not None
+            or application.status.value == "approved"
+            or application.submission_state.value != "not_submitted"
+            or application.submitted_at is not None
+        ):
             raise HTTPException(status_code=409, detail="Application cannot be changed")
         safe_name = _bounded_form_value(name, "name", 300)
         safe_role_family = _bounded_form_value(role_family, "role_family", 300)
         upload_dir = repo.vault_path / "resumes" / f"upload_{uuid4().hex}"
-        persisted = False
+        committed = False
         try:
             _require_owned_directory(repo.vault_path, repo.vault_path / "resumes")
             upload_dir.mkdir()
@@ -331,25 +336,25 @@ def create_app(
                 or path_stat.st_nlink != 1
             ):
                 raise HTTPException(status_code=409, detail="Resume storage is invalid")
-            resume = repo.create_resume_version(
+            resume = repo.create_and_select_resume_version(
+                application_id=application_id,
                 name=safe_name,
                 role_family=safe_role_family,
                 tex_path=tex_path,
                 tex_sha256=hashlib.sha256(content).hexdigest(),
             )
-            persisted = True
-            repo.select_resume(application_id, resume.id)
+            committed = True
             return _resume_payload(resume)
         except HTTPException:
-            if not persisted:
+            if not committed:
                 _cleanup_upload_directory(repo, upload_dir)
             raise
         except (KeyError, ValueError) as exc:
-            if not persisted:
+            if not committed:
                 _cleanup_upload_directory(repo, upload_dir)
             raise HTTPException(status_code=409, detail="Resume upload was rejected") from exc
         except Exception as exc:
-            if not persisted:
+            if not committed:
                 _cleanup_upload_directory(repo, upload_dir)
             raise HTTPException(status_code=500, detail="Resume upload failed") from exc
 
@@ -402,7 +407,7 @@ def create_app(
         fit = analyze_fit(jd, parsed_pdf.text)
         risks = evaluate_risks(
             resume_text=parsed_pdf.text,
-            claims=payload.claims,
+            claims=[claim.model_dump(mode="json") for claim in payload.claims],
             pdf_is_stale=pdf_is_stale,
             pdf_parse_ok=bool(parsed_pdf.text.strip()),
             page_count=parsed_pdf.page_count,
@@ -558,7 +563,8 @@ def create_app(
                 raise HTTPException(status_code=404, detail="Evidence not found") from exc
             return _json_response(_evidence_payload(evidence), status_code=200)
         try:
-            evidence = repo.create_evidence_item(
+            evidence = repo.create_and_link_evidence_item(
+                application_id=application_id,
                 claim_text=payload.claim_text or "",
                 evidence_type=payload.evidence_type or "",
                 source_url=payload.source_url or None,
@@ -567,7 +573,6 @@ def create_app(
                 privacy_level=payload.privacy_level.value,
                 notes=payload.notes or "",
             )
-            repo.link_application_evidence(application_id, evidence.id)
         except ValueError as exc:
             raise HTTPException(status_code=400, detail="Evidence is invalid") from exc
         return _json_response(_evidence_payload(evidence), status_code=201)
@@ -661,11 +666,38 @@ def create_app(
         except KeyError as exc:
             raise HTTPException(status_code=404, detail="Current approval not found") from exc
         if (
-            approval.application_id != application.id
+            approval.id != application.approval_id
+            or approval.application_id != application.id
             or approval.resume_version_id != application.selected_resume_version_id
             or approval.report_id != application.latest_report_id
         ):
             raise HTTPException(status_code=409, detail="Current approval is stale")
+        try:
+            report = repo.get_report(approval.report_id)
+            resume = repo.get_resume_version(approval.resume_version_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=409, detail="Current approval is stale") from exc
+        if (
+            report.id != application.latest_report_id
+            or report.application_id != application.id
+            or report.resume_version_id != resume.id
+            or report.jd_snapshot_id != application.jd_snapshot_id
+            or resume.id != application.selected_resume_version_id
+            or resume.pdf_path is None
+            or resume.pdf_sha256 is None
+            or approval.pdf_sha256 != resume.pdf_sha256
+        ):
+            raise HTTPException(status_code=409, detail="Current approval is stale")
+        try:
+            _artifact_bytes(
+                repo,
+                resume.pdf_path,
+                resume.pdf_sha256,
+                required_prefix=("resumes",),
+                max_bytes=MAX_RESUME_PDF_DOWNLOAD_BYTES,
+            )
+        except HTTPException as exc:
+            raise HTTPException(status_code=409, detail="Current approval is stale") from exc
         return _json_download(
             _approval_payload(approval),
             _artifact_filename(application, "approval", "json"),
@@ -1237,8 +1269,7 @@ def _profile_fact_payload(fact: ProfileFact) -> dict[str, Any]:
 def _evidence_payload(evidence: EvidenceItem) -> dict[str, Any]:
     publishable = (
         evidence.privacy_level.value == "public"
-        and evidence.verification_state.value
-        not in {"private_do_not_publish", "rejected"}
+        and evidence.verification_state.value == "verified"
     )
     return {
         "id": evidence.id,

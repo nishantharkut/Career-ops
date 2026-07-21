@@ -308,6 +308,37 @@ def test_background_failure_keeps_202_and_never_falls_back(tmp_path: Path):
     assert fallback.calls == 0
 
 
+def test_api_heartbeat_setup_failure_returns_202_with_durable_failed_task(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    repo = make_repo(tmp_path)
+    application = create_application(repo)
+    status = availability()
+    config = create_provider_config(repo, status)
+    provider = ControlledProvider(status)
+    app = create_app(repo, provider_registry={config.id: provider})
+
+    def fail_heartbeat_setup(_task_id: str, _claim_token: str):
+        raise RuntimeError("heartbeat setup detail must not leak")
+
+    monkeypatch.setattr(
+        app.state.ai_orchestrator, "_start_claim_heartbeat", fail_heartbeat_setup
+    )
+    client = TestClient(app)
+
+    response = client.post(
+        f"/applications/{application.id}/ai-tasks",
+        json={"task_type": "analyze_jd", "provider_config_id": config.id},
+    )
+
+    assert response.status_code == 202
+    task = client.get(f"/ai-tasks/{response.json()['id']}").json()
+    assert task["status"] == "failed"
+    assert task["error_summary"] == "provider_error"
+    assert "must not leak" not in str(task)
+    assert provider.calls == 0
+
+
 def test_provider_listing_combines_persisted_and_honest_runtime_state(tmp_path: Path):
     repo = make_repo(tmp_path)
     present_status = availability(model="present")
@@ -400,6 +431,32 @@ def test_default_provider_setup_is_fail_closed_and_keeps_codex_identities_distin
     assert "AI" not in deterministic["display_name"]
     assert ollama["available"] is False
     assert ollama["enabled"] is False
+    assert ollama["endpoint"] == "http://127.0.0.1:11434"
+    assert ollama["model"] == "fixture-local"
+
+
+def test_default_provider_setup_always_lists_unmanaged_ollama_without_network(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    from careerops.ai.providers.ollama import OllamaProvider
+
+    repo = make_repo(tmp_path)
+    monkeypatch.delenv("CAREEROPS_OLLAMA_URL", raising=False)
+    monkeypatch.delenv("CAREEROPS_OLLAMA_MODEL", raising=False)
+    monkeypatch.delenv("CAREEROPS_CODEX_ENABLED", raising=False)
+
+    def reject_network(*_args, **_kwargs):
+        raise AssertionError("default unmanaged Ollama registration must not probe")
+
+    monkeypatch.setattr(OllamaProvider, "_request_json", reject_network)
+
+    providers = TestClient(create_app(repo)).get("/ai/providers").json()
+    ollama = next(item for item in providers if item["provider_kind"] == "ollama")
+
+    assert ollama["endpoint"] == "http://127.0.0.1:11434"
+    assert ollama["model"] == "qwen2.5:7b"
+    assert ollama["enabled"] is False
+    assert ollama["available"] is False
 
 
 def test_packet_reloads_selected_resume_report_latest_task_evidence_and_versions(
@@ -487,6 +544,124 @@ def test_artifact_downloads_are_bound_to_latest_packet_and_verify_integrity(tmp_
     snapshot = repo.get_jd_snapshot(application.jd_snapshot_id)
     snapshot.raw_text_path.write_text("tampered", encoding="utf-8")
     assert client.get(f"/applications/{application.id}/artifacts/jd").status_code == 409
+
+
+@pytest.mark.parametrize(
+    "mismatch",
+    [
+        "application_approval",
+        "application_latest_report",
+        "application_selected_resume",
+        "approval_application",
+        "approval_report",
+        "approval_resume",
+        "report_application",
+        "report_resume",
+        "report_jd",
+        "approval_pdf_checksum",
+        "resume_pdf_checksum",
+        "resume_pdf_outside",
+        "resume_pdf_tamper",
+    ],
+)
+def test_approval_artifact_fails_closed_for_every_packet_or_pdf_mismatch(
+    tmp_path: Path, mismatch: str
+):
+    repo = make_repo(tmp_path)
+    application = create_application(repo)
+    resume = select_resume(repo, application.id)
+    report = repo.save_report(
+        application_id=application.id,
+        resume_version_id=resume.id,
+        jd_snapshot_id=application.jd_snapshot_id,
+        fit={"score": 100},
+        risks={"blockers": [], "warnings": []},
+    )
+    approval = repo.approve_application(application.id, report.id, "Reviewed")
+    foreign_application = create_application(repo, company="Foreign Corp")
+    foreign_resume = select_resume(repo, foreign_application.id)
+    foreign_report = repo.save_report(
+        application_id=foreign_application.id,
+        resume_version_id=foreign_resume.id,
+        jd_snapshot_id=foreign_application.jd_snapshot_id,
+        fit={"score": 100},
+        risks={"blockers": [], "warnings": []},
+    )
+    foreign_approval = repo.approve_application(
+        foreign_application.id, foreign_report.id, "Foreign review"
+    )
+    outside_pdf = tmp_path / "outside.pdf"
+    outside_pdf.write_bytes(resume.pdf_path.read_bytes())
+
+    with repo.connection() as connection:
+        if mismatch == "application_approval":
+            connection.execute(
+                "UPDATE applications SET approval_id = ? WHERE id = ?",
+                (foreign_approval.id, application.id),
+            )
+        elif mismatch == "application_latest_report":
+            connection.execute(
+                "UPDATE applications SET latest_report_id = ? WHERE id = ?",
+                (foreign_report.id, application.id),
+            )
+        elif mismatch == "application_selected_resume":
+            connection.execute(
+                "UPDATE applications SET selected_resume_version_id = ? WHERE id = ?",
+                (foreign_resume.id, application.id),
+            )
+        elif mismatch == "approval_application":
+            connection.execute(
+                "UPDATE approvals SET application_id = ? WHERE id = ?",
+                (foreign_application.id, approval.id),
+            )
+        elif mismatch == "approval_report":
+            connection.execute(
+                "UPDATE approvals SET report_id = ? WHERE id = ?",
+                (foreign_report.id, approval.id),
+            )
+        elif mismatch == "approval_resume":
+            connection.execute(
+                "UPDATE approvals SET resume_version_id = ? WHERE id = ?",
+                (foreign_resume.id, approval.id),
+            )
+        elif mismatch == "report_application":
+            connection.execute(
+                "UPDATE reports SET application_id = ? WHERE id = ?",
+                (foreign_application.id, report.id),
+            )
+        elif mismatch == "report_resume":
+            connection.execute(
+                "UPDATE reports SET resume_version_id = ? WHERE id = ?",
+                (foreign_resume.id, report.id),
+            )
+        elif mismatch == "report_jd":
+            connection.execute(
+                "UPDATE reports SET jd_snapshot_id = ? WHERE id = ?",
+                (foreign_application.jd_snapshot_id, report.id),
+            )
+        elif mismatch == "approval_pdf_checksum":
+            connection.execute(
+                "UPDATE approvals SET pdf_sha256 = ? WHERE id = ?",
+                ("b" * 64, approval.id),
+            )
+        elif mismatch == "resume_pdf_checksum":
+            connection.execute(
+                "UPDATE resume_versions SET pdf_sha256 = ? WHERE id = ?",
+                ("b" * 64, resume.id),
+            )
+        elif mismatch == "resume_pdf_outside":
+            connection.execute(
+                "UPDATE resume_versions SET pdf_path = ? WHERE id = ?",
+                (str(outside_pdf), resume.id),
+            )
+    if mismatch == "resume_pdf_tamper":
+        resume.pdf_path.write_bytes(b"tampered")
+
+    response = TestClient(create_app(repo, provider_registry={})).get(
+        f"/applications/{application.id}/artifacts/approval"
+    )
+
+    assert response.status_code == 409
 
 
 def test_artifact_routes_reject_missing_stale_and_non_vault_paths(tmp_path: Path):

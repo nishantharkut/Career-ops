@@ -1,3 +1,4 @@
+import hashlib
 from pathlib import Path
 
 from fastapi.testclient import TestClient
@@ -11,6 +12,48 @@ def make_client(tmp_path: Path) -> TestClient:
     repo = CareerOpsRepository(tmp_path / "careerops.db", tmp_path / "vault")
     repo.initialize()
     return TestClient(create_app(repo))
+
+
+def make_repo_and_client(tmp_path: Path) -> tuple[CareerOpsRepository, TestClient]:
+    repo = CareerOpsRepository(tmp_path / "careerops.db", tmp_path / "vault")
+    repo.initialize()
+    return repo, TestClient(create_app(repo, provider_registry={}))
+
+
+def create_reviewable_packet(repo: CareerOpsRepository):
+    application = repo.create_application(
+        company="Example Corp",
+        role_title="Engineer",
+        location="Remote",
+        source_url="",
+        jd_text="Python role",
+    )
+    source_dir = repo.vault_path / "resumes" / application.id
+    source_dir.mkdir()
+    tex_path = source_dir / "resume.tex"
+    pdf_path = source_dir / "resume.pdf"
+    tex_path.write_text("Python developer", encoding="utf-8")
+    pdf_path.write_bytes(b"%PDF-1.4\nreviewed")
+    resume = repo.create_resume_version(
+        name="Reviewed resume",
+        role_family="software",
+        tex_path=tex_path,
+        tex_sha256=hashlib.sha256(tex_path.read_bytes()).hexdigest(),
+        pdf_path=pdf_path,
+        pdf_sha256=hashlib.sha256(pdf_path.read_bytes()).hexdigest(),
+        render_status="rendered",
+        parse_status="parsed",
+        page_count=1,
+    )
+    repo.select_resume(application.id, resume.id)
+    report = repo.save_report(
+        application_id=application.id,
+        resume_version_id=resume.id,
+        jd_snapshot_id=application.jd_snapshot_id,
+        fit={"score": 100},
+        risks={"blockers": [], "warnings": []},
+    )
+    return application, resume, report
 
 
 def test_day_one_api_flow_blocks_then_approves_clean_packet(tmp_path: Path):
@@ -163,3 +206,95 @@ def test_resume_upload_rejects_oversize_or_invalid_utf8_and_cleans_partial_direc
 
     assert response.status_code == expected_status
     assert set(resume_root.iterdir()) == before
+
+
+@pytest.mark.parametrize("terminal_state", ["approved", "submitted"])
+def test_resume_upload_cannot_mutate_approved_or_submitted_packet(
+    tmp_path: Path, terminal_state: str
+):
+    repo, client = make_repo_and_client(tmp_path)
+    application, _resume, report = create_reviewable_packet(repo)
+    repo.approve_application(application.id, report.id, "Reviewed")
+    if terminal_state == "submitted":
+        repo.mark_submitted_manual(application.id, "Submitted")
+    before_packet = client.get(f"/applications/{application.id}/packet").json()
+    before_resumes = repo.list_resume_versions()
+    resume_root = repo.vault_path / "resumes"
+    before_directories = set(resume_root.iterdir())
+
+    response = client.post(
+        f"/applications/{application.id}/resume",
+        data={"name": "Forbidden replacement", "role_family": "software"},
+        files={"tex_file": ("resume.tex", b"replacement", "application/x-tex")},
+    )
+
+    assert response.status_code == 409
+    assert client.get(f"/applications/{application.id}/packet").json() == before_packet
+    assert repo.list_resume_versions() == before_resumes
+    assert set(resume_root.iterdir()) == before_directories
+
+
+def test_resume_upload_cleans_file_when_application_becomes_approved_before_transaction(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    repo, client = make_repo_and_client(tmp_path)
+    application, selected, report = create_reviewable_packet(repo)
+    original_atomic = getattr(repo, "create_and_select_resume_version", None)
+
+    def approve_then_attempt(**values):
+        repo.approve_application(application.id, report.id, "Concurrent approval")
+        if original_atomic is None:
+            raise ValueError("atomic upload method is missing")
+        return original_atomic(**values)
+
+    monkeypatch.setattr(
+        repo, "create_and_select_resume_version", approve_then_attempt, raising=False
+    )
+    before_resume_ids = [item.id for item in repo.list_resume_versions()]
+    resume_root = repo.vault_path / "resumes"
+    before_directories = set(resume_root.iterdir())
+
+    response = client.post(
+        f"/applications/{application.id}/resume",
+        data={"name": "Racing replacement", "role_family": "software"},
+        files={"tex_file": ("resume.tex", b"replacement", "application/x-tex")},
+    )
+
+    assert response.status_code == 409
+    assert [item.id for item in repo.list_resume_versions()] == before_resume_ids
+    assert set(resume_root.iterdir()) == before_directories
+    after = repo.get_application(application.id)
+    assert after.approval_id is not None
+    assert after.selected_resume_version_id == selected.id
+
+
+@pytest.mark.parametrize(
+    "claims",
+    [
+        [
+            {
+                "text": "Claim",
+                "verification_state": "verified",
+                "public_safe": True,
+                "unknown": "field",
+            }
+        ],
+        [{"text": {"nested": "claim"}, "verification_state": "verified", "public_safe": True}],
+        [{"text": "x" * 4_001, "verification_state": "verified", "public_safe": True}],
+        [{"text": "Claim", "verification_state": "invented", "public_safe": True}],
+        [{"text": "Claim", "verification_state": "verified", "public_safe": 1}],
+        [
+            {"text": "Claim", "verification_state": "verified", "public_safe": True}
+            for _ in range(101)
+        ],
+    ],
+    ids=["unknown", "nested", "huge", "enum", "non-bool", "too-many"],
+)
+def test_analyze_claims_reject_unknown_nested_unbounded_or_coerced_values(
+    tmp_path: Path, claims: list[object]
+):
+    client = make_client(tmp_path)
+
+    response = client.post("/applications/app_missing/analyze", json={"claims": claims})
+
+    assert response.status_code == 422

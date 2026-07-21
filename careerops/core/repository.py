@@ -1836,6 +1836,90 @@ class CareerOpsRepository:
             )
         return self.get_evidence_item(evidence_id)
 
+    def create_and_link_evidence_item(
+        self,
+        *,
+        application_id: str,
+        claim_text: str,
+        evidence_type: str,
+        verification_state: str,
+        privacy_level: str,
+        source_path: Path | None = None,
+        source_url: str | None = None,
+        source_sha256: str | None = None,
+        notes: str = "",
+    ) -> EvidenceItem:
+        verification_state = finite_value(
+            VerificationState, verification_state, "verification state"
+        )
+        privacy_level = finite_value(PrivacyLevel, privacy_level, "privacy level")
+        evidence_id = new_id("evd")
+        now = utc_now()
+        stored_source_path = str(source_path) if source_path else None
+        with self.connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            application = connection.execute(
+                "SELECT id FROM applications WHERE id = ?", (application_id,)
+            ).fetchone()
+            if application is None:
+                raise KeyError("No application with that ID")
+            connection.execute(
+                """
+                INSERT INTO evidence_items (
+                    id, claim_text, evidence_type, source_path, source_url,
+                    source_sha256, verification_state, privacy_level, notes,
+                    created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    evidence_id,
+                    claim_text,
+                    evidence_type,
+                    stored_source_path,
+                    source_url,
+                    source_sha256,
+                    verification_state,
+                    privacy_level,
+                    notes,
+                    now,
+                    now,
+                ),
+            )
+            self._write_audit(
+                connection,
+                "evidence_item.created",
+                "evidence_item",
+                evidence_id,
+                None,
+                {
+                    "claim_text": claim_text,
+                    "evidence_type": evidence_type,
+                    "source_path": stored_source_path,
+                    "source_url": source_url,
+                    "source_sha256": source_sha256,
+                    "verification_state": verification_state,
+                    "privacy_level": privacy_level,
+                    "notes": notes,
+                },
+            )
+            connection.execute(
+                """
+                INSERT INTO application_evidence_links (
+                    application_id, evidence_item_id, created_at
+                ) VALUES (?, ?, ?)
+                """,
+                (application_id, evidence_id, now),
+            )
+            self._write_audit(
+                connection,
+                "application.evidence_linked",
+                "application",
+                application_id,
+                None,
+                {"evidence_item_id": evidence_id},
+            )
+        return self.get_evidence_item(evidence_id)
+
     def get_evidence_item(self, evidence_item_id: str) -> EvidenceItem:
         row = self._one("SELECT * FROM evidence_items WHERE id = ?", (evidence_item_id,))
         return self._evidence_item_from_row(row)
@@ -2244,6 +2328,101 @@ class CareerOpsRepository:
                 resume_id,
                 None,
                 {"name": name, "role_family": role_family, "tex_sha256": tex_sha256},
+            )
+        return self.get_resume_version(resume_id)
+
+    def create_and_select_resume_version(
+        self,
+        *,
+        application_id: str,
+        name: str,
+        role_family: str,
+        tex_path: Path,
+        tex_sha256: str,
+    ) -> ResumeVersion:
+        canonical_tex_path, actual_sha256 = self._stable_artifact_digest(tex_path)
+        try:
+            relative_path = canonical_tex_path.relative_to(
+                Path(os.path.realpath(self.vault_path))
+            )
+        except ValueError as exc:
+            raise ValueError("Resume source must remain within the repository vault") from exc
+        if not relative_path.parts or relative_path.parts[0] != "resumes":
+            raise ValueError("Resume source must be repository-owned")
+        if not SHA256_PATTERN.fullmatch(tex_sha256) or actual_sha256 != tex_sha256.lower():
+            raise ValueError("Resume source checksum did not match")
+
+        resume_id = new_id("res")
+        now = utc_now()
+        with self.connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            application = connection.execute(
+                "SELECT * FROM applications WHERE id = ?", (application_id,)
+            ).fetchone()
+            if application is None:
+                raise KeyError("No application with that ID")
+            if (
+                application["approval_id"] is not None
+                or application["status"] == ApplicationStatus.APPROVED.value
+                or application["submission_state"]
+                != SubmissionState.NOT_SUBMITTED.value
+                or application["submitted_at"] is not None
+            ):
+                raise ValueError(
+                    "Cannot upload a resume to an approved or submitted application"
+                )
+            connection.execute(
+                """
+                INSERT INTO resume_versions (
+                    id, name, role_family, tex_path, tex_sha256, pdf_path, pdf_sha256,
+                    parent_resume_version_id, render_status, parse_status, page_count,
+                    created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, NULL, NULL, NULL, 'not_rendered',
+                          'not_parsed', NULL, ?, ?)
+                """,
+                (
+                    resume_id,
+                    name,
+                    role_family,
+                    str(canonical_tex_path),
+                    actual_sha256,
+                    now,
+                    now,
+                ),
+            )
+            self._write_audit(
+                connection,
+                "resume.created",
+                "resume_version",
+                resume_id,
+                None,
+                {
+                    "name": name,
+                    "role_family": role_family,
+                    "tex_sha256": actual_sha256,
+                },
+            )
+            status = (
+                ApplicationStatus.NEEDS_RESUME_UPDATE
+                if application["latest_report_id"] is not None
+                else ApplicationStatus(application["status"])
+            )
+            connection.execute(
+                """
+                UPDATE applications
+                SET selected_resume_version_id = ?, latest_report_id = NULL,
+                    status = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (resume_id, status.value, now, application_id),
+            )
+            self._write_audit(
+                connection,
+                "application.resume_selected",
+                "application",
+                application_id,
+                dict(application),
+                {"selected_resume_version_id": resume_id, "status": status.value},
             )
         return self.get_resume_version(resume_id)
 

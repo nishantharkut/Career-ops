@@ -119,11 +119,12 @@ class AiOrchestrator:
         if claim_token is None:
             return self._repository.get_ai_task(task_id)
 
-        heartbeat_stop, heartbeat, heartbeat_errors, heartbeat_lost = (
-            self._start_claim_heartbeat(
-                task_id, claim_token
+        try:
+            heartbeat_stop, heartbeat, heartbeat_errors, heartbeat_lost = (
+                self._start_claim_heartbeat(task_id, claim_token)
             )
-        )
+        except Exception:
+            return self._fail_or_return_current(task_id, claim_token, "provider_error")
         artifacts: list[AiArtifact] = []
         findings: list[dict[str, Any]] = []
         try:
