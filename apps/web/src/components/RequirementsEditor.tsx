@@ -351,11 +351,13 @@ export default function RequirementsEditor({ applicationId, readOnly, onMutated 
                 <button
                   type="button"
                   className="secondary"
+                  aria-label={`Add list item for ${row.key || `row ${index + 1}`}`}
+                  title={`Add list item for ${row.key || `row ${index + 1}`}`}
                   onClick={() => updateRow(row.id, {
                     listItems: [...row.listItems, { id: newId(), kind: "text", value: "" }]
                   })}
                 >
-                  <FilePlus2 aria-hidden="true" size={16} /> Add list item for {row.key || `row ${index + 1}`}
+                  <FilePlus2 aria-hidden="true" size={16} /> Add list item
                 </button>
               </div>
             ) : row.kind === "boolean" ? (

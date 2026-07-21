@@ -1,13 +1,39 @@
 {
-  "date": "2026-07-21",
+  "date": "2026-07-22",
   "framework": "Vite React",
-  "font_stack": "IBM Plex Sans and IBM Plex Mono via @fontsource",
-  "palette": "OKLCH tokens in apps/web/src/tokens.css",
-  "motion": "motion-cut with button microinteraction only",
+  "font_stack": "IBM Plex Sans and IBM Plex Mono via local @fontsource packages",
+  "palette": "Cobalt-on-neutral OKLCH tokens in apps/web/src/tokens.css",
+  "motion": "Motion-cut; short color transitions, a bounded task-progress indicator, and reduced-motion overrides",
   "spacing": "4pt token scale",
+  "responsive_widths_verified": [
+    320,
+    375,
+    414,
+    768,
+    1280
+  ],
+  "interaction_states": [
+    "default",
+    "hover",
+    "focus-visible",
+    "active",
+    "disabled",
+    "loading",
+    "error",
+    "success"
+  ],
+  "hallmark_audit": {
+    "pre_emit": "P5 H5 E5 S5 R5 V4",
+    "slop_test": "pass",
+    "contrast": "pass; audited WCAG 2.1 token pairs meet 4.5:1 text and 3:1 focus thresholds",
+    "mobile": "pass at 320, 375, 414, and 768 CSS pixels",
+    "desktop": "pass at 1280 CSS pixels",
+    "enrichment": "none"
+  },
   "preserve": [
-    "operational three-pane workbench",
-    "minimal copy",
-    "local-first UI"
+    "operational three-region workbench",
+    "minimal task-specific copy",
+    "local-first application packet workflow",
+    "unframed sections with bounded repeated findings"
   ]
 }

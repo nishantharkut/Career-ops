@@ -1,5 +1,14 @@
 [
   {
+    "date": "2026-07-22",
+    "macrostructure": "Workbench",
+    "theme": "Cobalt",
+    "enrichment": "none",
+    "brief": "CareerOps responsive interaction-state refinement",
+    "genre": "modern-minimal",
+    "scope": "tokens, styles, and browser interaction-state coverage"
+  },
+  {
     "date": "2026-07-21",
     "macrostructure": "Workbench",
     "theme": "Cobalt",
