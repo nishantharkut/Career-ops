@@ -132,22 +132,27 @@ class AiTaskRunner:
         self._join_generation(generation)
         self._discard_drained_generation(generation)
 
-    def submit(self, task_id: str) -> bool:
+    def submit(self, task_id: str, *, allow_synchronous: bool = True) -> bool:
         with self._state_lock:
             generation = self._generation
             if generation is None:
-                run_synchronously = True
+                run_synchronously = allow_synchronous
             elif not generation.has_live_threads():
                 self._generation = None
-                run_synchronously = True
+                generation = None
+                run_synchronously = allow_synchronous
             elif not self._is_generation_healthy(generation):
                 return False
             else:
                 run_synchronously = False
 
+        if generation is None and not run_synchronously:
+            return False
         if run_synchronously:
             self._run_task(task_id)
             return True
+        if generation is None:
+            return False
         return self._submit_to_generation(generation, task_id)
 
     def _is_generation_healthy(self, generation: _RunnerGeneration) -> bool:

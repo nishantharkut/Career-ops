@@ -532,6 +532,105 @@ def test_task_runner_lifespan_stops_daemon_threads_cleanly(tmp_path: Path):
     assert not runner.is_running
 
 
+def test_lifespan_refuses_to_serve_until_blocked_generation_drains(tmp_path: Path):
+    repo = make_repo(tmp_path)
+    application = create_application(repo)
+    status = availability()
+    config = create_provider_config(repo, status)
+    entered = Event()
+    release = Event()
+    provider = ControlledProvider(status, entered=entered, release=release)
+    app = create_app(
+        repo,
+        provider_registry={config.id: provider},
+        task_poll_interval_seconds=0.01,
+        task_worker_count=1,
+    )
+    runner = app.state.task_runner
+
+    with TestClient(app) as client:
+        accepted = client.post(
+            f"/applications/{application.id}/ai-tasks",
+            json={"task_type": "analyze_jd", "provider_config_id": config.id},
+        )
+        assert accepted.status_code == 202
+        assert entered.wait(timeout=2)
+
+    served_request = False
+    try:
+        with pytest.raises(RuntimeError, match="AI task runner failed to start"):
+            with TestClient(app) as client:
+                served_request = True
+                client.get("/health")
+        assert not served_request
+        assert not runner.is_running
+        assert len(runner_threads(runner, kind="worker")) == 1
+    finally:
+        release.set()
+
+    wait_for_task_status(repo, accepted.json()["id"], "completed")
+    wait_until(lambda: not runner_threads(runner))
+
+    with TestClient(app) as client:
+        assert runner.is_running
+        assert client.get("/health").status_code == 200
+
+    assert provider.calls == 1
+    assert not runner_threads(runner)
+
+
+def test_health_fails_closed_when_lifespan_runner_becomes_unhealthy(tmp_path: Path):
+    repo = make_repo(tmp_path)
+    app = create_app(
+        repo,
+        provider_registry={},
+        task_poll_interval_seconds=0.01,
+        task_worker_count=1,
+    )
+
+    with TestClient(app) as client:
+        app.state.task_runner.stop()
+
+        response = client.get("/health")
+
+        assert response.status_code == 503
+        assert response.json() == {"detail": "AI task runner unavailable"}
+
+
+def test_unhealthy_lifespan_handoff_leaves_task_pending_for_later_recovery(
+    tmp_path: Path,
+):
+    repo = make_repo(tmp_path)
+    application = create_application(repo)
+    status = availability()
+    config = create_provider_config(repo, status)
+    provider = ControlledProvider(status)
+    app = create_app(
+        repo,
+        provider_registry={config.id: provider},
+        task_poll_interval_seconds=0.01,
+        task_worker_count=1,
+    )
+
+    with TestClient(app) as client:
+        app.state.task_runner.stop()
+        accepted = client.post(
+            f"/applications/{application.id}/ai-tasks",
+            json={"task_type": "analyze_jd", "provider_config_id": config.id},
+        )
+
+        assert accepted.status_code == 202
+        assert repo.get_ai_task(accepted.json()["id"]).status.value == "pending"
+        assert provider.calls == 0
+        assert client.get("/health").status_code == 503
+
+    with TestClient(app) as client:
+        wait_for_task_status(repo, accepted.json()["id"], "completed")
+        assert client.get("/health").status_code == 200
+
+    assert provider.calls == 1
+
+
 def test_create_task_is_persisted_running_queryable_and_reloadable(tmp_path: Path):
     repo = make_repo(tmp_path)
     application = create_application(repo)

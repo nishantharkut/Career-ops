@@ -260,10 +260,18 @@ def create_app(
 
     @asynccontextmanager
     async def lifespan(_api: FastAPI):
-        task_runner.start()
+        runner_started = False
         try:
+            try:
+                runner_started = task_runner.start()
+            except Exception as exc:
+                raise RuntimeError("AI task runner failed to start") from exc
+            if not runner_started:
+                raise RuntimeError("AI task runner failed to start")
+            _api.state.task_runner_lifespan_started = True
             yield
         finally:
+            _api.state.task_runner_lifespan_started = False
             task_runner.stop()
 
     root = Path(__file__).resolve().parents[3]
@@ -272,6 +280,7 @@ def create_app(
     api.state.provider_registry = registry
     api.state.ai_orchestrator = orchestrator
     api.state.task_runner = task_runner
+    api.state.task_runner_lifespan_started = False
     _add_basic_auth_middleware(api, auth if auth is not None else _auth_from_env())
     api.add_middleware(
         CORSMiddleware,
@@ -288,7 +297,17 @@ def create_app(
                 connection.execute("SELECT 1").fetchone()
         except Exception as exc:
             raise HTTPException(status_code=503, detail="Database unavailable") from exc
+        if api.state.task_runner_lifespan_started and not task_runner.is_running:
+            raise HTTPException(
+                status_code=503, detail="AI task runner unavailable"
+            )
         return {"status": "ok", "database": "ok"}
+
+    def submit_ai_task(task_id: str) -> bool:
+        return task_runner.submit(
+            task_id,
+            allow_synchronous=not api.state.task_runner_lifespan_started,
+        )
 
     @api.get("/applications")
     def list_applications() -> list[dict[str, Any]]:
@@ -501,7 +520,7 @@ def create_app(
             raise HTTPException(status_code=409, detail="AI task cannot be launched") from exc
         except Exception as exc:
             raise HTTPException(status_code=500, detail="AI task launch failed") from exc
-        background_tasks.add_task(task_runner.submit, task.id)
+        background_tasks.add_task(submit_ai_task, task.id)
         return _ai_task_payload(task)
 
     @api.get("/ai-tasks/{task_id}")
