@@ -48,6 +48,9 @@ PRIVACY_LEVELS = frozenset({"public", "private", "sensitive"})
 
 _IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 _URL_PATTERN = re.compile(r"(?i)https?://[^\s<>\"']+")
+_CREDENTIAL_URL_PATTERN = re.compile(
+    r"(?i)https?://[^\s<>\"']+\?[^=\s<>\"']+[ \t]*=[ \t]*[^\s<>\"']+"
+)
 _REDACTION_MARKER_PATTERN = re.compile(
     r"(\[redacted (?:credential|restricted material|url)\])",
     re.IGNORECASE,
@@ -308,6 +311,7 @@ def _provider_text(
             else restricted_pattern.sub("[redacted restricted material]", part)
             for part in parts
         )
+    text = _CREDENTIAL_URL_PATTERN.sub(_sanitize_url, text)
     text = SECRET_PATTERN.sub("[redacted credential]", text)
     return _URL_PATTERN.sub(_sanitize_url, text)
 

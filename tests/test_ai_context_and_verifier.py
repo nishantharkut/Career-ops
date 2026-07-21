@@ -3959,6 +3959,8 @@ def test_provider_sanitizer_removes_complete_credential_values(source: str):
     canonical = context.canonical_json.casefold()
     for leaked in ("correct horse", "private-value", "eyj.private.signature"):
         assert leaked not in canonical
+    if source.startswith("https://"):
+        assert context.to_dict()["job_description"]["text"] == "https://jobs.example/"
 
 
 @pytest.mark.parametrize(
