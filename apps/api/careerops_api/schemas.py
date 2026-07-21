@@ -91,6 +91,19 @@ class CreateAiTaskRequest(ApiRequest):
         return value
 
 
+class CreateResumeDraftRequest(ApiRequest):
+    task_id: Identifier
+    finding_ids: list[Identifier] = Field(min_length=1, max_length=100)
+    name: ShortText
+
+    @field_validator("finding_ids")
+    @classmethod
+    def require_unique_finding_ids(cls, value: list[str]) -> list[str]:
+        if len(set(value)) != len(value):
+            raise ValueError("finding IDs must be unique")
+        return value
+
+
 class FindingDecisionRequest(ApiRequest):
     decision: Literal["accepted", "rejected"]
 

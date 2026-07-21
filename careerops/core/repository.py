@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 import errno
 import hashlib
+from io import BytesIO
 import json
 import math
 import os
@@ -144,6 +145,27 @@ class ApplicationPacketSnapshot:
     versions: list[ApplicationVersion]
 
 
+@dataclass(frozen=True)
+class ResumeDraftAuthority:
+    application: Application
+    task: AiTask
+    parent_resume: ResumeVersion
+    parent_source: bytes
+    context_artifact: AiArtifact
+    context_bytes: bytes
+    findings: tuple[AiFinding, ...]
+    evidence: tuple[EvidenceItem, ...]
+    profile_facts: tuple[ProfileFact, ...]
+    authority_version_id: str
+    authority_snapshot_sha256: str
+    task_signature: str
+    parent_signature: str
+    artifact_signatures: tuple[tuple[str, str], ...]
+    finding_signatures: tuple[tuple[str, str], ...]
+    evidence_signatures: tuple[tuple[str, str], ...]
+    profile_fact_signatures: tuple[tuple[str, str], ...]
+
+
 PROVIDER_BINDING_BOOLEAN_FIELDS = frozenset(
     {"data_leaves_machine", "is_ai", "cloud_disabled", "egress_enforced"}
 )
@@ -181,6 +203,17 @@ def new_id(prefix: str) -> str:
 
 def sha256_text(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def database_row_sha256(row: sqlite3.Row) -> str:
+    serialized = json.dumps(
+        dict(row),
+        ensure_ascii=False,
+        allow_nan=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    return sha256_text(serialized)
 
 
 def redact(value: Any) -> Any:
@@ -2355,6 +2388,562 @@ class CareerOpsRepository:
                 {"company": company, "role_title": role_title, "jd_snapshot_id": snapshot_id},
             )
         return self.get_application(application_id)
+
+    def get_resume_draft_authority(
+        self,
+        *,
+        application_id: str,
+        task_id: str,
+        finding_ids: Sequence[str],
+    ) -> ResumeDraftAuthority:
+        if not finding_ids or len(set(finding_ids)) != len(finding_ids):
+            raise ValueError("Resume draft finding IDs must be nonempty and unique")
+
+        with self.connection() as connection:
+            connection.execute("BEGIN")
+            application_row = connection.execute(
+                "SELECT * FROM applications WHERE id = ?", (application_id,)
+            ).fetchone()
+            if application_row is None:
+                raise KeyError("No application with that ID")
+            task_row = connection.execute(
+                "SELECT * FROM ai_tasks WHERE id = ?", (task_id,)
+            ).fetchone()
+            if task_row is None:
+                raise KeyError("No AI task with that ID")
+            if task_row["application_id"] != application_id:
+                raise ValueError("AI task does not belong to this application")
+            if (
+                task_row["status"] != AiTaskStatus.COMPLETED.value
+                or task_row["task_type"]
+                != AiTaskType.SUGGEST_RESUME_EDITS.value
+            ):
+                raise ValueError("AI task cannot authorize a resume draft")
+
+            parent_id = application_row["selected_resume_version_id"]
+            if parent_id is None:
+                raise ValueError("Application has no selected parent resume")
+            parent_row = connection.execute(
+                "SELECT * FROM resume_versions WHERE id = ?", (parent_id,)
+            ).fetchone()
+            if parent_row is None:
+                raise ValueError("Selected parent resume is missing")
+
+            authority_matches: list[tuple[sqlite3.Row, dict[str, Any]]] = []
+            version_rows = connection.execute(
+                """
+                SELECT * FROM application_versions
+                WHERE application_id = ? AND event_type = 'ai_task.completed'
+                ORDER BY version_number ASC
+                """,
+                (application_id,),
+            ).fetchall()
+            for version_row in version_rows:
+                try:
+                    snapshot = json.loads(version_row["snapshot_json"])
+                except (TypeError, json.JSONDecodeError) as exc:
+                    raise ValueError("AI task authority snapshot is invalid") from exc
+                if not isinstance(snapshot, dict):
+                    raise ValueError("AI task authority snapshot is invalid")
+                task_snapshot = snapshot.get("ai_task")
+                if (
+                    isinstance(task_snapshot, dict)
+                    and task_snapshot.get("id") == task_id
+                ):
+                    authority_matches.append((version_row, snapshot))
+            if len(authority_matches) != 1:
+                raise ValueError("AI task completed authority is ambiguous")
+            authority_version, authority_snapshot = authority_matches[0]
+            task_snapshot = authority_snapshot.get("ai_task")
+            if (
+                not isinstance(task_snapshot, dict)
+                or task_snapshot.get("status") != AiTaskStatus.COMPLETED.value
+                or task_snapshot.get("task_type")
+                != AiTaskType.SUGGEST_RESUME_EDITS.value
+            ):
+                raise ValueError("AI task completed authority is invalid")
+
+            artifact_manifest = authority_snapshot.get("artifacts")
+            if not isinstance(artifact_manifest, list):
+                raise ValueError("AI task artifact authority is invalid")
+            manifest_by_id: dict[str, dict[str, str]] = {}
+            manifest_by_type: dict[str, dict[str, str]] = {}
+            for item in artifact_manifest:
+                if (
+                    not isinstance(item, dict)
+                    or set(item) != {"artifact_type", "id", "sha256"}
+                    or type(item.get("artifact_type")) is not str
+                    or type(item.get("id")) is not str
+                    or type(item.get("sha256")) is not str
+                    or item["id"] in manifest_by_id
+                    or item["artifact_type"] in manifest_by_type
+                ):
+                    raise ValueError("AI task artifact authority is invalid")
+                manifest_by_id[item["id"]] = item
+                manifest_by_type[item["artifact_type"]] = item
+            if set(manifest_by_type) != {
+                "context",
+                "raw_output",
+                "validated_output",
+            }:
+                raise ValueError("AI task artifact authority is incomplete")
+
+            placeholders = ", ".join("?" for _ in manifest_by_id)
+            artifact_rows = connection.execute(
+                f"SELECT * FROM ai_artifacts WHERE id IN ({placeholders})",
+                tuple(manifest_by_id),
+            ).fetchall()
+            if len(artifact_rows) != len(manifest_by_id):
+                raise ValueError("AI task artifact authority is missing")
+            artifact_by_id = {row["id"]: row for row in artifact_rows}
+            context_row = artifact_by_id[manifest_by_type["context"]["id"]]
+            attempt_token = context_row["claim_token"]
+            if type(attempt_token) is not str or not attempt_token:
+                raise ValueError("AI task completed attempt is invalid")
+            for artifact_id, manifest in manifest_by_id.items():
+                artifact_row = artifact_by_id[artifact_id]
+                if (
+                    artifact_row["task_id"] != task_id
+                    or artifact_row["claim_token"] != attempt_token
+                    or artifact_row["artifact_type"] != manifest["artifact_type"]
+                    or artifact_row["sha256"] != manifest["sha256"]
+                ):
+                    raise ValueError("AI task artifact authority changed")
+                self._validate_artifact_row(artifact_row)
+            attempt_artifact_rows = connection.execute(
+                """
+                SELECT * FROM ai_artifacts
+                WHERE task_id = ? AND claim_token = ?
+                ORDER BY created_at ASC, id ASC
+                """,
+                (task_id, attempt_token),
+            ).fetchall()
+            if {row["id"] for row in attempt_artifact_rows} != set(manifest_by_id):
+                raise ValueError("AI task completed attempt artifacts are ambiguous")
+
+            provenance = authority_snapshot.get("provenance")
+            if (
+                not isinstance(provenance, dict)
+                or provenance.get("ai_task_id") != task_id
+                or provenance.get("context_sha256") != context_row["sha256"]
+            ):
+                raise ValueError("AI task context provenance is invalid")
+
+            snapshot_finding_ids = authority_snapshot.get("finding_ids")
+            side_effect = authority_snapshot.get("side_effect")
+            suggestion_ids = (
+                side_effect.get("suggestion_finding_ids")
+                if isinstance(side_effect, dict)
+                else None
+            )
+            if (
+                not isinstance(snapshot_finding_ids, list)
+                or not isinstance(suggestion_ids, list)
+                or any(type(value) is not str for value in snapshot_finding_ids)
+                or any(type(value) is not str for value in suggestion_ids)
+                or len(set(snapshot_finding_ids)) != len(snapshot_finding_ids)
+                or snapshot_finding_ids != suggestion_ids
+            ):
+                raise ValueError("AI task finding authority is invalid")
+
+            attempt_finding_rows = connection.execute(
+                """
+                SELECT * FROM ai_findings
+                WHERE task_id = ? AND claim_token = ?
+                ORDER BY created_at ASC, id ASC
+                """,
+                (task_id, attempt_token),
+            ).fetchall()
+            if {row["id"] for row in attempt_finding_rows} != set(
+                snapshot_finding_ids
+            ):
+                raise ValueError("AI task completed attempt findings are ambiguous")
+            attempt_findings = {row["id"]: row for row in attempt_finding_rows}
+            selected_finding_rows: list[sqlite3.Row] = []
+            for finding_id in finding_ids:
+                finding_row = connection.execute(
+                    "SELECT * FROM ai_findings WHERE id = ?", (finding_id,)
+                ).fetchone()
+                if finding_row is None:
+                    raise KeyError("No AI finding with that ID")
+                if finding_id not in attempt_findings:
+                    raise ValueError("AI finding is not authorized by this task")
+                selected_finding_rows.append(finding_row)
+
+            evidence_rows = connection.execute(
+                """
+                SELECT evidence_items.*
+                FROM application_evidence_links
+                JOIN evidence_items
+                  ON evidence_items.id = application_evidence_links.evidence_item_id
+                WHERE application_evidence_links.application_id = ?
+                ORDER BY application_evidence_links.created_at ASC,
+                         evidence_items.id ASC
+                """,
+                (application_id,),
+            ).fetchall()
+            profile_fact_rows = connection.execute(
+                "SELECT * FROM profile_facts ORDER BY created_at ASC, id ASC"
+            ).fetchall()
+
+            context_buffer = BytesIO()
+            context_evidence = self._stable_artifact_read(
+                Path(context_row["path"]), context_buffer
+            )
+            if (
+                context_evidence.path != Path(context_row["path"])
+                or context_evidence.sha256 != context_row["sha256"]
+            ):
+                raise ValueError("AI task context checksum is invalid")
+
+            parent_buffer = BytesIO()
+            parent_evidence = self._stable_artifact_read(
+                Path(parent_row["tex_path"]), parent_buffer
+            )
+            vault_root = Path(os.path.realpath(self.vault_path))
+            try:
+                parent_relative = parent_evidence.path.relative_to(vault_root)
+            except ValueError as exc:
+                raise ValueError("Parent resume source is not repository-owned") from exc
+            if (
+                not parent_relative.parts
+                or parent_relative.parts[0] != "resumes"
+                or parent_evidence.path != Path(parent_row["tex_path"])
+                or not SHA256_PATTERN.fullmatch(parent_row["tex_sha256"])
+                or parent_row["tex_sha256"].lower() != parent_row["tex_sha256"]
+                or parent_evidence.sha256 != parent_row["tex_sha256"]
+            ):
+                raise ValueError("Parent resume source checksum is invalid")
+
+            application = self._application_from_row(application_row)
+            task = self._ai_task_from_row(
+                task_row, self._ai_task_input_artifact_ids(connection, task_id)
+            )
+            parent = self._resume_from_row(parent_row)
+            context_artifact = self._ai_artifact_from_row(context_row)
+            selected_findings = tuple(
+                self._ai_finding_from_row(row) for row in selected_finding_rows
+            )
+            evidence = tuple(
+                self._evidence_item_from_row(row) for row in evidence_rows
+            )
+            profile_facts = tuple(
+                self._profile_fact_from_row(row) for row in profile_fact_rows
+            )
+            authority = ResumeDraftAuthority(
+                application=application,
+                task=task,
+                parent_resume=parent,
+                parent_source=parent_buffer.getvalue(),
+                context_artifact=context_artifact,
+                context_bytes=context_buffer.getvalue(),
+                findings=selected_findings,
+                evidence=evidence,
+                profile_facts=profile_facts,
+                authority_version_id=authority_version["id"],
+                authority_snapshot_sha256=sha256_text(
+                    authority_version["snapshot_json"]
+                ),
+                task_signature=database_row_sha256(task_row),
+                parent_signature=database_row_sha256(parent_row),
+                artifact_signatures=tuple(
+                    sorted(
+                        (row["id"], database_row_sha256(row))
+                        for row in artifact_rows
+                    )
+                ),
+                finding_signatures=tuple(
+                    sorted(
+                        (row["id"], database_row_sha256(row))
+                        for row in attempt_finding_rows
+                    )
+                ),
+                evidence_signatures=tuple(
+                    sorted(
+                        (row["id"], database_row_sha256(row))
+                        for row in evidence_rows
+                    )
+                ),
+                profile_fact_signatures=tuple(
+                    sorted(
+                        (row["id"], database_row_sha256(row))
+                        for row in profile_fact_rows
+                    )
+                ),
+            )
+        return authority
+
+    def create_and_select_resume_draft(
+        self,
+        *,
+        application_id: str,
+        resume_id: str,
+        name: str,
+        tex_path: Path,
+        tex_sha256: str,
+        authority: ResumeDraftAuthority,
+        referenced_evidence_ids: Sequence[str],
+    ) -> ResumeVersion:
+        if (
+            type(name) is not str
+            or not name
+            or name != name.strip()
+            or len(name) > 300
+        ):
+            raise ValueError("Resume draft name is invalid")
+        if not re.fullmatch(r"res_[0-9a-f]{32}", resume_id):
+            raise ValueError("Resume draft ID is invalid")
+        if len(set(referenced_evidence_ids)) != len(referenced_evidence_ids):
+            raise ValueError("Referenced evidence IDs must be unique")
+        expected_evidence_signatures = dict(authority.evidence_signatures)
+        if not set(referenced_evidence_ids).issubset(expected_evidence_signatures):
+            raise ValueError("Referenced evidence is not authorized")
+
+        child_evidence = self._stable_artifact_read(tex_path)
+        expected_child_path = Path(
+            os.path.realpath(
+                self.vault_path / "resumes" / resume_id / "source.tex"
+            )
+        )
+        if (
+            child_evidence.path != expected_child_path
+            or not SHA256_PATTERN.fullmatch(tex_sha256)
+            or tex_sha256.lower() != tex_sha256
+            or child_evidence.sha256 != tex_sha256
+        ):
+            raise ValueError("Resume draft source is not repository-owned")
+
+        expected_artifact_signatures = dict(authority.artifact_signatures)
+        expected_finding_signatures = dict(authority.finding_signatures)
+        expected_profile_signatures = dict(authority.profile_fact_signatures)
+        inserted_resume: ResumeVersion | None = None
+        with self.connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            now = utc_now()
+            application = connection.execute(
+                "SELECT * FROM applications WHERE id = ?", (application_id,)
+            ).fetchone()
+            if application is None:
+                raise KeyError("No application with that ID")
+            if (
+                authority.application.id != application_id
+                or application["approval_id"] is not None
+                or application["status"]
+                in {
+                    ApplicationStatus.APPROVED.value,
+                    ApplicationStatus.SUBMITTED_MANUAL.value,
+                }
+                or application["submission_state"]
+                != SubmissionState.NOT_SUBMITTED.value
+                or application["submitted_at"] is not None
+            ):
+                raise ValueError(
+                    "Cannot create a resume draft for an approved or submitted application"
+                )
+            if (
+                application["selected_resume_version_id"]
+                != authority.parent_resume.id
+            ):
+                raise ValueError("Selected resume changed since the AI task")
+
+            task_row = connection.execute(
+                "SELECT * FROM ai_tasks WHERE id = ?", (authority.task.id,)
+            ).fetchone()
+            if (
+                task_row is None
+                or task_row["application_id"] != application_id
+                or task_row["status"] != AiTaskStatus.COMPLETED.value
+                or task_row["task_type"]
+                != AiTaskType.SUGGEST_RESUME_EDITS.value
+                or database_row_sha256(task_row) != authority.task_signature
+            ):
+                raise ValueError("AI task authority changed before draft creation")
+
+            version_row = connection.execute(
+                "SELECT * FROM application_versions WHERE id = ?",
+                (authority.authority_version_id,),
+            ).fetchone()
+            if (
+                version_row is None
+                or version_row["application_id"] != application_id
+                or version_row["event_type"] != "ai_task.completed"
+                or sha256_text(version_row["snapshot_json"])
+                != authority.authority_snapshot_sha256
+            ):
+                raise ValueError("AI task completed authority changed")
+
+            artifact_rows = connection.execute(
+                "SELECT * FROM ai_artifacts WHERE task_id = ? AND claim_token = ?",
+                (authority.task.id, authority.context_artifact.claim_token),
+            ).fetchall()
+            if {
+                row["id"]: database_row_sha256(row) for row in artifact_rows
+            } != expected_artifact_signatures:
+                raise ValueError("AI task artifact authority changed")
+            for artifact_row in artifact_rows:
+                self._validate_artifact_row(artifact_row)
+
+            finding_rows = connection.execute(
+                """
+                SELECT * FROM ai_findings
+                WHERE task_id = ? AND claim_token = ?
+                """,
+                (authority.task.id, authority.context_artifact.claim_token),
+            ).fetchall()
+            if {
+                row["id"]: database_row_sha256(row) for row in finding_rows
+            } != expected_finding_signatures:
+                raise ValueError("AI finding authority changed")
+            evidence_rows = connection.execute(
+                """
+                SELECT evidence_items.*
+                FROM application_evidence_links
+                JOIN evidence_items
+                  ON evidence_items.id = application_evidence_links.evidence_item_id
+                WHERE application_evidence_links.application_id = ?
+                """,
+                (application_id,),
+            ).fetchall()
+            if {
+                row["id"]: database_row_sha256(row) for row in evidence_rows
+            } != expected_evidence_signatures:
+                raise ValueError("Application evidence authority changed")
+            for evidence_id in referenced_evidence_ids:
+                evidence_row = next(
+                    (row for row in evidence_rows if row["id"] == evidence_id),
+                    None,
+                )
+                if (
+                    evidence_row is None
+                    or evidence_row["verification_state"]
+                    != VerificationState.VERIFIED.value
+                    or evidence_row["privacy_level"] != PrivacyLevel.PUBLIC.value
+                ):
+                    raise ValueError("Referenced evidence is not publishable")
+
+            profile_rows = connection.execute(
+                "SELECT * FROM profile_facts ORDER BY created_at ASC, id ASC"
+            ).fetchall()
+            if {
+                row["id"]: database_row_sha256(row) for row in profile_rows
+            } != expected_profile_signatures:
+                raise ValueError("Profile fact authority changed")
+
+            parent_row = connection.execute(
+                "SELECT * FROM resume_versions WHERE id = ?",
+                (authority.parent_resume.id,),
+            ).fetchone()
+            if (
+                parent_row is None
+                or database_row_sha256(parent_row) != authority.parent_signature
+            ):
+                raise ValueError("Parent resume authority changed")
+            parent_evidence = self._stable_artifact_read(
+                Path(parent_row["tex_path"])
+            )
+            if (
+                parent_evidence.sha256 != parent_row["tex_sha256"]
+                or parent_evidence.sha256
+                != hashlib.sha256(authority.parent_source).hexdigest()
+            ):
+                raise ValueError("Parent resume source changed")
+
+            committed_child_evidence = self._stable_artifact_read(tex_path)
+            if (
+                committed_child_evidence.path != child_evidence.path
+                or committed_child_evidence.sha256 != child_evidence.sha256
+            ):
+                raise ValueError("Resume draft source changed before commit")
+
+            connection.execute(
+                """
+                INSERT INTO resume_versions (
+                    id, name, role_family, tex_path, tex_sha256, pdf_path,
+                    pdf_sha256, parent_resume_version_id, render_status,
+                    parse_status, page_count, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, NULL, NULL, ?, 'not_rendered',
+                          'not_parsed', NULL, ?, ?)
+                """,
+                (
+                    resume_id,
+                    name,
+                    parent_row["role_family"],
+                    str(committed_child_evidence.path),
+                    committed_child_evidence.sha256,
+                    parent_row["id"],
+                    now,
+                    now,
+                ),
+            )
+            self._write_audit(
+                connection,
+                "resume.created",
+                "resume_version",
+                resume_id,
+                None,
+                {
+                    "name": name,
+                    "parent_resume_version_id": parent_row["id"],
+                    "role_family": parent_row["role_family"],
+                    "task_id": authority.task.id,
+                    "tex_sha256": committed_child_evidence.sha256,
+                },
+            )
+            invalidated_report_id = application["latest_report_id"]
+            invalidated_approval_id = application["approval_id"]
+            status = (
+                ApplicationStatus.NEEDS_RESUME_UPDATE
+                if invalidated_report_id is not None
+                else ApplicationStatus(application["status"])
+            )
+            connection.execute(
+                """
+                UPDATE applications
+                SET selected_resume_version_id = ?, latest_report_id = NULL,
+                    approval_id = NULL, status = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (resume_id, status.value, now, application_id),
+            )
+            self._write_audit(
+                connection,
+                "application.resume_selected",
+                "application",
+                application_id,
+                dict(application),
+                {
+                    "approval_id": None,
+                    "latest_report_id": None,
+                    "selected_resume_version_id": resume_id,
+                    "status": status.value,
+                },
+            )
+            self._insert_application_version(
+                connection=connection,
+                application_id=application_id,
+                event_type="resume_draft.created",
+                snapshot={
+                    "context_artifact_id": authority.context_artifact.id,
+                    "context_sha256": authority.context_artifact.sha256,
+                    "finding_ids": [finding.id for finding in authority.findings],
+                    "invalidated_approval_id": invalidated_approval_id,
+                    "invalidated_report_id": invalidated_report_id,
+                    "parent_resume_version_id": parent_row["id"],
+                    "resume_version_id": resume_id,
+                    "task_id": authority.task.id,
+                    "tex_sha256": committed_child_evidence.sha256,
+                },
+                now=now,
+            )
+            inserted_row = connection.execute(
+                "SELECT * FROM resume_versions WHERE id = ?", (resume_id,)
+            ).fetchone()
+            if inserted_row is None:
+                raise RuntimeError("Created resume draft was not readable")
+            inserted_resume = self._resume_from_row(inserted_row)
+        if inserted_resume is None:
+            raise RuntimeError("Created resume draft was not returned")
+        return inserted_resume
 
     def create_resume_version(
         self,

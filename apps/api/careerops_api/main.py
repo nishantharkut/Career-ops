@@ -11,6 +11,7 @@ from pathlib import Path
 import re
 import secrets
 import shutil
+import sqlite3
 import stat
 from typing import Annotated, Any
 from uuid import uuid4
@@ -33,6 +34,7 @@ from apps.api.careerops_api.schemas import (
     ApproveRequest,
     CreateAiTaskRequest,
     CreateApplicationRequest,
+    CreateResumeDraftRequest,
     EvidenceRequest,
     FindingDecisionRequest,
     MarkSubmittedRequest,
@@ -70,6 +72,7 @@ from careerops.gates.risk import evaluate_risks
 from careerops.parsers.jd_parser import parse_jd
 from careerops.parsers.pdf_parser import parse_pdf
 from careerops.renderers.latex import render_latex, sha256_file
+from careerops.resumes.drafts import create_verified_resume_draft
 
 
 DEFAULT_ALLOWED_ORIGINS = ["http://127.0.0.1:5173", "http://localhost:5173"]
@@ -433,6 +436,29 @@ def create_app(
             page_count=parsed.page_count,
         )
         return _resume_payload(updated)
+
+    @api.post("/applications/{application_id}/resume-drafts", status_code=201)
+    def create_resume_draft(
+        application_id: ApplicationId,
+        payload: CreateResumeDraftRequest,
+    ) -> dict[str, Any]:
+        try:
+            resume = create_verified_resume_draft(
+                repo,
+                application_id=application_id,
+                task_id=payload.task_id,
+                finding_ids=payload.finding_ids,
+                name=payload.name,
+            )
+        except KeyError as exc:
+            raise HTTPException(
+                status_code=404, detail="Resume draft authority not found"
+            ) from exc
+        except (OSError, sqlite3.DatabaseError, ValueError) as exc:
+            raise HTTPException(
+                status_code=409, detail="Resume draft could not be created"
+            ) from exc
+        return _resume_payload(resume)
 
     @api.post("/applications/{application_id}/analyze")
     def analyze_application(
