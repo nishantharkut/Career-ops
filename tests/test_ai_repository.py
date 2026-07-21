@@ -374,11 +374,18 @@ def test_finalization_rejects_caller_supplied_authority_provenance(tmp_path: Pat
 def test_finalization_builds_provenance_from_repository_rows(tmp_path: Path):
     repo = make_repo(tmp_path)
     application = create_application(repo)
+    resume_dir = repo.vault_path / "resumes" / "ai-report"
+    resume_dir.mkdir(parents=True)
+    pdf_path = resume_dir / "resume.pdf"
+    pdf_bytes = b"%PDF-1.4\nrepository-owned provenance"
+    pdf_path.write_bytes(pdf_bytes)
     resume = repo.create_resume_version(
         name="Current resume",
         role_family="software",
-        tex_path=tmp_path / "resume.tex",
+        tex_path=resume_dir / "resume.tex",
         tex_sha256="a" * 64,
+        pdf_path=pdf_path,
+        pdf_sha256=hashlib.sha256(pdf_bytes).hexdigest(),
     )
     repo.select_resume(application.id, resume.id)
     provider = create_provider(repo)
@@ -433,6 +440,8 @@ def test_finalization_builds_provenance_from_repository_rows(tmp_path: Path):
     assert "provenance" not in report.fit["details"]
     version = repo.list_application_versions(application.id)[-1]
     assert version.snapshot["provenance"] == expected_provenance
+    approval = repo.approve_application(application.id, report.id, "Reviewed")
+    assert approval.report_id == report.id
 
 
 def test_verification_failed_block_requires_all_output_artifacts(tmp_path: Path):
@@ -564,7 +573,7 @@ def test_lock_delayed_finalization_rejects_expired_claim(tmp_path: Path):
     assert repo.list_application_versions(application.id) == []
 
 
-def test_ai_artifact_requires_task_attempt_path_and_unique_physical_path(
+def test_ai_artifact_requires_task_attempt_source_path(
     tmp_path: Path,
 ):
     repo = make_repo(tmp_path)
@@ -596,7 +605,7 @@ def test_ai_artifact_requires_task_attempt_path_and_unique_physical_path(
     if not alias_path.exists():
         alias_path = artifact.path
 
-    with pytest.raises(ValueError, match="physical path"):
+    with pytest.raises(ValueError, match="task attempt"):
         repo.save_ai_artifact(
             task.id,
             second_claim,
@@ -607,7 +616,51 @@ def test_ai_artifact_requires_task_attempt_path_and_unique_physical_path(
         )
 
 
-def test_ai_artifact_insert_race_rolls_back_database_row(
+def test_ai_artifact_insert_race_rolls_back_database_row_and_copy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    repo = make_repo(tmp_path)
+    application = create_application(repo)
+    provider = create_provider(repo)
+    task = create_task(repo, application.id, provider.id)
+    claim = claim_task(repo, task.id)
+    source = attempt_file(repo, task.id, "insert-race.json")
+    original_bytes = b"original"
+    source.write_bytes(original_bytes)
+    original_require_claim = repo._require_active_ai_claim
+
+    def tamper_materialized_copy(connection, task_id, claim_token):
+        original_require_claim(connection, task_id, claim_token)
+        copies = list(
+            (repo.vault_path / "ai-artifacts" / task.id).glob("*/context.json")
+        )
+        assert len(copies) == 1
+        copies[0].write_bytes(b"tampered-after-materialization")
+
+    monkeypatch.setattr(
+        repo, "_require_active_ai_claim", tamper_materialized_copy
+    )
+
+    with pytest.raises(ValueError, match="integrity"):
+        repo.save_ai_artifact(
+            task.id,
+            claim,
+            "context",
+            source,
+            hashlib.sha256(original_bytes).hexdigest(),
+            "1",
+        )
+
+    with repo.connection() as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM ai_artifacts WHERE task_id = ?",
+            (task.id,),
+        ).fetchone()[0] == 0
+    artifact_root = repo.vault_path / "ai-artifacts" / task.id
+    assert not artifact_root.exists() or list(artifact_root.rglob("*")) == []
+
+
+def test_ai_artifact_save_does_not_use_post_commit_getter(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
     repo = make_repo(tmp_path)
@@ -618,30 +671,163 @@ def test_ai_artifact_insert_race_rolls_back_database_row(
     path = attempt_file(repo, task.id, "raced.json")
     original_bytes = b"original"
     path.write_bytes(original_bytes)
-    original_require_claim = repo._require_active_ai_claim
 
-    def mutate_after_initial_digest(connection, task_id, claim_token):
-        original_require_claim(connection, task_id, claim_token)
-        path.write_bytes(b"mutated-after-digest")
+    def reject_post_commit_getter(_artifact_id: str) -> None:
+        raise AssertionError("save must not validate through a post-commit getter")
 
-    monkeypatch.setattr(
-        repo, "_require_active_ai_claim", mutate_after_initial_digest
+    monkeypatch.setattr(repo, "get_ai_artifact", reject_post_commit_getter)
+
+    artifact = repo.save_ai_artifact(
+        task.id,
+        claim,
+        "context",
+        path,
+        hashlib.sha256(original_bytes).hexdigest(),
+        "1",
     )
 
-    with pytest.raises(ValueError, match="integrity"):
+    with repo.connection() as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM ai_artifacts WHERE task_id = ?",
+            (task.id,),
+        ).fetchone()[0] == 1
+    assert artifact.path.read_bytes() == original_bytes
+
+
+def test_ai_artifact_is_repository_owned_copy_not_request_source(tmp_path: Path):
+    repo = make_repo(tmp_path)
+    application = create_application(repo)
+    provider = create_provider(repo)
+    task = create_task(repo, application.id, provider.id)
+    claim = claim_task(repo, task.id)
+    source = attempt_file(repo, task.id, "source.json")
+    source.write_bytes(b"sealed request bytes")
+
+    artifact = repo.save_ai_artifact(
+        task.id,
+        claim,
+        "context",
+        source,
+        hashlib.sha256(source.read_bytes()).hexdigest(),
+        "1",
+    )
+
+    relative = artifact.path.relative_to(repo.vault_path)
+    assert relative.parts[:3] == ("ai-artifacts", task.id, artifact.id)
+    assert artifact.path != source.resolve()
+    assert artifact.path.read_bytes() == b"sealed request bytes"
+    source.write_bytes(b"request file later changed")
+    assert repo.get_ai_artifact(artifact.id) == artifact
+
+
+def test_ai_artifact_repeated_source_gets_unique_physical_copies(tmp_path: Path):
+    repo = make_repo(tmp_path)
+    application = create_application(repo)
+    provider = create_provider(repo)
+    task = create_task(repo, application.id, provider.id)
+    claim = claim_task(repo, task.id)
+    source = attempt_file(repo, task.id, "shared-source.json")
+    source.write_bytes(b"same source")
+    source_sha256 = hashlib.sha256(source.read_bytes()).hexdigest()
+
+    first = repo.save_ai_artifact(
+        task.id, claim, "context", source, source_sha256, "1"
+    )
+    second = repo.save_ai_artifact(
+        task.id, claim, "context", source, source_sha256, "1"
+    )
+
+    assert first.path != second.path
+    assert first.path.read_bytes() == second.path.read_bytes() == b"same source"
+
+
+def test_ai_artifact_source_replacement_during_read_leaves_no_row_or_copy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    from careerops.core import repository as repository_module
+
+    repo = make_repo(tmp_path)
+    application = create_application(repo)
+    provider = create_provider(repo)
+    task = create_task(repo, application.id, provider.id)
+    claim = claim_task(repo, task.id)
+    source = attempt_file(repo, task.id, "replace-race.json")
+    original_bytes = b"a" * (128 * 1024)
+    source.write_bytes(original_bytes)
+    original_read = repository_module.os.read
+    replaced = False
+
+    def replace_after_first_read(descriptor: int, size: int) -> bytes:
+        nonlocal replaced
+        content = original_read(descriptor, size)
+        if content and not replaced:
+            replaced = True
+            source.write_bytes(b"replacement")
+        return content
+
+    monkeypatch.setattr(repository_module.os, "read", replace_after_first_read)
+
+    with pytest.raises(ValueError, match="identity changed"):
         repo.save_ai_artifact(
             task.id,
             claim,
             "context",
-            path,
+            source,
             hashlib.sha256(original_bytes).hexdigest(),
             "1",
         )
 
     with repo.connection() as connection:
         assert connection.execute(
-            "SELECT COUNT(*) FROM ai_artifacts WHERE task_id = ?",
-            (task.id,),
+            "SELECT COUNT(*) FROM ai_artifacts WHERE task_id = ?", (task.id,)
+        ).fetchone()[0] == 0
+    artifact_root = repo.vault_path / "ai-artifacts" / task.id
+    assert not artifact_root.exists() or list(artifact_root.rglob("*")) == []
+
+
+def test_ai_artifact_db_failure_cleans_only_new_repository_copy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    from careerops.core import repository as repository_module
+
+    repo = make_repo(tmp_path)
+    application = create_application(repo)
+    provider = create_provider(repo)
+    task = create_task(repo, application.id, provider.id)
+    claim = claim_task(repo, task.id)
+    source = attempt_file(repo, task.id, "db-failure.json")
+    source_bytes = b"preserve source"
+    source.write_bytes(source_bytes)
+    materialized_paths: list[Path] = []
+    original_replace = repository_module.os.replace
+
+    def record_materialization(source_path, destination_path) -> None:
+        materialized_paths.append(Path(destination_path))
+        original_replace(source_path, destination_path)
+
+    def fail_claim_check(_connection, _task_id, _claim_token) -> None:
+        raise ValueError("simulated claim loss")
+
+    monkeypatch.setattr(repository_module.os, "replace", record_materialization)
+    monkeypatch.setattr(repo, "_require_active_ai_claim", fail_claim_check)
+
+    with pytest.raises(ValueError, match="claim loss"):
+        repo.save_ai_artifact(
+            task.id,
+            claim,
+            "context",
+            source,
+            hashlib.sha256(source_bytes).hexdigest(),
+            "1",
+        )
+
+    assert len(materialized_paths) == 1
+    assert not materialized_paths[0].exists()
+    assert not materialized_paths[0].parent.exists()
+    assert source.read_bytes() == source_bytes
+    with repo.connection() as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM ai_artifacts WHERE task_id = ?", (task.id,)
         ).fetchone()[0] == 0
 
 
@@ -909,6 +1095,108 @@ def create_approved_application(repo: CareerOpsRepository, tmp_path: Path):
     )
     approval = repo.approve_application(application.id, report.id, "Reviewed")
     return application, resume, report, approval
+
+
+@pytest.mark.parametrize(
+    ("fit", "risks"),
+    [
+        (
+            {"score": 90, "provenance": {"ai_task_id": "forged"}},
+            {"blockers": [], "warnings": []},
+        ),
+        (
+            {"score": 90},
+            {
+                "blockers": [],
+                "warnings": [],
+                "provenance": {"provider_kind": "forged"},
+            },
+        ),
+        ({"score": 90, "ai_task_id": "forged"}, {"blockers": [], "warnings": []}),
+    ],
+)
+def test_non_ai_report_rejects_reserved_ai_provenance(
+    tmp_path: Path, fit: dict[str, Any], risks: dict[str, Any]
+):
+    repo = make_repo(tmp_path)
+    application = create_application(repo)
+    resume = repo.create_resume_version(
+        name="Current resume",
+        role_family="software",
+        tex_path=tmp_path / "resume.tex",
+        tex_sha256="a" * 64,
+    )
+    repo.select_resume(application.id, resume.id)
+
+    with pytest.raises(ValueError, match="reserved AI provenance"):
+        repo.save_report(
+            application_id=application.id,
+            resume_version_id=resume.id,
+            jd_snapshot_id=application.jd_snapshot_id,
+            fit=fit,
+            risks=risks,
+        )
+
+    assert repo.get_application(application.id).latest_report_id is None
+
+
+def test_approval_rejects_forged_reserved_provenance_but_accepts_normal_report(
+    tmp_path: Path,
+):
+    repo = make_repo(tmp_path)
+    application = create_application(repo)
+    source_dir = repo.vault_path / "resumes" / "provenance"
+    source_dir.mkdir(parents=True)
+    pdf_path = source_dir / "resume.pdf"
+    pdf_bytes = b"%PDF-1.4\nprovenance"
+    pdf_path.write_bytes(pdf_bytes)
+    resume = repo.create_resume_version(
+        name="Current resume",
+        role_family="software",
+        tex_path=source_dir / "resume.tex",
+        tex_sha256="a" * 64,
+        pdf_path=pdf_path,
+        pdf_sha256=hashlib.sha256(pdf_bytes).hexdigest(),
+    )
+    repo.select_resume(application.id, resume.id)
+    forged_report_id = "rep_forged_provenance"
+    with repo.connection() as connection:
+        connection.execute(
+            """
+            INSERT INTO reports (
+                id, application_id, resume_version_id, jd_snapshot_id,
+                fit_json, risks_json, blocking_issue_count, warning_count,
+                created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, 0, 0, ?)
+            """,
+            (
+                forged_report_id,
+                application.id,
+                resume.id,
+                application.jd_snapshot_id,
+                '{"provenance":{"ai_task_id":"forged"},"score":100}',
+                '{"blockers":[],"warnings":[]}',
+                "2026-01-01T00:00:00+00:00",
+            ),
+        )
+        connection.execute(
+            "UPDATE applications SET latest_report_id = ?, status = ? WHERE id = ?",
+            (forged_report_id, "ready_for_review", application.id),
+        )
+
+    with pytest.raises(ValueError, match="reserved AI provenance"):
+        repo.approve_application(application.id, forged_report_id, "Reviewed")
+
+    normal = repo.save_report(
+        application_id=application.id,
+        resume_version_id=resume.id,
+        jd_snapshot_id=application.jd_snapshot_id,
+        fit={"score": 90, "method": "deterministic"},
+        risks={"blockers": [], "warnings": []},
+    )
+    approval = repo.approve_application(application.id, normal.id, "Reviewed")
+
+    assert approval.report_id == normal.id
 
 
 def test_approval_and_submission_require_current_vault_pdf_bytes(tmp_path: Path):
@@ -1544,7 +1832,8 @@ def test_ai_artifacts_require_contained_existing_checksum_matched_files(tmp_path
     artifact = repo.save_ai_artifact(
         task.id, claim_token, "context", valid_path, valid_sha, "1"
     )
-    assert artifact.path == valid_path.resolve()
+    assert artifact.path != valid_path.resolve()
+    assert artifact.path.read_bytes() == valid_path.read_bytes()
 
 
 def test_ai_artifact_getters_detect_post_save_tampering(tmp_path: Path):
@@ -1553,6 +1842,7 @@ def test_ai_artifact_getters_detect_post_save_tampering(tmp_path: Path):
     provider = create_provider(repo)
     task = create_task(repo, application.id, provider.id)
     claim = claim_task(repo, task.id)
+    assert repo.begin_ai_task_invocation(task.id, claim) is True
     path = attempt_file(repo, task.id, "tampered.json")
     path.write_bytes(b"original")
     artifact = repo.save_ai_artifact(
@@ -1563,12 +1853,26 @@ def test_ai_artifact_getters_detect_post_save_tampering(tmp_path: Path):
         hashlib.sha256(b"original").hexdigest(),
         "1",
     )
-    path.write_bytes(b"changed")
+    assert artifact.path != path.resolve()
+    artifact.path.write_bytes(b"changed")
 
     with pytest.raises(ValueError, match="integrity"):
         repo.get_ai_artifact(artifact.id)
     with pytest.raises(ValueError, match="integrity"):
         repo.list_ai_artifacts(task.id)
+    with pytest.raises(ValueError, match="integrity"):
+        repo.finalize_ai_task_attempt(
+            task_id=task.id,
+            claim_token=claim,
+            terminal_status="blocked",
+            error_summary="invalid_output",
+            expected_jd_snapshot_id=application.jd_snapshot_id,
+            expected_resume_version_id=None,
+            findings=[],
+        )
+
+    assert repo.get_ai_task(task.id).status == "running"
+    assert repo.list_application_versions(application.id) == []
 
 
 def test_ai_artifacts_reject_hardlinks_and_symlinks(tmp_path: Path):
@@ -1632,6 +1936,83 @@ def test_finalization_rejects_unowned_artifact_metadata_and_rolls_back(tmp_path:
     assert repo.list_application_versions(application.id) == []
 
 
+def test_finalization_hashes_artifacts_before_acquiring_writer_lock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    repo = make_repo(tmp_path)
+    application = create_application(repo)
+    provider = create_provider(repo)
+    task = create_bound_task(repo, application.id, provider.id, "analyze_jd")
+    claim = claim_task(repo, task.id)
+    assert repo.begin_ai_task_invocation(task.id, claim) is True
+    write_attempt_artifact(repo, task.id, claim, "context", b"context")
+    digest_started = Event()
+    release_digest = Event()
+    original_digest = repo._stable_artifact_digest
+
+    def delayed_digest(path: Path):
+        digest_started.set()
+        assert release_digest.wait(10)
+        return original_digest(path)
+
+    monkeypatch.setattr(repo, "_stable_artifact_digest", delayed_digest)
+    worker = CareerOpsRepository(repo.database_path, repo.vault_path)
+
+    def finalize():
+        return repo.finalize_ai_task_attempt(
+            task_id=task.id,
+            claim_token=claim,
+            terminal_status="blocked",
+            error_summary="invalid_output",
+            expected_jd_snapshot_id=application.jd_snapshot_id,
+            expected_resume_version_id=None,
+            findings=[],
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        finalization = pool.submit(finalize)
+        assert digest_started.wait(5)
+        renewal = pool.submit(worker.renew_ai_task_claim, task.id, claim)
+        try:
+            assert renewal.result(timeout=3) is True
+        finally:
+            release_digest.set()
+        blocked = finalization.result(timeout=5)
+
+    assert blocked.status == "blocked"
+
+
+def test_finalization_preflight_digest_mismatch_leaves_business_state_untouched(
+    tmp_path: Path,
+):
+    repo = make_repo(tmp_path)
+    application = create_application(repo)
+    provider = create_provider(repo)
+    task = create_bound_task(repo, application.id, provider.id, "analyze_jd")
+    claim = claim_task(repo, task.id)
+    assert repo.begin_ai_task_invocation(task.id, claim) is True
+    artifact = write_attempt_artifact(repo, task.id, claim, "context", b"context")
+    artifact.path.write_bytes(b"tampered")
+    before_application = repo.get_application(application.id)
+    before_jd = repo.get_jd_snapshot(application.jd_snapshot_id)
+
+    with pytest.raises(ValueError, match="integrity"):
+        repo.finalize_ai_task_attempt(
+            task_id=task.id,
+            claim_token=claim,
+            terminal_status="blocked",
+            error_summary="invalid_output",
+            expected_jd_snapshot_id=application.jd_snapshot_id,
+            expected_resume_version_id=None,
+            findings=[],
+        )
+
+    assert repo.get_ai_task(task.id).status == "running"
+    assert repo.get_application(application.id) == before_application
+    assert repo.get_jd_snapshot(application.jd_snapshot_id) == before_jd
+    assert repo.list_application_versions(application.id) == []
+
+
 def test_finalization_rejects_cross_task_and_tampered_artifacts(tmp_path: Path):
     repo = make_repo(tmp_path)
     application = create_application(repo)
@@ -1680,7 +2061,7 @@ def test_finalization_rejects_cross_task_and_tampered_artifacts(tmp_path: Path):
         hashlib.sha256(b"target").hexdigest(),
         "1",
     )
-    target_path.write_bytes(b"tampered")
+    target_artifact.path.write_bytes(b"tampered")
     with pytest.raises(ValueError, match="integrity"):
         repo.finalize_ai_task_attempt(
             task_id=target_task.id,

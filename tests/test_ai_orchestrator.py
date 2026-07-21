@@ -665,6 +665,64 @@ def test_heartbeat_renews_through_post_provider_processing(
     assert len(repo.list_application_versions(application.id)) == 1
 
 
+def test_slow_artifact_materialization_does_not_starve_heartbeat(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    from careerops.ai.orchestrator import AiOrchestrator
+
+    repo = CareerOpsRepository(
+        tmp_path / "careerops.db",
+        tmp_path / "vault",
+        claim_lease_seconds=15,
+    )
+    repo.initialize()
+    application = create_application(repo)
+    config = create_provider_config(repo)
+    slow_digest_active = Event()
+    renewed_during_slow_digest = Event()
+    digest_lock = Lock()
+    digest_calls = 0
+    original_digest = repo._stable_artifact_digest
+    original_renew = repo.renew_ai_task_claim
+
+    monkeypatch.setattr(
+        type(repo),
+        "claim_heartbeat_interval",
+        property(lambda _repository: 0.05),
+    )
+
+    def delay_second_digest(path: Path):
+        nonlocal digest_calls
+        with digest_lock:
+            digest_calls += 1
+            call_number = digest_calls
+        if call_number == 2:
+            slow_digest_active.set()
+            try:
+                time.sleep(6.2)
+            finally:
+                slow_digest_active.clear()
+        return original_digest(path)
+
+    def record_renewal(task_id: str, claim_token: str) -> bool:
+        renewed = original_renew(task_id, claim_token)
+        if renewed and slow_digest_active.is_set():
+            renewed_during_slow_digest.set()
+        return renewed
+
+    monkeypatch.setattr(repo, "_stable_artifact_digest", delay_second_digest)
+    monkeypatch.setattr(repo, "renew_ai_task_claim", record_renewal)
+    provider = ScriptedProvider(availability())
+    orchestrator = AiOrchestrator(repo, {config.id: provider})
+    task = orchestrator.enqueue(application.id, "analyze_jd", config.id)
+
+    completed = orchestrator.run(task.id)
+
+    assert completed.status == "completed"
+    assert provider.calls == 1
+    assert renewed_during_slow_digest.is_set()
+
+
 def test_post_provider_heartbeat_loss_requeues_and_preserves_invocation_fence(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
@@ -1271,8 +1329,14 @@ def test_attempt_artifacts_are_atomic_checksummed_and_never_contain_sidecar(
         content = artifact.path.read_bytes()
         assert hashlib.sha256(content).hexdigest() == artifact.sha256
     request = provider.requests[0]
-    assert request.context_snapshot == next(
-        item.path.read_bytes() for item in artifacts if item.artifact_type == "context"
+    context_artifact = next(
+        item for item in artifacts if item.artifact_type == "context"
+    )
+    assert request.context_snapshot == context_artifact.path.read_bytes()
+    assert request.context_path != context_artifact.path
+    assert request.context_path.relative_to(repo.vault_path).parts[0] == "ai-tasks"
+    assert context_artifact.path.relative_to(repo.vault_path).parts[0] == (
+        "ai-artifacts"
     )
     assert json.loads(request.schema_path.read_text(encoding="utf-8")) == (
         output_schema_for_task("analyze_fit")

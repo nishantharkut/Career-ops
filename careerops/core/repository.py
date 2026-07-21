@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 import hashlib
 import json
@@ -13,7 +14,7 @@ import secrets
 import sqlite3
 import stat
 from threading import Lock
-from typing import Any
+from typing import Any, BinaryIO
 from uuid import uuid4
 
 from careerops.core.database import connect_database, initialize_database
@@ -78,6 +79,22 @@ AI_ARTIFACT_TYPES = frozenset(
     {"context", "raw_output", "validated_output", "draft_text"}
 )
 AI_ARTIFACT_SCHEMA_VERSIONS = frozenset({"1"})
+REPORT_AI_AUTHORITY_FIELDS = frozenset(
+    {
+        "ai_task_id",
+        "context_sha256",
+        "output_checksums",
+        "privacy_mode",
+        "prompt_sha256",
+        "prompt_template_id",
+        "provider_binding",
+        "provider_binding_sha256",
+        "provider_config_id",
+        "provider_identity_name",
+        "provider_kind",
+        "provider_model",
+    }
+)
 PROVIDER_BINDING_FIELDS = (
     "provider_kind",
     "model",
@@ -109,6 +126,19 @@ PROVIDER_BINDING_BOOLEAN_FIELDS = frozenset(
 )
 UTC_NOW_LOCK = Lock()
 LAST_UTC_NOW: datetime | None = None
+
+
+@dataclass(frozen=True)
+class _ArtifactFileEvidence:
+    path: Path
+    sha256: str
+    identity: tuple[int, int, int, int, int]
+
+
+@dataclass(frozen=True)
+class _ArtifactPreflight:
+    row_signature: tuple[Any, ...]
+    file_evidence: _ArtifactFileEvidence
 
 
 def utc_now() -> str:
@@ -685,6 +715,7 @@ class CareerOpsRepository:
         safe_success, _ = persisted_json(
             without_provenance(dict(success_payload or {}))
         )
+        artifact_preflight = self._preflight_ai_artifacts(task_id, claim_token)
 
         with self.connection() as connection:
             connection.execute("BEGIN IMMEDIATE")
@@ -739,8 +770,19 @@ class CareerOpsRepository:
                 """,
                 (task_id, claim_token),
             ).fetchall()
+            if {row["id"] for row in artifact_rows} != set(artifact_preflight):
+                raise ValueError("AI task artifact ownership changed during finalization")
             for artifact in artifact_rows:
-                self._validate_artifact_row(artifact)
+                preflight = artifact_preflight[artifact["id"]]
+                if self._artifact_row_signature(artifact) != preflight.row_signature:
+                    raise ValueError(
+                        "AI task artifact ownership changed during finalization"
+                    )
+                # Same-user mutation after this fast check is outside the process
+                # threat model; getters and later reads rehash and reject divergence.
+                self._validate_artifact_row_fast(
+                    artifact, preflight.file_evidence
+                )
             safe_artifacts = [
                 {
                     "artifact_type": artifact["artifact_type"],
@@ -1192,17 +1234,20 @@ class CareerOpsRepository:
                 "Artifact SHA-256 must contain exactly 64 hexadecimal characters"
             )
         normalized_sha256 = sha256.lower()
-        artifact_path, actual_sha256 = self._stable_artifact_digest(path)
-        self._require_ai_task_artifact_path(task_id, artifact_path)
-        if actual_sha256 != normalized_sha256:
-            raise ValueError("Artifact checksum does not match file bytes")
-
         artifact_id = new_id("aia")
-        with self.connection() as connection:
-            connection.execute("BEGIN IMMEDIATE")
-            now = utc_now()
-            self._require_active_ai_claim(connection, task_id, claim_token)
-            try:
+        artifact_path, file_evidence = self._materialize_ai_artifact(
+            task_id=task_id,
+            artifact_id=artifact_id,
+            artifact_type=artifact_type,
+            source_path=path,
+            expected_sha256=normalized_sha256,
+        )
+        inserted_artifact: AiArtifact | None = None
+        try:
+            with self.connection() as connection:
+                connection.execute("BEGIN IMMEDIATE")
+                now = utc_now()
+                self._require_active_ai_claim(connection, task_id, claim_token)
                 connection.execute(
                     """
                     INSERT INTO ai_artifacts (
@@ -1226,14 +1271,20 @@ class CareerOpsRepository:
                 ).fetchone()
                 if inserted is None:
                     raise ValueError("AI artifact row was not persisted")
-                self._validate_artifact_row(inserted)
-            except sqlite3.IntegrityError as exc:
-                if "ai_artifacts.path" in str(exc):
-                    raise ValueError(
-                        "AI artifact physical path is already owned"
-                    ) from exc
-                raise
-        return self.get_ai_artifact(artifact_id)
+                self._validate_artifact_row_fast(inserted, file_evidence)
+                inserted_artifact = self._ai_artifact_from_row(inserted)
+        except sqlite3.IntegrityError as exc:
+            self._remove_materialized_ai_artifact(artifact_path)
+            if "ai_artifacts.path" in str(exc):
+                raise ValueError("AI artifact physical path is already owned") from exc
+            raise
+        except BaseException:
+            self._remove_materialized_ai_artifact(artifact_path)
+            raise
+        if inserted_artifact is None:
+            self._remove_materialized_ai_artifact(artifact_path)
+            raise ValueError("AI artifact row was not persisted")
+        return inserted_artifact
 
     def get_ai_artifact(self, artifact_id: str) -> AiArtifact:
         row = self._one("SELECT * FROM ai_artifacts WHERE id = ?", (artifact_id,))
@@ -1911,6 +1962,7 @@ class CareerOpsRepository:
     ) -> Report:
         if ai_task_id is not None or claim_token is not None:
             raise ValueError("AI reports require the aggregate finalizer")
+        self._reject_reserved_report_provenance(fit, risks)
         report_id = new_id("rep")
         blockers = risks.get("blockers", [])
         warnings = risks.get("warnings", [])
@@ -2074,6 +2126,68 @@ class CareerOpsRepository:
                 "AI task cannot replace approved or submitted application state"
             )
 
+    @staticmethod
+    def _reserved_report_fields(value: Mapping[str, Any]) -> set[str]:
+        reserved = set(value).intersection(REPORT_AI_AUTHORITY_FIELDS)
+        if "provenance" in value:
+            reserved.add("provenance")
+        return reserved
+
+    @classmethod
+    def _reject_reserved_report_provenance(
+        cls, fit: Mapping[str, Any], risks: Mapping[str, Any]
+    ) -> None:
+        if cls._reserved_report_fields(fit) or cls._reserved_report_fields(risks):
+            raise ValueError("Report contains reserved AI provenance fields")
+
+    def _require_report_provenance_authority(
+        self, connection: sqlite3.Connection, report: sqlite3.Row
+    ) -> None:
+        try:
+            fit = json.loads(report["fit_json"])
+            risks = json.loads(report["risks_json"])
+        except (TypeError, json.JSONDecodeError) as exc:
+            raise ValueError("Report payload is invalid") from exc
+        if not isinstance(fit, dict) or not isinstance(risks, dict):
+            raise ValueError("Report payload is invalid")
+        direct_fields = (
+            set(fit).intersection(REPORT_AI_AUTHORITY_FIELDS)
+            | set(risks).intersection(REPORT_AI_AUTHORITY_FIELDS)
+        )
+        if direct_fields:
+            raise ValueError("Report contains reserved AI provenance fields")
+        fit_provenance = fit.get("provenance")
+        risks_provenance = risks.get("provenance")
+        if fit_provenance is None and risks_provenance is None:
+            return
+        if (
+            not isinstance(fit_provenance, dict)
+            or fit_provenance != risks_provenance
+        ):
+            raise ValueError("Report contains untrusted reserved AI provenance")
+        versions = connection.execute(
+            """
+            SELECT snapshot_json
+            FROM application_versions
+            WHERE application_id = ? AND event_type = 'ai_task.completed'
+            ORDER BY version_number DESC
+            """,
+            (report["application_id"],),
+        ).fetchall()
+        for version in versions:
+            try:
+                snapshot = json.loads(version["snapshot_json"])
+            except (TypeError, json.JSONDecodeError):
+                continue
+            if (
+                isinstance(snapshot, dict)
+                and snapshot.get("provenance") == fit_provenance
+                and isinstance(snapshot.get("side_effect"), dict)
+                and snapshot["side_effect"].get("report_id") == report["id"]
+            ):
+                return
+        raise ValueError("Report contains untrusted reserved AI provenance")
+
     def _approval_packet_rows(
         self,
         connection: sqlite3.Connection,
@@ -2096,6 +2210,7 @@ class CareerOpsRepository:
             raise KeyError("Application approval resume was missing")
         if report["application_id"] != application["id"]:
             raise ValueError("Report does not belong to application")
+        self._require_report_provenance_authority(connection, report)
         if report["blocking_issue_count"]:
             raise ValueError("Application has blocking risks")
         if application["latest_report_id"] != report["id"]:
@@ -2153,6 +2268,7 @@ class CareerOpsRepository:
             or report["jd_snapshot_id"] != application["jd_snapshot_id"]
         ):
             raise ValueError("Approved application packet changed before submission")
+        self._require_report_provenance_authority(connection, report)
         self._verify_resume_pdf_row(resume)
         return application
 
@@ -2262,6 +2378,12 @@ class CareerOpsRepository:
         return row
 
     def _stable_artifact_digest(self, path: Path) -> tuple[Path, str]:
+        evidence = self._stable_artifact_read(path)
+        return evidence.path, evidence.sha256
+
+    def _stable_artifact_read(
+        self, path: Path, destination: BinaryIO | None = None
+    ) -> _ArtifactFileEvidence:
         vault_root = Path(os.path.abspath(self.vault_path))
         artifact_path = Path(os.path.abspath(path))
         try:
@@ -2335,6 +2457,8 @@ class CareerOpsRepository:
                 if total > MAX_AI_ARTIFACT_BYTES:
                     raise ValueError("Artifact file exceeded its size limit")
                 digest.update(chunk)
+                if destination is not None:
+                    destination.write(chunk)
             after_read = os.fstat(descriptor)
         finally:
             os.close(descriptor)
@@ -2358,9 +2482,163 @@ class CareerOpsRepository:
         )
         if final_identity != identity or final_path_identity != identity:
             raise ValueError("Artifact file identity changed while hashing")
-        return canonical_path, digest.hexdigest()
+        return _ArtifactFileEvidence(canonical_path, digest.hexdigest(), identity)
 
-    def _validate_artifact_row(self, row: sqlite3.Row) -> None:
+    def _fast_artifact_identity(
+        self, path: Path
+    ) -> tuple[Path, tuple[int, int, int, int, int]]:
+        vault_root = Path(os.path.abspath(self.vault_path))
+        artifact_path = Path(os.path.abspath(path))
+        try:
+            relative = artifact_path.relative_to(vault_root)
+        except ValueError as exc:
+            raise ValueError(
+                "Artifact path must remain within the repository vault"
+            ) from exc
+        current = vault_root
+        try:
+            path_stat = current.lstat()
+        except FileNotFoundError as exc:
+            raise FileNotFoundError("Repository vault does not exist") from exc
+        if stat.S_ISLNK(path_stat.st_mode):
+            raise ValueError("Artifact path must be a regular vault file")
+        for part in relative.parts:
+            current = current / part
+            try:
+                path_stat = current.lstat()
+            except FileNotFoundError as exc:
+                raise FileNotFoundError(
+                    f"Artifact file does not exist: {artifact_path}"
+                ) from exc
+            if stat.S_ISLNK(path_stat.st_mode):
+                raise ValueError("Artifact path must be a regular vault file")
+        if not stat.S_ISREG(path_stat.st_mode) or path_stat.st_nlink != 1:
+            raise ValueError("Artifact path must be a single-link regular file")
+        if path_stat.st_size > MAX_AI_ARTIFACT_BYTES:
+            raise ValueError("Artifact file exceeded its size limit")
+        canonical_path = Path(os.path.realpath(artifact_path))
+        identity = (
+            path_stat.st_dev,
+            path_stat.st_ino,
+            path_stat.st_size,
+            path_stat.st_mtime_ns,
+            path_stat.st_nlink,
+        )
+        return canonical_path, identity
+
+    def _materialize_ai_artifact(
+        self,
+        *,
+        task_id: str,
+        artifact_id: str,
+        artifact_type: str,
+        source_path: Path,
+        expected_sha256: str,
+    ) -> tuple[Path, _ArtifactFileEvidence]:
+        source_candidate = Path(os.path.abspath(source_path))
+        self._require_ai_task_source_path(task_id, source_candidate)
+        artifacts_root = self.vault_path / "ai-artifacts"
+        task_root = artifacts_root / task_id
+        artifact_root = task_root / artifact_id
+        artifacts_root.mkdir(exist_ok=True)
+        artifacts_root_stat = artifacts_root.lstat()
+        if stat.S_ISLNK(artifacts_root_stat.st_mode) or not stat.S_ISDIR(
+            artifacts_root_stat.st_mode
+        ):
+            raise ValueError("AI artifact repository path must be a directory")
+        task_root.mkdir(exist_ok=True)
+        task_root_stat = task_root.lstat()
+        if stat.S_ISLNK(task_root_stat.st_mode) or not stat.S_ISDIR(
+            task_root_stat.st_mode
+        ):
+            raise ValueError("AI artifact repository path must be a directory")
+        artifact_root.mkdir(exist_ok=False)
+        suffix = ".txt" if artifact_type == "draft_text" else ".json"
+        artifact_path = artifact_root / f"{artifact_type}{suffix}"
+        temporary_path = artifact_root / f".{artifact_type}-{uuid4().hex}.tmp"
+        try:
+            with temporary_path.open("xb") as destination:
+                source_evidence = self._stable_artifact_read(
+                    source_path, destination
+                )
+                self._require_ai_task_source_path(task_id, source_evidence.path)
+                if source_evidence.sha256 != expected_sha256:
+                    raise ValueError("Artifact checksum does not match file bytes")
+                destination.flush()
+                os.fsync(destination.fileno())
+            os.replace(temporary_path, artifact_path)
+            copied_path, copied_sha256 = self._stable_artifact_digest(artifact_path)
+            copied_path, copied_identity = self._fast_artifact_identity(copied_path)
+            if copied_sha256 != expected_sha256:
+                raise ValueError("Artifact copy checksum does not match source bytes")
+            evidence = _ArtifactFileEvidence(
+                copied_path, copied_sha256, copied_identity
+            )
+            self._require_ai_artifact_path(task_id, artifact_id, evidence.path)
+            return evidence.path, evidence
+        except BaseException:
+            temporary_path.unlink(missing_ok=True)
+            artifact_path.unlink(missing_ok=True)
+            try:
+                artifact_root.rmdir()
+            except OSError:
+                pass
+            raise
+
+    def _remove_materialized_ai_artifact(self, artifact_path: Path) -> None:
+        try:
+            relative = artifact_path.relative_to(
+                Path(os.path.abspath(self.vault_path))
+            )
+        except ValueError:
+            return
+        if len(relative.parts) != 4 or relative.parts[0] != "ai-artifacts":
+            return
+        artifact_path.unlink(missing_ok=True)
+        try:
+            artifact_path.parent.rmdir()
+        except OSError:
+            pass
+
+    @staticmethod
+    def _artifact_row_signature(row: sqlite3.Row) -> tuple[Any, ...]:
+        return tuple(
+            row[field]
+            for field in (
+                "id",
+                "task_id",
+                "claim_token",
+                "artifact_type",
+                "path",
+                "sha256",
+                "schema_version",
+                "created_at",
+            )
+        )
+
+    def _preflight_ai_artifacts(
+        self, task_id: str, claim_token: str
+    ) -> dict[str, _ArtifactPreflight]:
+        with self.connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM ai_artifacts
+                WHERE task_id = ? AND claim_token = ?
+                ORDER BY created_at ASC, id ASC
+                """,
+                (task_id, claim_token),
+            ).fetchall()
+        preflight: dict[str, _ArtifactPreflight] = {}
+        for row in rows:
+            evidence = self._artifact_evidence_for_row(row)
+            preflight[row["id"]] = _ArtifactPreflight(
+                self._artifact_row_signature(row), evidence
+            )
+        return preflight
+
+    def _artifact_evidence_for_row(
+        self, row: sqlite3.Row
+    ) -> _ArtifactFileEvidence:
         self._validate_ai_artifact_metadata(
             row["artifact_type"], row["schema_version"]
         )
@@ -2368,11 +2646,39 @@ class CareerOpsRepository:
             artifact_path, actual_sha256 = self._stable_artifact_digest(
                 Path(row["path"])
             )
+            artifact_path, identity = self._fast_artifact_identity(artifact_path)
+            self._require_ai_artifact_path(
+                row["task_id"], row["id"], artifact_path
+            )
         except (FileNotFoundError, OSError, ValueError) as exc:
             raise ValueError("AI artifact integrity verification failed") from exc
         if str(artifact_path) != row["path"] or actual_sha256 != row["sha256"]:
             raise ValueError("AI artifact integrity verification failed")
-        self._require_ai_task_artifact_path(row["task_id"], artifact_path)
+        return _ArtifactFileEvidence(artifact_path, actual_sha256, identity)
+
+    def _validate_artifact_row(self, row: sqlite3.Row) -> None:
+        self._artifact_evidence_for_row(row)
+
+    def _validate_artifact_row_fast(
+        self, row: sqlite3.Row, evidence: _ArtifactFileEvidence
+    ) -> None:
+        try:
+            self._validate_ai_artifact_metadata(
+                row["artifact_type"], row["schema_version"]
+            )
+            artifact_path, identity = self._fast_artifact_identity(Path(row["path"]))
+            self._require_ai_artifact_path(
+                row["task_id"], row["id"], artifact_path
+            )
+        except (FileNotFoundError, OSError, ValueError) as exc:
+            raise ValueError("AI artifact integrity verification failed") from exc
+        if (
+            str(artifact_path) != row["path"]
+            or artifact_path != evidence.path
+            or row["sha256"] != evidence.sha256
+            or identity != evidence.identity
+        ):
+            raise ValueError("AI artifact integrity verification failed")
 
     @staticmethod
     def _validate_ai_artifact_metadata(
@@ -2384,14 +2690,16 @@ class CareerOpsRepository:
         ):
             raise ValueError("AI artifact metadata was invalid")
 
-    def _require_ai_task_artifact_path(
+    def _require_ai_task_source_path(
         self, task_id: str, artifact_path: Path
     ) -> None:
         vault_root = Path(os.path.abspath(self.vault_path))
         try:
             relative = artifact_path.relative_to(vault_root)
         except ValueError as exc:
-            raise ValueError("AI artifact path must be under its task attempt") from exc
+            raise ValueError(
+                "AI artifact source path must be under its vault task attempt"
+            ) from exc
         parts = relative.parts
         if (
             len(parts) < 4
@@ -2400,7 +2708,27 @@ class CareerOpsRepository:
             or not parts[2].startswith("attempt-")
             or len(parts[2]) == len("attempt-")
         ):
-            raise ValueError("AI artifact path must be under its task attempt")
+            raise ValueError(
+                "AI artifact source path must be under its vault task attempt"
+            )
+
+    def _require_ai_artifact_path(
+        self, task_id: str, artifact_id: str, artifact_path: Path
+    ) -> None:
+        vault_root = Path(os.path.abspath(self.vault_path))
+        try:
+            relative = artifact_path.relative_to(vault_root)
+        except ValueError as exc:
+            raise ValueError("AI artifact path must be repository-owned") from exc
+        parts = relative.parts
+        if (
+            len(parts) != 4
+            or parts[0] != "ai-artifacts"
+            or parts[1] != task_id
+            or parts[2] != artifact_id
+            or not parts[3]
+        ):
+            raise ValueError("AI artifact path must be repository-owned")
 
     def _require_active_ai_claim(
         self,
