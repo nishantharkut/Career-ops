@@ -44,6 +44,20 @@ def test_repository_rejects_claim_lease_below_sqlite_contention_floor(
     assert repository.claim_lease_seconds == 15
 
 
+@pytest.mark.parametrize(
+    "claim_lease_seconds", [float("nan"), float("inf"), float("-inf")]
+)
+def test_repository_rejects_non_finite_claim_lease(
+    tmp_path: Path, claim_lease_seconds: float
+):
+    with pytest.raises(ValueError, match="finite and at least 15 seconds"):
+        CareerOpsRepository(
+            tmp_path / "careerops.db",
+            tmp_path / "vault",
+            claim_lease_seconds=claim_lease_seconds,
+        )
+
+
 def create_legacy_ai_database(database_path: Path, version: int) -> None:
     fixture_dir = Path(__file__).parent / "fixtures"
     with closing(sqlite3.connect(database_path)) as connection:

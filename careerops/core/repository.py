@@ -5,6 +5,7 @@ from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -228,11 +229,17 @@ class CareerOpsRepository:
         *,
         claim_lease_seconds: float = 30.0,
     ):
-        if claim_lease_seconds < MIN_AI_TASK_CLAIM_LEASE_SECONDS:
-            raise ValueError("AI task claim lease must be at least 15 seconds")
+        normalized_claim_lease_seconds = float(claim_lease_seconds)
+        if (
+            not math.isfinite(normalized_claim_lease_seconds)
+            or normalized_claim_lease_seconds < MIN_AI_TASK_CLAIM_LEASE_SECONDS
+        ):
+            raise ValueError(
+                "AI task claim lease must be finite and at least 15 seconds"
+            )
         self.database_path = Path(database_path)
         self.vault_path = Path(vault_path)
-        self.claim_lease_seconds = float(claim_lease_seconds)
+        self.claim_lease_seconds = normalized_claim_lease_seconds
 
     @property
     def claim_heartbeat_interval(self) -> float:
