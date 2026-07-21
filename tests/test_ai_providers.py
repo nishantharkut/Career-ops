@@ -1373,6 +1373,8 @@ def test_ollama_rejects_malformed_incomplete_or_wrong_model_chat(
         elif handler.path == "/api/show":
             send_http_json(handler, 200, official_show_metadata())
         else:
+            length = int(handler.headers.get("Content-Length", "0"))
+            handler.rfile.read(length)
             send_http_bytes(handler, 200, chat_body)
 
     with ollama_test_server(malformed) as endpoint:
