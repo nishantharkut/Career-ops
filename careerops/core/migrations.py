@@ -744,6 +744,29 @@ def _add_ai_prompt_and_artifact_authority(connection: sqlite3.Connection) -> Non
     )
 
 
+def _add_ai_artifact_storage_version(connection: sqlite3.Connection) -> None:
+    if "storage_version" not in _column_names(connection, "ai_artifacts"):
+        connection.execute(
+            """
+            ALTER TABLE ai_artifacts
+            ADD COLUMN storage_version INTEGER NOT NULL DEFAULT 1
+            """
+        )
+    for operation in ("INSERT", "UPDATE"):
+        trigger_name = f"validate_ai_artifact_storage_{operation.lower()}"
+        connection.execute(f"DROP TRIGGER IF EXISTS {trigger_name}")
+        connection.execute(
+            f"""
+            CREATE TRIGGER {trigger_name}
+            BEFORE {operation} ON ai_artifacts
+            WHEN NEW.storage_version != 2
+            BEGIN
+                SELECT RAISE(ABORT, 'invalid AI artifact storage version');
+            END
+            """
+        )
+
+
 MIGRATIONS: tuple[tuple[int, Migration], ...] = (
     (1, _add_application_role_type),
     (2, _add_application_submitted_at),
@@ -759,6 +782,7 @@ MIGRATIONS: tuple[tuple[int, Migration], ...] = (
     (12, _repair_ai_orchestration_migrations),
     (13, _add_provider_availability_bindings),
     (14, _add_ai_prompt_and_artifact_authority),
+    (15, _add_ai_artifact_storage_version),
 )
 
 LATEST_SCHEMA_VERSION = MIGRATIONS[-1][0]

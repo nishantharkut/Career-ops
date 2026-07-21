@@ -11,6 +11,7 @@ import os
 from pathlib import Path
 import re
 import secrets
+import shutil
 import sqlite3
 import stat
 from threading import Lock
@@ -79,6 +80,8 @@ AI_ARTIFACT_TYPES = frozenset(
     {"context", "raw_output", "validated_output", "draft_text"}
 )
 AI_ARTIFACT_SCHEMA_VERSIONS = frozenset({"1"})
+AI_ARTIFACT_STORAGE_VERSION = 2
+DIRECTORY_FSYNC_SUPPORTED = hasattr(os, "O_DIRECTORY")
 REPORT_AI_AUTHORITY_FIELDS = frozenset(
     {
         "ai_task_id",
@@ -288,7 +291,155 @@ class CareerOpsRepository:
             "application-versions",
         ):
             (self.vault_path / directory).mkdir(parents=True, exist_ok=True)
+        self._upgrade_legacy_ai_artifacts()
+        self._reconcile_ai_artifact_storage()
         self.requeue_interrupted_ai_tasks()
+
+    def _upgrade_legacy_ai_artifacts(self) -> None:
+        with self.connection() as connection:
+            rows = connection.execute(
+                "SELECT * FROM ai_artifacts ORDER BY created_at ASC, id ASC"
+            ).fetchall()
+        for row in rows:
+            storage_version = row["storage_version"]
+            if storage_version == AI_ARTIFACT_STORAGE_VERSION:
+                continue
+            if storage_version != 1:
+                raise ValueError("legacy AI artifact storage version is invalid")
+            source_path = Path(row["path"])
+            target_path = self._ai_artifact_storage_path(
+                row["task_id"], row["id"], row["artifact_type"]
+            )
+            try:
+                source_path, source_sha256 = self._stable_artifact_digest(
+                    source_path
+                )
+                if source_sha256 != row["sha256"]:
+                    raise ValueError("stored checksum does not match source bytes")
+                if source_path != Path(os.path.realpath(target_path)):
+                    self._require_ai_task_source_path(row["task_id"], source_path)
+                    evidence = self._publish_ai_artifact_copy(
+                        source_path=source_path,
+                        artifact_path=target_path,
+                        expected_sha256=row["sha256"],
+                        allow_existing=True,
+                    )
+                else:
+                    copied_path, identity = self._fast_artifact_identity(
+                        source_path
+                    )
+                    evidence = _ArtifactFileEvidence(
+                        copied_path, source_sha256, identity
+                    )
+                self._require_ai_artifact_path(
+                    row["task_id"], row["id"], evidence.path
+                )
+            except (FileNotFoundError, OSError, ValueError) as exc:
+                raise ValueError(
+                    f"legacy AI artifact {row['id']} failed integrity validation"
+                ) from exc
+            self._commit_legacy_ai_artifact_upgrade(
+                row["id"], row["path"], evidence.path, row["sha256"]
+            )
+
+    def _commit_legacy_ai_artifact_upgrade(
+        self,
+        artifact_id: str,
+        old_path: str,
+        artifact_path: Path,
+        sha256: str,
+    ) -> None:
+        with self.connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            cursor = connection.execute(
+                """
+                UPDATE ai_artifacts
+                SET path = ?, storage_version = ?
+                WHERE id = ? AND path = ? AND sha256 = ? AND storage_version = 1
+                """,
+                (
+                    str(artifact_path),
+                    AI_ARTIFACT_STORAGE_VERSION,
+                    artifact_id,
+                    old_path,
+                    sha256,
+                ),
+            )
+            if cursor.rowcount == 1:
+                return
+            current = connection.execute(
+                "SELECT path, sha256, storage_version FROM ai_artifacts WHERE id = ?",
+                (artifact_id,),
+            ).fetchone()
+            if (
+                current is None
+                or current["path"] != str(artifact_path)
+                or current["sha256"] != sha256
+                or current["storage_version"] != AI_ARTIFACT_STORAGE_VERSION
+            ):
+                raise ValueError("legacy AI artifact authority changed during upgrade")
+
+    def _reconcile_ai_artifact_storage(self) -> None:
+        with self.connection() as connection:
+            rows = connection.execute(
+                "SELECT * FROM ai_artifacts ORDER BY created_at ASC, id ASC"
+            ).fetchall()
+        recorded_files: dict[str, str] = {}
+        protected_legacy_directories: set[str] = set()
+        for row in rows:
+            target = self._ai_artifact_storage_path(
+                row["task_id"], row["id"], row["artifact_type"]
+            )
+            target_directory_key = self._artifact_path_key(target.parent)
+            if row["storage_version"] == AI_ARTIFACT_STORAGE_VERSION:
+                self._artifact_evidence_for_row(row)
+                recorded_files[target_directory_key] = self._artifact_path_key(
+                    Path(row["path"])
+                )
+            elif row["storage_version"] == 1:
+                protected_legacy_directories.add(target_directory_key)
+            else:
+                raise ValueError("AI artifact storage version is invalid")
+
+        artifacts_root = self.vault_path / "ai-artifacts"
+        for task_entry in list(artifacts_root.iterdir()):
+            if task_entry.is_symlink() or not task_entry.is_dir():
+                if task_entry.name.endswith(".tmp"):
+                    task_entry.unlink(missing_ok=True)
+                    continue
+                raise ValueError("AI artifact storage contains an invalid entry")
+            for artifact_entry in list(task_entry.iterdir()):
+                directory_key = self._artifact_path_key(artifact_entry)
+                if directory_key in recorded_files:
+                    if artifact_entry.is_symlink() or not artifact_entry.is_dir():
+                        raise ValueError(
+                            "AI artifact storage contains an invalid entry"
+                        )
+                    for child in artifact_entry.iterdir():
+                        if (
+                            self._artifact_path_key(child)
+                            == recorded_files[directory_key]
+                        ):
+                            continue
+                        if child.is_symlink() or not child.is_dir():
+                            child.unlink(missing_ok=True)
+                        else:
+                            shutil.rmtree(child)
+                    continue
+                if directory_key in protected_legacy_directories:
+                    continue
+                if artifact_entry.is_symlink() or not artifact_entry.is_dir():
+                    artifact_entry.unlink(missing_ok=True)
+                else:
+                    shutil.rmtree(artifact_entry)
+            try:
+                task_entry.rmdir()
+            except OSError:
+                pass
+
+    @staticmethod
+    def _artifact_path_key(path: Path) -> str:
+        return os.path.normcase(str(Path(os.path.abspath(path))))
 
     def upsert_ai_provider(
         self,
@@ -854,57 +1005,12 @@ class CareerOpsRepository:
             finding_ids: list[str] = []
             finding_types: dict[str, list[str]] = {}
             for finding in findings:
-                severity = finite_value(
-                    FindingSeverity, str(finding["severity"]), "severity"
-                )
-                verifier_state = finite_value(
-                    VerifierState,
-                    str(finding["verifier_state"]),
-                    "verifier state",
-                )
-                decision = finite_value(
-                    FindingDecision,
-                    str(finding.get("decision", FindingDecision.PENDING.value)),
-                    "decision",
-                )
-                if decision != FindingDecision.PENDING.value:
-                    raise ValueError("AI findings must start with a pending decision")
-                safe_finding, _ = persisted_json(
-                    {
-                        "claim_text": str(finding["claim_text"]),
-                        "finding_type": str(finding["finding_type"]),
-                        "payload": dict(finding.get("payload", {})),
-                        "recommendation": str(finding["recommendation"]),
-                    }
-                )
-                _safe_payload, payload_json = persisted_json(
-                    safe_finding["payload"]
-                )
-                finding_id = new_id("aif")
-                finding_type = safe_finding["finding_type"]
-                connection.execute(
-                    """
-                    INSERT INTO ai_findings (
-                        id, task_id, claim_token, finding_type, severity, claim_text,
-                        evidence_item_id, recommendation, verifier_state, decision,
-                        payload_json, created_at, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        finding_id,
-                        task_id,
-                        claim_token,
-                        finding_type,
-                        severity,
-                        safe_finding["claim_text"],
-                        finding.get("evidence_item_id"),
-                        safe_finding["recommendation"],
-                        verifier_state,
-                        decision,
-                        payload_json,
-                        now,
-                        now,
-                    ),
+                finding_id, finding_type = self._insert_ai_finding(
+                    connection=connection,
+                    task_id=task_id,
+                    claim_token=claim_token,
+                    finding=finding,
+                    now=now,
                 )
                 finding_ids.append(finding_id)
                 finding_types.setdefault(finding_type, []).append(finding_id)
@@ -1106,44 +1212,12 @@ class CareerOpsRepository:
                 "provenance": safe_provenance,
                 "side_effect": side_effect,
             }
-            safe_snapshot, snapshot_json = persisted_json(snapshot)
-            version_id = new_id("appv")
-            version_number = connection.execute(
-                """
-                SELECT COALESCE(MAX(version_number), 0) + 1
-                FROM application_versions
-                WHERE application_id = ?
-                """,
-                (application["id"],),
-            ).fetchone()[0]
-            connection.execute(
-                """
-                INSERT INTO application_versions (
-                    id, application_id, version_number, event_type,
-                    snapshot_json, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    version_id,
-                    application["id"],
-                    version_number,
-                    f"ai_task.{terminal_status}",
-                    snapshot_json,
-                    now,
-                ),
-            )
-            self._write_audit(
-                connection,
-                "application.version_recorded",
-                "application",
-                application["id"],
-                None,
-                {
-                    "application_version_id": version_id,
-                    "version_number": version_number,
-                    "event_type": f"ai_task.{terminal_status}",
-                    "snapshot": safe_snapshot,
-                },
+            self._insert_application_version(
+                connection=connection,
+                application_id=application["id"],
+                event_type=f"ai_task.{terminal_status}",
+                snapshot=snapshot,
+                now=now,
             )
             cursor = connection.execute(
                 """
@@ -1252,8 +1326,8 @@ class CareerOpsRepository:
                     """
                     INSERT INTO ai_artifacts (
                         id, task_id, claim_token, artifact_type, path, sha256,
-                        schema_version, created_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                        schema_version, storage_version, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         artifact_id,
@@ -1263,6 +1337,7 @@ class CareerOpsRepository:
                         str(artifact_path),
                         normalized_sha256,
                         schema_version,
+                        AI_ARTIFACT_STORAGE_VERSION,
                         now,
                     ),
                 )
@@ -1319,50 +1394,66 @@ class CareerOpsRepository:
         decision: str = "pending",
         payload: dict[str, Any] | None = None,
     ) -> AiFinding:
-        severity = finite_value(FindingSeverity, severity, "severity")
-        verifier_state = finite_value(VerifierState, verifier_state, "verifier state")
-        decision = finite_value(FindingDecision, decision, "decision")
+        raise ValueError("AI findings require the aggregate finalizer")
+
+    def _insert_ai_finding(
+        self,
+        *,
+        connection: sqlite3.Connection,
+        task_id: str,
+        claim_token: str,
+        finding: Mapping[str, Any],
+        now: str,
+    ) -> tuple[str, str]:
+        severity = finite_value(
+            FindingSeverity, str(finding["severity"]), "severity"
+        )
+        verifier_state = finite_value(
+            VerifierState, str(finding["verifier_state"]), "verifier state"
+        )
+        decision = finite_value(
+            FindingDecision,
+            str(finding.get("decision", FindingDecision.PENDING.value)),
+            "decision",
+        )
         if decision != FindingDecision.PENDING.value:
             raise ValueError("AI findings must start with a pending decision")
-        finding_id = new_id("aif")
         safe_finding, _ = persisted_json(
             {
-                "claim_text": claim_text,
-                "finding_type": finding_type,
-                "recommendation": recommendation,
-                "payload": payload or {},
+                "claim_text": str(finding["claim_text"]),
+                "finding_type": str(finding["finding_type"]),
+                "payload": dict(finding.get("payload", {})),
+                "recommendation": str(finding["recommendation"]),
             }
         )
         _safe_payload, payload_json = persisted_json(safe_finding["payload"])
-        with self.connection() as connection:
-            connection.execute("BEGIN IMMEDIATE")
-            now = utc_now()
-            self._require_active_ai_claim(connection, task_id, claim_token)
-            connection.execute(
-                """
-                INSERT INTO ai_findings (
-                    id, task_id, claim_token, finding_type, severity, claim_text,
-                    evidence_item_id, recommendation, verifier_state, decision,
-                    payload_json, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    finding_id,
-                    task_id,
-                    claim_token,
-                    safe_finding["finding_type"],
-                    severity,
-                    safe_finding["claim_text"],
-                    evidence_item_id,
-                    safe_finding["recommendation"],
-                    verifier_state,
-                    decision,
-                    payload_json,
-                    now,
-                    now,
-                ),
-            )
-        return self.get_ai_finding(finding_id)
+        finding_id = new_id("aif")
+        finding_type = safe_finding["finding_type"]
+        connection.execute(
+            """
+            INSERT INTO ai_findings (
+                id, task_id, claim_token, finding_type, severity, claim_text,
+                evidence_item_id, recommendation, verifier_state, decision,
+                payload_json, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                finding_id,
+                task_id,
+                claim_token,
+                finding_type,
+                severity,
+                safe_finding["claim_text"],
+                finding.get("evidence_item_id"),
+                safe_finding["recommendation"],
+                verifier_state,
+                decision,
+                payload_json,
+                now,
+                now,
+            ),
+        )
+        return finding_id, finding_type
 
     def get_ai_finding(self, finding_id: str) -> AiFinding:
         row = self._one("SELECT * FROM ai_findings WHERE id = ?", (finding_id,))
@@ -1618,59 +1709,73 @@ class CareerOpsRepository:
         ai_task_id: str | None = None,
         claim_token: str | None = None,
     ) -> ApplicationVersion:
-        if (ai_task_id is None) != (claim_token is None):
-            raise ValueError("AI task ID and claim token must be provided together")
-        safe_snapshot, snapshot_json = persisted_json(snapshot)
-        version_id = new_id("appv")
+        if (
+            event_type.startswith("ai_task.")
+            or ai_task_id is not None
+            or claim_token is not None
+        ):
+            raise ValueError("AI application versions require the aggregate finalizer")
         with self.connection() as connection:
             connection.execute("BEGIN IMMEDIATE")
             now = utc_now()
-            if ai_task_id is not None and claim_token is not None:
-                self._require_active_ai_claim(connection, ai_task_id, claim_token)
-                owner = connection.execute(
-                    "SELECT application_id FROM ai_tasks WHERE id = ?",
-                    (ai_task_id,),
-                ).fetchone()
-                if owner is None or owner["application_id"] != application_id:
-                    raise ValueError("AI task does not belong to the application")
-            row = connection.execute(
-                """
-                SELECT COALESCE(MAX(version_number), 0) + 1
-                FROM application_versions
-                WHERE application_id = ?
-                """,
-                (application_id,),
-            ).fetchone()
-            version_number = row[0]
-            connection.execute(
-                """
-                INSERT INTO application_versions (
-                    id, application_id, version_number, event_type, snapshot_json, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    version_id,
-                    application_id,
-                    version_number,
-                    event_type,
-                    snapshot_json,
-                    now,
-                ),
-            )
-            self._write_audit(
-                connection,
-                "application.version_recorded",
-                "application",
-                application_id,
-                None,
-                {
-                    "application_version_id": version_id,
-                    "version_number": version_number,
-                    "event_type": event_type,
-                    "snapshot": safe_snapshot,
-                },
+            version_id, _version_number = self._insert_application_version(
+                connection=connection,
+                application_id=application_id,
+                event_type=event_type,
+                snapshot=snapshot,
+                now=now,
             )
         return self.get_application_version(version_id)
+
+    def _insert_application_version(
+        self,
+        *,
+        connection: sqlite3.Connection,
+        application_id: str,
+        event_type: str,
+        snapshot: Mapping[str, Any],
+        now: str,
+    ) -> tuple[str, int]:
+        safe_snapshot, snapshot_json = persisted_json(dict(snapshot))
+        version_id = new_id("appv")
+        version_number = connection.execute(
+            """
+            SELECT COALESCE(MAX(version_number), 0) + 1
+            FROM application_versions
+            WHERE application_id = ?
+            """,
+            (application_id,),
+        ).fetchone()[0]
+        connection.execute(
+            """
+            INSERT INTO application_versions (
+                id, application_id, version_number, event_type,
+                snapshot_json, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                version_id,
+                application_id,
+                version_number,
+                event_type,
+                snapshot_json,
+                now,
+            ),
+        )
+        self._write_audit(
+            connection,
+            "application.version_recorded",
+            "application",
+            application_id,
+            None,
+            {
+                "application_version_id": version_id,
+                "version_number": version_number,
+                "event_type": event_type,
+                "snapshot": safe_snapshot,
+            },
+        )
+        return version_id, version_number
 
     def get_application_version(self, version_id: str) -> ApplicationVersion:
         row = self._one("SELECT * FROM application_versions WHERE id = ?", (version_id,))
@@ -2134,10 +2239,31 @@ class CareerOpsRepository:
         return reserved
 
     @classmethod
+    def _contains_reserved_provenance(
+        cls, value: Any, *, allow_root: bool = False
+    ) -> bool:
+        if isinstance(value, Mapping):
+            if "provenance" in value and not allow_root:
+                return True
+            return any(
+                cls._contains_reserved_provenance(inner)
+                for key, inner in value.items()
+                if not (allow_root and key == "provenance")
+            )
+        if isinstance(value, (list, tuple)):
+            return any(cls._contains_reserved_provenance(inner) for inner in value)
+        return False
+
+    @classmethod
     def _reject_reserved_report_provenance(
         cls, fit: Mapping[str, Any], risks: Mapping[str, Any]
     ) -> None:
-        if cls._reserved_report_fields(fit) or cls._reserved_report_fields(risks):
+        if (
+            cls._reserved_report_fields(fit)
+            or cls._reserved_report_fields(risks)
+            or cls._contains_reserved_provenance(fit)
+            or cls._contains_reserved_provenance(risks)
+        ):
             raise ValueError("Report contains reserved AI provenance fields")
 
     def _require_report_provenance_authority(
@@ -2155,6 +2281,10 @@ class CareerOpsRepository:
             | set(risks).intersection(REPORT_AI_AUTHORITY_FIELDS)
         )
         if direct_fields:
+            raise ValueError("Report contains reserved AI provenance fields")
+        if self._contains_reserved_provenance(
+            fit, allow_root=True
+        ) or self._contains_reserved_provenance(risks, allow_root=True):
             raise ValueError("Report contains reserved AI provenance fields")
         fit_provenance = fit.get("provenance")
         risks_provenance = risks.get("provenance")
@@ -2537,9 +2667,42 @@ class CareerOpsRepository:
     ) -> tuple[Path, _ArtifactFileEvidence]:
         source_candidate = Path(os.path.abspath(source_path))
         self._require_ai_task_source_path(task_id, source_candidate)
+        artifact_path = self._ai_artifact_storage_path(
+            task_id, artifact_id, artifact_type
+        )
+        evidence = self._publish_ai_artifact_copy(
+            source_path=source_path,
+            artifact_path=artifact_path,
+            expected_sha256=expected_sha256,
+            allow_existing=False,
+        )
+        self._require_ai_task_source_path(task_id, source_candidate)
+        self._require_ai_artifact_path(task_id, artifact_id, evidence.path)
+        return evidence.path, evidence
+
+    def _ai_artifact_storage_path(
+        self, task_id: str, artifact_id: str, artifact_type: str
+    ) -> Path:
+        suffix = ".txt" if artifact_type == "draft_text" else ".json"
+        return (
+            self.vault_path
+            / "ai-artifacts"
+            / task_id
+            / artifact_id
+            / f"{artifact_type}{suffix}"
+        )
+
+    def _publish_ai_artifact_copy(
+        self,
+        *,
+        source_path: Path,
+        artifact_path: Path,
+        expected_sha256: str,
+        allow_existing: bool,
+    ) -> _ArtifactFileEvidence:
         artifacts_root = self.vault_path / "ai-artifacts"
-        task_root = artifacts_root / task_id
-        artifact_root = task_root / artifact_id
+        task_root = artifact_path.parent.parent
+        artifact_root = artifact_path.parent
         artifacts_root.mkdir(exist_ok=True)
         artifacts_root_stat = artifacts_root.lstat()
         if stat.S_ISLNK(artifacts_root_stat.st_mode) or not stat.S_ISDIR(
@@ -2552,38 +2715,70 @@ class CareerOpsRepository:
             task_root_stat.st_mode
         ):
             raise ValueError("AI artifact repository path must be a directory")
-        artifact_root.mkdir(exist_ok=False)
-        suffix = ".txt" if artifact_type == "draft_text" else ".json"
-        artifact_path = artifact_root / f"{artifact_type}{suffix}"
-        temporary_path = artifact_root / f".{artifact_type}-{uuid4().hex}.tmp"
+        artifact_root.mkdir(exist_ok=allow_existing)
+        artifact_root_stat = artifact_root.lstat()
+        if stat.S_ISLNK(artifact_root_stat.st_mode) or not stat.S_ISDIR(
+            artifact_root_stat.st_mode
+        ):
+            raise ValueError("AI artifact repository path must be a directory")
+        temporary_path = artifact_root / f".{artifact_path.stem}-{uuid4().hex}.tmp"
+        published = False
         try:
-            with temporary_path.open("xb") as destination:
-                source_evidence = self._stable_artifact_read(
-                    source_path, destination
-                )
-                self._require_ai_task_source_path(task_id, source_evidence.path)
-                if source_evidence.sha256 != expected_sha256:
-                    raise ValueError("Artifact checksum does not match file bytes")
-                destination.flush()
-                os.fsync(destination.fileno())
-            os.replace(temporary_path, artifact_path)
-            copied_path, copied_sha256 = self._stable_artifact_digest(artifact_path)
-            copied_path, copied_identity = self._fast_artifact_identity(copied_path)
+            if artifact_path.exists():
+                if not allow_existing:
+                    raise FileExistsError("AI artifact target already exists")
+            else:
+                with temporary_path.open("xb") as destination:
+                    source_evidence = self._stable_artifact_read(
+                        source_path, destination
+                    )
+                    if source_evidence.sha256 != expected_sha256:
+                        raise ValueError(
+                            "Artifact checksum does not match file bytes"
+                        )
+                    destination.flush()
+                    os.fsync(destination.fileno())
+                os.replace(temporary_path, artifact_path)
+                published = True
+            copied_path, copied_sha256 = self._stable_artifact_digest(
+                artifact_path
+            )
+            copied_path, copied_identity = self._fast_artifact_identity(
+                copied_path
+            )
             if copied_sha256 != expected_sha256:
-                raise ValueError("Artifact copy checksum does not match source bytes")
+                raise ValueError(
+                    "Artifact copy checksum does not match source bytes"
+                )
+            self._fsync_directory(artifact_root)
+            self._fsync_directory(task_root)
+            self._fsync_directory(artifacts_root)
             evidence = _ArtifactFileEvidence(
                 copied_path, copied_sha256, copied_identity
             )
-            self._require_ai_artifact_path(task_id, artifact_id, evidence.path)
-            return evidence.path, evidence
+            return evidence
         except BaseException:
             temporary_path.unlink(missing_ok=True)
-            artifact_path.unlink(missing_ok=True)
-            try:
-                artifact_root.rmdir()
-            except OSError:
-                pass
+            if published or not allow_existing:
+                artifact_path.unlink(missing_ok=True)
+                try:
+                    artifact_root.rmdir()
+                except OSError:
+                    pass
             raise
+
+    @staticmethod
+    def _fsync_directory(directory: Path) -> None:
+        if not DIRECTORY_FSYNC_SUPPORTED:
+            return
+        descriptor = os.open(
+            directory,
+            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
+        )
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
 
     def _remove_materialized_ai_artifact(self, artifact_path: Path) -> None:
         try:
@@ -2612,6 +2807,7 @@ class CareerOpsRepository:
                 "path",
                 "sha256",
                 "schema_version",
+                "storage_version",
                 "created_at",
             )
         )
@@ -2639,6 +2835,8 @@ class CareerOpsRepository:
     def _artifact_evidence_for_row(
         self, row: sqlite3.Row
     ) -> _ArtifactFileEvidence:
+        if row["storage_version"] != AI_ARTIFACT_STORAGE_VERSION:
+            raise ValueError("AI artifact storage version is invalid")
         self._validate_ai_artifact_metadata(
             row["artifact_type"], row["schema_version"]
         )

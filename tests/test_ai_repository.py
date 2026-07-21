@@ -1,5 +1,5 @@
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import closing
+from contextlib import closing, contextmanager
 from dataclasses import FrozenInstanceError
 from datetime import UTC, datetime
 import gc
@@ -15,6 +15,7 @@ import warnings
 import pytest
 
 from careerops.core.database import connect_database, initialize_database
+from careerops.core.migrations import LATEST_SCHEMA_VERSION, MIGRATIONS
 from careerops.core.repository import CareerOpsRepository
 from careerops.ai.context import load_prompt_template
 
@@ -111,6 +112,93 @@ def promote_to_f32e429_v11(connection: sqlite3.Connection) -> None:
         PRAGMA user_version = 11;
         """
     )
+
+
+def create_v14_legacy_artifact_database(
+    database_path: Path,
+    vault_path: Path,
+    *,
+    source_bytes: bytes = b"legacy context",
+    stored_sha256: str | None = None,
+    create_source: bool = True,
+) -> tuple[str, str, Path]:
+    create_legacy_ai_database(database_path, 12)
+    with closing(sqlite3.connect(database_path)) as connection:
+        connection.row_factory = sqlite3.Row
+        connection.execute("PRAGMA foreign_keys = ON")
+        for version, migration in MIGRATIONS:
+            if version in {13, 14}:
+                migration(connection)
+        connection.execute("PRAGMA user_version = 14")
+        provider_id = "aip_v14_artifact"
+        task_id = "ait_v14_artifact"
+        artifact_id = "aia_v14_artifact"
+        connection.execute(
+            """
+            INSERT INTO ai_provider_configs (
+                id, provider_kind, display_name, identity_name, enabled,
+                privacy_mode, endpoint, model, availability_binding_json,
+                availability_binding_sha256, created_at, updated_at
+            ) VALUES (?, 'mock', 'Legacy artifact provider', '', 0,
+                      'local_private', '', 'fixture-v1', '{}', '', ?, ?)
+            """,
+            (
+                provider_id,
+                "2026-01-01T00:00:00+00:00",
+                "2026-01-01T00:00:00+00:00",
+            ),
+        )
+        connection.execute(
+            """
+            INSERT INTO ai_tasks (
+                id, application_id, task_type, provider_config_id,
+                prompt_template_id, prompt_sha256, input_artifact_ids_json,
+                status, privacy_mode, provider_binding_json,
+                provider_binding_sha256, started_at, claim_expires_at,
+                invocation_started_at, completed_at, error_summary,
+                claim_token, created_at, updated_at
+            ) VALUES (?, 'app_v0', 'analyze_jd', ?, 'analyze_jd_v1', ?, '[]',
+                      'completed', 'local_private', '{}', '', ?, NULL, ?, ?, '',
+                      'legacy-claim', ?, ?)
+            """,
+            (
+                task_id,
+                provider_id,
+                "a" * 64,
+                "2026-01-01T00:00:00+00:00",
+                "2026-01-01T00:00:01+00:00",
+                "2026-01-01T00:00:02+00:00",
+                "2026-01-01T00:00:00+00:00",
+                "2026-01-01T00:00:02+00:00",
+            ),
+        )
+        source_path = (
+            vault_path
+            / "ai-tasks"
+            / task_id
+            / "attempt-legacy"
+            / "context.json"
+        )
+        if create_source:
+            source_path.parent.mkdir(parents=True, exist_ok=True)
+            source_path.write_bytes(source_bytes)
+        connection.execute(
+            """
+            INSERT INTO ai_artifacts (
+                id, task_id, claim_token, artifact_type, path, sha256,
+                schema_version, created_at
+            ) VALUES (?, ?, 'legacy-claim', 'context', ?, ?, '1', ?)
+            """,
+            (
+                artifact_id,
+                task_id,
+                str(source_path.resolve()),
+                stored_sha256 or hashlib.sha256(source_bytes).hexdigest(),
+                "2026-01-01T00:00:01+00:00",
+            ),
+        )
+        connection.commit()
+    return task_id, artifact_id, source_path.resolve()
 
 
 @pytest.mark.parametrize("version", [9, 10, 11, 12])
@@ -295,6 +383,52 @@ def expire_claim(repo: CareerOpsRepository, task_id: str) -> None:
             "UPDATE ai_tasks SET claim_expires_at = ? WHERE id = ?",
             ("1970-01-01T00:00:00+00:00", task_id),
         )
+
+
+def finalize_findings(
+    repo: CareerOpsRepository,
+    application_id: str,
+    provider_id: str,
+    findings: list[dict[str, Any]],
+):
+    application = repo.get_application(application_id)
+    task = create_bound_task(
+        repo, application_id, provider_id, "suggest_resume_edits"
+    )
+    claim = claim_task(repo, task.id)
+    assert repo.begin_ai_task_invocation(task.id, claim) is True
+    for artifact_type in ("context", "raw_output", "validated_output"):
+        write_attempt_artifact(
+            repo,
+            task.id,
+            claim,
+            artifact_type,
+            artifact_type.encode("ascii"),
+        )
+    terminal = repo.finalize_ai_task_attempt(
+        task_id=task.id,
+        claim_token=claim,
+        terminal_status="completed",
+        error_summary="",
+        expected_jd_snapshot_id=application.jd_snapshot_id,
+        expected_resume_version_id=None,
+        findings=findings,
+    )
+    return task, terminal
+
+
+def create_aggregate_finding(
+    repo: CareerOpsRepository,
+    application_id: str,
+    provider_id: str,
+    **finding: Any,
+):
+    task, _terminal = finalize_findings(
+        repo, application_id, provider_id, [finding]
+    )
+    findings = repo.list_ai_findings(task.id)
+    assert len(findings) == 1
+    return task, findings[0]
 
 
 def test_completed_finalization_rejects_empty_artifact_set(tmp_path: Path):
@@ -831,6 +965,421 @@ def test_ai_artifact_db_failure_cleans_only_new_repository_copy(
         ).fetchone()[0] == 0
 
 
+def test_v14_legacy_artifact_is_materialized_idempotently_without_source_deletion(
+    tmp_path: Path,
+):
+    database_path = tmp_path / "careerops.db"
+    vault_path = tmp_path / "vault"
+    task_id, artifact_id, source_path = create_v14_legacy_artifact_database(
+        database_path, vault_path
+    )
+    repo = CareerOpsRepository(database_path, vault_path)
+
+    repo.initialize()
+    artifact = repo.get_ai_artifact(artifact_id)
+
+    assert LATEST_SCHEMA_VERSION >= 15
+    assert artifact.task_id == task_id
+    assert artifact.path != source_path
+    assert artifact.path.relative_to(vault_path).parts[:3] == (
+        "ai-artifacts",
+        task_id,
+        artifact_id,
+    )
+    assert artifact.path.read_bytes() == source_path.read_bytes() == b"legacy context"
+    assert source_path.exists()
+    with repo.connection() as connection:
+        row = connection.execute(
+            "SELECT path, storage_version FROM ai_artifacts WHERE id = ?",
+            (artifact_id,),
+        ).fetchone()
+        assert row["path"] == str(artifact.path)
+        assert row["storage_version"] == 2
+        with pytest.raises(sqlite3.IntegrityError, match="storage version"):
+            connection.execute(
+                "UPDATE ai_artifacts SET storage_version = 3 WHERE id = ?",
+                (artifact_id,),
+            )
+        with pytest.raises(sqlite3.IntegrityError, match="storage version"):
+            connection.execute(
+                "UPDATE ai_artifacts SET storage_version = 1 WHERE id = ?",
+                (artifact_id,),
+            )
+        with pytest.raises(sqlite3.IntegrityError, match="storage version"):
+            connection.execute(
+                """
+                INSERT INTO ai_artifacts (
+                    id, task_id, claim_token, artifact_type, path, sha256,
+                    schema_version, storage_version, created_at
+                ) VALUES (?, ?, 'forged', 'context', ?, ?, '1', 1, ?)
+                """,
+                (
+                    "aia_new_legacy_forgery",
+                    task_id,
+                    str(vault_path / "ai-tasks" / task_id / "attempt-forged.json"),
+                    "f" * 64,
+                    "2026-01-02T00:00:00+00:00",
+                ),
+            )
+
+    repo.initialize()
+
+    assert repo.get_ai_artifact(artifact_id) == artifact
+    assert source_path.exists()
+
+
+@pytest.mark.parametrize(
+    ("create_source", "stored_sha256"),
+    [(False, None), (True, "0" * 64)],
+)
+def test_v14_missing_or_corrupt_legacy_artifact_fails_closed(
+    tmp_path: Path, create_source: bool, stored_sha256: str | None
+):
+    database_path = tmp_path / "careerops.db"
+    vault_path = tmp_path / "vault"
+    _task_id, artifact_id, source_path = create_v14_legacy_artifact_database(
+        database_path,
+        vault_path,
+        create_source=create_source,
+        stored_sha256=stored_sha256,
+    )
+    repo = CareerOpsRepository(database_path, vault_path)
+
+    with pytest.raises(ValueError, match="legacy AI artifact"):
+        repo.initialize()
+
+    with connect_database(database_path) as connection:
+        row = connection.execute(
+            "SELECT path, storage_version FROM ai_artifacts WHERE id = ?",
+            (artifact_id,),
+        ).fetchone()
+        assert row["path"] == str(source_path)
+        assert row["storage_version"] == 1
+
+
+def test_v14_upgrade_recovers_crash_after_copy_before_row_update(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    class SimulatedCrash(BaseException):
+        pass
+
+    database_path = tmp_path / "careerops.db"
+    vault_path = tmp_path / "vault"
+    task_id, artifact_id, source_path = create_v14_legacy_artifact_database(
+        database_path, vault_path
+    )
+    crashing_repo = CareerOpsRepository(database_path, vault_path)
+
+    def crash_before_row_update(*_args, **_kwargs) -> None:
+        raise SimulatedCrash
+
+    monkeypatch.setattr(
+        crashing_repo,
+        "_commit_legacy_ai_artifact_upgrade",
+        crash_before_row_update,
+        raising=False,
+    )
+
+    with pytest.raises(SimulatedCrash):
+        crashing_repo.initialize()
+
+    copied_path = (
+        vault_path
+        / "ai-artifacts"
+        / task_id
+        / artifact_id
+        / "context.json"
+    )
+    assert copied_path.read_bytes() == source_path.read_bytes()
+    with connect_database(database_path) as connection:
+        row = connection.execute(
+            "SELECT path, storage_version FROM ai_artifacts WHERE id = ?",
+            (artifact_id,),
+        ).fetchone()
+        assert row["path"] == str(source_path)
+        assert row["storage_version"] == 1
+
+    recovered_repo = CareerOpsRepository(database_path, vault_path)
+    recovered_repo.initialize()
+
+    assert recovered_repo.get_ai_artifact(artifact_id).path == copied_path.resolve()
+    assert source_path.exists()
+
+
+def test_v14_upgrade_recovers_crash_after_row_update(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    class SimulatedCrash(BaseException):
+        pass
+
+    database_path = tmp_path / "careerops.db"
+    vault_path = tmp_path / "vault"
+    _task_id, artifact_id, source_path = create_v14_legacy_artifact_database(
+        database_path, vault_path
+    )
+    crashing_repo = CareerOpsRepository(database_path, vault_path)
+
+    def crash_before_orphan_reconciliation() -> None:
+        raise SimulatedCrash
+
+    monkeypatch.setattr(
+        crashing_repo,
+        "_reconcile_ai_artifact_storage",
+        crash_before_orphan_reconciliation,
+        raising=False,
+    )
+
+    with pytest.raises(SimulatedCrash):
+        crashing_repo.initialize()
+
+    with connect_database(database_path) as connection:
+        row = connection.execute(
+            "SELECT path, storage_version FROM ai_artifacts WHERE id = ?",
+            (artifact_id,),
+        ).fetchone()
+        assert row["path"] != str(source_path)
+        assert row["storage_version"] == 2
+
+    recovered_repo = CareerOpsRepository(database_path, vault_path)
+    recovered_repo.initialize()
+
+    assert recovered_repo.get_ai_artifact(artifact_id).path == Path(row["path"])
+    assert source_path.exists()
+
+
+def test_initialize_removes_crash_orphan_published_before_artifact_insert(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    class SimulatedCrash(BaseException):
+        pass
+
+    repo = make_repo(tmp_path)
+    application = create_application(repo)
+    provider = create_provider(repo)
+    task = create_task(repo, application.id, provider.id)
+    claim = claim_task(repo, task.id)
+    source = attempt_file(repo, task.id, "crash-orphan.json")
+    source.write_bytes(b"orphan")
+
+    @contextmanager
+    def crash_before_begin():
+        raise SimulatedCrash
+        yield
+
+    monkeypatch.setattr(repo, "connection", crash_before_begin)
+    monkeypatch.setattr(
+        repo, "_remove_materialized_ai_artifact", lambda _path: None
+    )
+
+    with pytest.raises(SimulatedCrash):
+        repo.save_ai_artifact(
+            task.id,
+            claim,
+            "context",
+            source,
+            hashlib.sha256(b"orphan").hexdigest(),
+            "1",
+        )
+
+    artifact_root = repo.vault_path / "ai-artifacts" / task.id
+    assert list(artifact_root.glob("*/context.json"))
+    restarted = CareerOpsRepository(repo.database_path, repo.vault_path)
+    restarted.initialize()
+
+    assert not artifact_root.exists() or list(artifact_root.rglob("*")) == []
+    with restarted.connection() as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM ai_artifacts WHERE task_id = ?", (task.id,)
+        ).fetchone()[0] == 0
+    restarted.initialize()
+    assert source.exists()
+
+
+def test_initialize_preserves_recorded_artifacts_and_cleans_temps_and_orphans(
+    tmp_path: Path,
+):
+    repo = make_repo(tmp_path)
+    application = create_application(repo)
+    provider = create_provider(repo)
+    task = create_task(repo, application.id, provider.id)
+    claim = claim_task(repo, task.id)
+    source = attempt_file(repo, task.id, "recorded.json")
+    source.write_bytes(b"recorded")
+    artifact = repo.save_ai_artifact(
+        task.id,
+        claim,
+        "context",
+        source,
+        hashlib.sha256(b"recorded").hexdigest(),
+        "1",
+    )
+    tracked_temp = artifact.path.parent / ".interrupted.tmp"
+    tracked_temp.write_bytes(b"temporary")
+    untracked_copy = artifact.path.parent / "untracked-copy.json"
+    untracked_copy.write_bytes(b"untracked")
+    orphan_dir = (
+        repo.vault_path / "ai-artifacts" / task.id / "aia_untracked_orphan"
+    )
+    orphan_dir.mkdir()
+    (orphan_dir / ".copy.tmp").write_bytes(b"orphan")
+
+    restarted = CareerOpsRepository(repo.database_path, repo.vault_path)
+    restarted.initialize()
+    restarted.initialize()
+
+    assert restarted.get_ai_artifact(artifact.id) == artifact
+    assert artifact.path.read_bytes() == b"recorded"
+    assert not tracked_temp.exists()
+    assert not untracked_copy.exists()
+    assert not orphan_dir.exists()
+
+
+def test_initialize_never_deletes_a_tampered_database_recorded_artifact(
+    tmp_path: Path,
+):
+    repo = make_repo(tmp_path)
+    application = create_application(repo)
+    provider = create_provider(repo)
+    task = create_task(repo, application.id, provider.id)
+    claim = claim_task(repo, task.id)
+    source = attempt_file(repo, task.id, "recorded-tamper.json")
+    source.write_bytes(b"recorded")
+    artifact = repo.save_ai_artifact(
+        task.id,
+        claim,
+        "context",
+        source,
+        hashlib.sha256(b"recorded").hexdigest(),
+        "1",
+    )
+    artifact.path.write_bytes(b"tampered")
+
+    restarted = CareerOpsRepository(repo.database_path, repo.vault_path)
+    with pytest.raises(ValueError, match="integrity"):
+        restarted.initialize()
+
+    assert artifact.path.read_bytes() == b"tampered"
+    with restarted.connection() as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM ai_artifacts WHERE id = ?", (artifact.id,)
+        ).fetchone()[0] == 1
+
+
+def test_artifact_publication_fsyncs_containing_directories(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    repo = make_repo(tmp_path)
+    application = create_application(repo)
+    provider = create_provider(repo)
+    task = create_task(repo, application.id, provider.id)
+    claim = claim_task(repo, task.id)
+    source = attempt_file(repo, task.id, "durable.json")
+    source.write_bytes(b"durable")
+    fsynced_directories: list[Path] = []
+    monkeypatch.setattr(
+        repo,
+        "_fsync_directory",
+        lambda path: fsynced_directories.append(Path(path)),
+        raising=False,
+    )
+
+    artifact = repo.save_ai_artifact(
+        task.id,
+        claim,
+        "context",
+        source,
+        hashlib.sha256(b"durable").hexdigest(),
+        "1",
+    )
+
+    assert artifact.path.parent in fsynced_directories
+    assert artifact.path.parent.parent in fsynced_directories
+    assert repo.vault_path / "ai-artifacts" in fsynced_directories
+
+
+def test_artifact_directory_fsync_failure_rolls_back_copy_and_row(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    repo = make_repo(tmp_path)
+    application = create_application(repo)
+    provider = create_provider(repo)
+    task = create_task(repo, application.id, provider.id)
+    claim = claim_task(repo, task.id)
+    source = attempt_file(repo, task.id, "fsync-failure.json")
+    source.write_bytes(b"durable")
+
+    def fail_directory_fsync(_path: Path) -> None:
+        raise OSError("simulated directory fsync failure")
+
+    monkeypatch.setattr(
+        repo, "_fsync_directory", fail_directory_fsync, raising=False
+    )
+
+    with pytest.raises(OSError, match="directory fsync failure"):
+        repo.save_ai_artifact(
+            task.id,
+            claim,
+            "context",
+            source,
+            hashlib.sha256(b"durable").hexdigest(),
+            "1",
+        )
+
+    with repo.connection() as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM ai_artifacts WHERE task_id = ?", (task.id,)
+        ).fetchone()[0] == 0
+    artifact_root = repo.vault_path / "ai-artifacts" / task.id
+    assert not artifact_root.exists() or list(artifact_root.rglob("*")) == []
+
+
+def test_directory_fsync_is_explicitly_skipped_when_platform_lacks_support(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    from careerops.core import repository as repository_module
+
+    repo = CareerOpsRepository(tmp_path / "careerops.db", tmp_path / "vault")
+    monkeypatch.setattr(repository_module, "DIRECTORY_FSYNC_SUPPORTED", False)
+
+    def unexpected_open(*_args, **_kwargs):
+        raise AssertionError("unsupported directory fsync must not open a directory")
+
+    monkeypatch.setattr(repository_module.os, "open", unexpected_open)
+
+    repo._fsync_directory(tmp_path)
+
+
+def test_directory_fsync_uses_open_fsync_and_close_when_supported(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    from careerops.core import repository as repository_module
+
+    repo = CareerOpsRepository(tmp_path / "careerops.db", tmp_path / "vault")
+    calls: list[tuple[str, Any]] = []
+    monkeypatch.setattr(repository_module, "DIRECTORY_FSYNC_SUPPORTED", True)
+    monkeypatch.setattr(
+        repository_module.os,
+        "open",
+        lambda path, flags: calls.append(("open", (Path(path), flags))) or 73,
+    )
+    monkeypatch.setattr(
+        repository_module.os,
+        "fsync",
+        lambda descriptor: calls.append(("fsync", descriptor)),
+    )
+    monkeypatch.setattr(
+        repository_module.os,
+        "close",
+        lambda descriptor: calls.append(("close", descriptor)),
+    )
+
+    repo._fsync_directory(tmp_path)
+
+    assert calls[0][0] == "open"
+    assert calls[0][1][0] == tmp_path
+    assert calls[1:] == [("fsync", 73), ("close", 73)]
+
+
 @pytest.mark.parametrize(
     ("artifact_type", "schema_version"),
     [
@@ -883,8 +1432,8 @@ def test_ai_artifact_metadata_triggers_reject_direct_sql(tmp_path: Path):
                     """
                     INSERT INTO ai_artifacts (
                         id, task_id, claim_token, artifact_type, path, sha256,
-                        schema_version, created_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                        schema_version, storage_version, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, 2, ?)
                     """,
                     (
                         artifact_id,
@@ -1140,6 +1689,47 @@ def test_non_ai_report_rejects_reserved_ai_provenance(
     assert repo.get_application(application.id).latest_report_id is None
 
 
+@pytest.mark.parametrize(
+    ("fit", "risks"),
+    [
+        (
+            {"score": 90, "details": {"provenance": {"ai_task_id": "forged"}}},
+            {"blockers": [], "warnings": []},
+        ),
+        (
+            {"score": 90},
+            {
+                "blockers": [],
+                "warnings": [{"notes": [{"provenance": "forged"}]}],
+            },
+        ),
+    ],
+)
+def test_non_ai_report_recursively_rejects_reserved_provenance(
+    tmp_path: Path, fit: dict[str, Any], risks: dict[str, Any]
+):
+    repo = make_repo(tmp_path)
+    application = create_application(repo)
+    resume = repo.create_resume_version(
+        name="Current resume",
+        role_family="software",
+        tex_path=tmp_path / "resume.tex",
+        tex_sha256="a" * 64,
+    )
+    repo.select_resume(application.id, resume.id)
+
+    with pytest.raises(ValueError, match="reserved AI provenance"):
+        repo.save_report(
+            application_id=application.id,
+            resume_version_id=resume.id,
+            jd_snapshot_id=application.jd_snapshot_id,
+            fit=fit,
+            risks=risks,
+        )
+
+    assert repo.get_application(application.id).latest_report_id is None
+
+
 def test_approval_rejects_forged_reserved_provenance_but_accepts_normal_report(
     tmp_path: Path,
 ):
@@ -1197,6 +1787,57 @@ def test_approval_rejects_forged_reserved_provenance_but_accepts_normal_report(
     approval = repo.approve_application(application.id, normal.id, "Reviewed")
 
     assert approval.report_id == normal.id
+
+
+def test_approval_rejects_nested_reserved_provenance_forged_in_database(
+    tmp_path: Path,
+):
+    repo = make_repo(tmp_path)
+    application = create_application(repo)
+    source_dir = repo.vault_path / "resumes" / "nested-provenance"
+    source_dir.mkdir(parents=True)
+    pdf_path = source_dir / "resume.pdf"
+    pdf_bytes = b"%PDF-1.4\nnested provenance"
+    pdf_path.write_bytes(pdf_bytes)
+    resume = repo.create_resume_version(
+        name="Current resume",
+        role_family="software",
+        tex_path=source_dir / "resume.tex",
+        tex_sha256="a" * 64,
+        pdf_path=pdf_path,
+        pdf_sha256=hashlib.sha256(pdf_bytes).hexdigest(),
+    )
+    repo.select_resume(application.id, resume.id)
+    report_id = "rep_nested_forged_provenance"
+    with repo.connection() as connection:
+        connection.execute(
+            """
+            INSERT INTO reports (
+                id, application_id, resume_version_id, jd_snapshot_id,
+                fit_json, risks_json, blocking_issue_count, warning_count,
+                created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, 0, 0, ?)
+            """,
+            (
+                report_id,
+                application.id,
+                resume.id,
+                application.jd_snapshot_id,
+                '{"details":{"items":[{"provenance":'
+                '{"ai_task_id":"forged"}}]},"score":100}',
+                '{"blockers":[],"warnings":[]}',
+                "2026-01-01T00:00:00+00:00",
+            ),
+        )
+        connection.execute(
+            "UPDATE applications SET latest_report_id = ?, status = ? WHERE id = ?",
+            (report_id, "ready_for_review", application.id),
+        )
+
+    with pytest.raises(ValueError, match="reserved AI provenance"):
+        repo.approve_application(application.id, report_id, "Reviewed")
+
+    assert repo.get_application(application.id).approval_id is None
 
 
 def test_approval_and_submission_require_current_vault_pdf_bytes(tmp_path: Path):
@@ -2122,11 +2763,10 @@ def test_save_ai_finding_redacts_and_canonicalizes_every_field(tmp_path: Path):
     repo = make_repo(tmp_path)
     application = create_application(repo)
     provider = create_provider(repo)
-    task = create_task(repo, application.id, provider.id)
-    claim = claim_task(repo, task.id)
-    finding = repo.save_ai_finding(
-        task_id=task.id,
-        claim_token=claim,
+    task, finding = create_aggregate_finding(
+        repo,
+        application.id,
+        provider.id,
         finding_type="risk",
         severity="warning",
         claim_text="api_key=PRIVATE_CLAIM_KEY",
@@ -2145,16 +2785,64 @@ def test_save_ai_finding_redacts_and_canonicalizes_every_field(tmp_path: Path):
         ).fetchone()[0]
     assert payload_json == '{"a":2,"token":"[REDACTED]","z":1}'
     with pytest.raises(ValueError, match="size limit"):
+        finalize_findings(
+            repo,
+            application.id,
+            provider.id,
+            [
+                {
+                    "finding_type": "x" * 300_000,
+                    "severity": "warning",
+                    "claim_text": "bounded",
+                    "evidence_item_id": None,
+                    "recommendation": "bounded",
+                    "verifier_state": "needs_evidence",
+                }
+            ],
+        )
+
+
+def test_standalone_ai_findings_and_terminal_versions_fail_closed_after_recovery(
+    tmp_path: Path,
+):
+    repo = make_repo(tmp_path)
+    application = create_application(repo)
+    provider = create_provider(repo)
+    task = create_task(repo, application.id, provider.id)
+    claim = claim_task(repo, task.id)
+
+    with pytest.raises(ValueError, match="aggregate finalizer"):
         repo.save_ai_finding(
             task_id=task.id,
             claim_token=claim,
-            finding_type="x" * 300_000,
+            finding_type="forged",
             severity="warning",
-            claim_text="bounded",
+            claim_text="Standalone finding",
             evidence_item_id=None,
-            recommendation="bounded",
+            recommendation="Do not persist",
             verifier_state="needs_evidence",
         )
+    with pytest.raises(ValueError, match="aggregate finalizer"):
+        repo.record_application_version(
+            application.id,
+            "ai_task.completed",
+            {"ai_task": {"id": task.id}, "provenance": {"forged": True}},
+        )
+    with pytest.raises(ValueError, match="aggregate finalizer"):
+        repo.record_application_version(
+            application.id,
+            "ai_task.blocked",
+            {"ai_task": {"id": task.id}},
+            ai_task_id=task.id,
+            claim_token=claim,
+        )
+
+    expire_claim(repo, task.id)
+    restarted = CareerOpsRepository(repo.database_path, repo.vault_path)
+    restarted.initialize()
+
+    assert restarted.list_ai_findings(task.id) == []
+    assert restarted.list_application_versions(application.id) == []
 
 
 def test_public_report_and_jd_json_reject_nonfinite_and_oversize(tmp_path: Path):
@@ -2496,7 +3184,7 @@ def test_requeue_invalidates_stale_worker_claim(tmp_path: Path):
     )
 
 
-def test_requeue_invalidates_stale_artifact_and_finding_writes(tmp_path: Path):
+def test_requeue_invalidates_stale_artifact_writes(tmp_path: Path):
     repo = make_repo(tmp_path)
     application = create_application(repo)
     provider = create_provider(repo)
@@ -2515,16 +3203,6 @@ def test_requeue_invalidates_stale_artifact_and_finding_writes(tmp_path: Path):
         hashlib.sha256(b"attempt-a").hexdigest(),
         "1",
     )
-    first_finding = worker_a.save_ai_finding(
-        task_id=task.id,
-        claim_token=stale_token,
-        finding_type="risk",
-        severity="warning",
-        claim_text="Attempt A",
-        evidence_item_id=None,
-        recommendation="Review",
-        verifier_state="needs_evidence",
-    )
     expire_claim(repo, task.id)
     assert repo.requeue_interrupted_ai_tasks() == 1
     current_token = claim_task(worker_b, task.id)
@@ -2540,18 +3218,6 @@ def test_requeue_invalidates_stale_artifact_and_finding_writes(tmp_path: Path):
             hashlib.sha256(b"attempt-b").hexdigest(),
             "1",
         )
-    with pytest.raises(ValueError, match="claim"):
-        worker_a.save_ai_finding(
-            task_id=task.id,
-            claim_token=stale_token,
-            finding_type="risk",
-            severity="warning",
-            claim_text="Stale attempt A",
-            evidence_item_id=None,
-            recommendation="Review",
-            verifier_state="needs_evidence",
-        )
-
     second_artifact = worker_b.save_ai_artifact(
         task.id,
         current_token,
@@ -2560,23 +3226,10 @@ def test_requeue_invalidates_stale_artifact_and_finding_writes(tmp_path: Path):
         hashlib.sha256(b"attempt-b").hexdigest(),
         "1",
     )
-    second_finding = worker_b.save_ai_finding(
-        task_id=task.id,
-        claim_token=current_token,
-        finding_type="risk",
-        severity="warning",
-        claim_text="Attempt B",
-        evidence_item_id=None,
-        recommendation="Review",
-        verifier_state="needs_evidence",
-    )
-
     assert first_artifact.claim_token == stale_token
     assert second_artifact.claim_token == current_token
-    assert first_finding.claim_token == stale_token
-    assert second_finding.claim_token == current_token
     assert repo.list_ai_artifacts(task.id) == [first_artifact, second_artifact]
-    assert repo.list_ai_findings(task.id) == [first_finding, second_finding]
+    assert repo.list_ai_findings(task.id) == []
 
 
 def test_competing_terminal_updates_allow_only_one_claim_owner_update(tmp_path: Path):
@@ -2645,12 +3298,10 @@ def test_ai_finding_decisions_are_persisted_and_audited(tmp_path: Path):
     repo = make_repo(tmp_path)
     application = create_application(repo)
     provider = create_provider(repo)
-    task = create_task(repo, application.id, provider.id)
-    claim_token = claim_task(repo, task.id)
-
-    finding = repo.save_ai_finding(
-        task_id=task.id,
-        claim_token=claim_token,
+    task, finding = create_aggregate_finding(
+        repo,
+        application.id,
+        provider.id,
         finding_type="unsupported_claim",
         severity="blocking",
         claim_text="Improved throughput by 50%",
@@ -2677,11 +3328,7 @@ def test_ai_findings_only_start_pending_and_decisions_use_compare_and_set(tmp_pa
     repo = make_repo(tmp_path)
     application = create_application(repo)
     provider = create_provider(repo)
-    task = create_task(repo, application.id, provider.id)
-    claim_token = claim_task(repo, task.id)
     finding_values = {
-        "task_id": task.id,
-        "claim_token": claim_token,
         "finding_type": "unsupported_claim",
         "severity": "blocking",
         "claim_text": "Improved throughput by 50%",
@@ -2691,9 +3338,16 @@ def test_ai_findings_only_start_pending_and_decisions_use_compare_and_set(tmp_pa
     }
 
     with pytest.raises(ValueError, match="pending"):
-        repo.save_ai_finding(**finding_values, decision="accepted")
+        finalize_findings(
+            repo,
+            application.id,
+            provider.id,
+            [{**finding_values, "decision": "accepted"}],
+        )
 
-    finding = repo.save_ai_finding(**finding_values)
+    _task, finding = create_aggregate_finding(
+        repo, application.id, provider.id, **finding_values
+    )
     accepted = repo.update_ai_finding_decision(
         finding.id, "accepted", expected_decision="pending"
     )
@@ -2722,11 +3376,10 @@ def test_unsafe_verifier_states_cannot_be_accepted(
     repo = make_repo(tmp_path)
     application = create_application(repo)
     provider = create_provider(repo)
-    task = create_task(repo, application.id, provider.id)
-    claim_token = claim_task(repo, task.id)
-    finding = repo.save_ai_finding(
-        task_id=task.id,
-        claim_token=claim_token,
+    _task, finding = create_aggregate_finding(
+        repo,
+        application.id,
+        provider.id,
         finding_type="risk",
         severity="blocking",
         claim_text="Unsafe claim",
@@ -2752,11 +3405,10 @@ def test_concurrent_finding_decisions_have_one_causal_audit(tmp_path: Path):
     repo = make_repo(tmp_path)
     application = create_application(repo)
     provider = create_provider(repo)
-    task = create_task(repo, application.id, provider.id)
-    claim_token = claim_task(repo, task.id)
-    finding = repo.save_ai_finding(
-        task_id=task.id,
-        claim_token=claim_token,
+    _task, finding = create_aggregate_finding(
+        repo,
+        application.id,
+        provider.id,
         finding_type="verified_claim",
         severity="info",
         claim_text="Verified claim",
@@ -2854,29 +3506,37 @@ def test_repository_rejects_non_finite_state_values(tmp_path: Path):
             **authority,
         )
 
-    task = create_task(repo, application.id, provider.id)
-    claim_token = claim_task(repo, task.id)
     with pytest.raises(ValueError, match="severity"):
-        repo.save_ai_finding(
-            task_id=task.id,
-            claim_token=claim_token,
-            finding_type="risk",
-            severity="invented",
-            claim_text="Claim",
-            evidence_item_id=None,
-            recommendation="Review",
-            verifier_state="blocked",
+        finalize_findings(
+            repo,
+            application.id,
+            provider.id,
+            [
+                {
+                    "finding_type": "risk",
+                    "severity": "invented",
+                    "claim_text": "Claim",
+                    "evidence_item_id": None,
+                    "recommendation": "Review",
+                    "verifier_state": "blocked",
+                }
+            ],
         )
     with pytest.raises(ValueError, match="verifier state"):
-        repo.save_ai_finding(
-            task_id=task.id,
-            claim_token=claim_token,
-            finding_type="risk",
-            severity="warning",
-            claim_text="Claim",
-            evidence_item_id=None,
-            recommendation="Review",
-            verifier_state="invented",
+        finalize_findings(
+            repo,
+            application.id,
+            provider.id,
+            [
+                {
+                    "finding_type": "risk",
+                    "severity": "warning",
+                    "claim_text": "Claim",
+                    "evidence_item_id": None,
+                    "recommendation": "Review",
+                    "verifier_state": "invented",
+                }
+            ],
         )
     with pytest.raises(ValueError, match="privacy level"):
         repo.create_profile_fact(
@@ -3592,7 +4252,7 @@ def test_v12_database_quarantines_unbound_configs_and_fences_running_tasks(
             )
 
 
-def test_v12_upgrade_quarantines_duplicate_paths_and_unbound_prompt_authority(
+def test_v12_upgrade_quarantines_duplicates_then_fails_closed_on_missing_artifact(
     tmp_path: Path,
 ):
     database_path = tmp_path / "careerops.db"
@@ -3672,7 +4332,8 @@ def test_v12_upgrade_quarantines_duplicate_paths_and_unbound_prompt_authority(
             )
 
     repo = CareerOpsRepository(database_path, tmp_path / "vault")
-    repo.initialize()
+    with pytest.raises(ValueError, match="legacy AI artifact"):
+        repo.initialize()
     task = repo.get_ai_task("ait_v12_prompt")
     claim = claim_task(repo, task.id)
 
@@ -3689,8 +4350,8 @@ def test_v12_upgrade_quarantines_duplicate_paths_and_unbound_prompt_authority(
                 """
                 INSERT INTO ai_artifacts (
                     id, task_id, claim_token, artifact_type, path, sha256,
-                    schema_version, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    schema_version, storage_version, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, 2, ?)
                 """,
                 (
                     "aia_v12_duplicate",
