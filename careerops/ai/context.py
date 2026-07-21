@@ -283,6 +283,7 @@ def _profile_facts(
     if any(
         fact["verification_state"] not in VERIFICATION_STATES
         or fact["privacy_level"] not in PRIVACY_LEVELS
+        or not fact["value"].strip()
         for fact in facts
     ):
         raise ContextBuildError("Context profile fact state was invalid")
@@ -440,7 +441,9 @@ def validate_context_packet(
 ) -> dict[str, Any] | None:
     if (
         type(packet) is not ContextPacket
+        or type(expected_task_type) is not str
         or expected_task_type not in ALLOWED_TASK_TYPES
+        or type(packet.task_type) is not str
         or packet.task_type != expected_task_type
         or type(packet.canonical_bytes) is not bytes
         or not packet.canonical_bytes

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import Counter
 from dataclasses import dataclass
 import re
 import unicodedata
@@ -79,7 +80,7 @@ _RISK_CODES = {
     "NDA-sensitive wording": "nda_sensitive_wording",
     "Unsupported title": "unsafe_title",
 }
-_SENTENCE_PATTERN = re.compile(r"[^.!?\n]+(?:[.!?]+|$)")
+_SENTENCE_PATTERN = re.compile(r"[^.!?\n]+(?:[.!?]+|\n|$)")
 _INJECTION_PATTERN = re.compile(
     r"(?i)(?:\b(?:ignore|disregard|override|forget)\b.{0,100}"
     r"\b(?:instruction|prompt|rule|message)s?\b|"
@@ -101,9 +102,11 @@ _NON_FACTUAL_SENTENCE_PATTERNS = (
     ),
     re.compile(r"(?i)^please consider my application$"),
 )
-_NON_FACTUAL_REASON_PATTERNS = (
+_SUPPORTED_REASON_PATTERNS = (
     re.compile(r"(?i)^direct (?:evidence|match)$"),
     re.compile(r"(?i)^matches? (?:the )?(?:supplied )?(?:evidence|record)$"),
+)
+_UNSUPPORTED_REASON_PATTERNS = (
     re.compile(r"(?i)^(?:no|missing|insufficient) (?:supporting )?(?:evidence|proof)$"),
     re.compile(
         r"(?i)^(?:supporting )?(?:evidence|proof) (?:is )?"
@@ -113,13 +116,30 @@ _NON_FACTUAL_REASON_PATTERNS = (
         r"(?i)^(?:the )?evidence (?:does not|doesn't|cannot|can't) "
         r"support (?:this|the) claim$"
     ),
-    re.compile(r"(?i)^(?:requires?|needs?) (?:human )?review$"),
-    re.compile(r"(?i)^private(?: material)?$"),
     re.compile(
         r"(?i)^(?:the )?claim (?:is )?"
-        r"(?:not supported|unsupported|unverified|private|rejected)"
+        r"(?:not supported|unsupported|unverified|rejected)"
         r"(?: by (?:the )?(?:supplied )?evidence)?$"
     ),
+)
+_NEEDS_REVIEW_REASON_PATTERNS = (
+    re.compile(r"(?i)^(?:requires?|needs?) (?:human )?review$"),
+    *_UNSUPPORTED_REASON_PATTERNS,
+)
+_PRIVATE_REASON_PATTERNS = (
+    re.compile(r"(?i)^private(?: material)?$"),
+    re.compile(r"(?i)^(?:the )?claim (?:is )?private$"),
+)
+_DECISION_REASON_PATTERNS = {
+    "supported": _SUPPORTED_REASON_PATTERNS,
+    "unsupported": _UNSUPPORTED_REASON_PATTERNS,
+    "needs_review": _NEEDS_REVIEW_REASON_PATTERNS,
+    "private": _PRIVATE_REASON_PATTERNS,
+}
+_ALL_GENERIC_REASON_PATTERNS = tuple(
+    pattern
+    for patterns in _DECISION_REASON_PATTERNS.values()
+    for pattern in patterns
 )
 _UNTRUSTED_CONTEXT_FIELDS = (
     "job_description",
@@ -130,6 +150,43 @@ _UNTRUSTED_CONTEXT_FIELDS = (
     "writing_preferences",
 )
 _MAX_TEXT_SEGMENTS = 256
+_DEFAULT_IGNORABLE_RANGES = (
+    (0x034F, 0x034F),
+    (0x115F, 0x1160),
+    (0x17B4, 0x17B5),
+    (0x180B, 0x180F),
+    (0x200B, 0x200F),
+    (0x202A, 0x202E),
+    (0x2060, 0x206F),
+    (0x3164, 0x3164),
+    (0xFE00, 0xFE0F),
+    (0xFEFF, 0xFEFF),
+    (0xFFA0, 0xFFA0),
+    (0x1BCA0, 0x1BCA3),
+    (0x1D173, 0x1D17A),
+    (0xE0000, 0xE0FFF),
+)
+_METRIC_WRAPPER_LEXEMES = frozenset(
+    {
+        "a",
+        "an",
+        "by",
+        "candidate",
+        "consider",
+        "demonstrate",
+        "evidence",
+        "experience",
+        "highlight",
+        "in",
+        "of",
+        "recommend",
+        "relevant",
+        "show",
+        "the",
+        "with",
+        "your",
+    }
+)
 _LOW_SIGNAL_LEXEMES = frozenset(
     {
         "a",
@@ -388,6 +445,7 @@ def _claim_records(
             if (
                 not claim_id
                 or text is None
+                or not text.strip()
                 or state not in VERIFICATION_STATES
                 or privacy not in PRIVACY_LEVELS
             ):
@@ -406,8 +464,15 @@ def _normalize_text(text: str) -> str:
     return "".join(
         character
         for character in normalized
-        if unicodedata.category(character) != "Cf"
+        if not _is_default_ignorable(character)
     )
+
+
+def _is_default_ignorable(character: str) -> bool:
+    if unicodedata.category(character) == "Cf":
+        return True
+    codepoint = ord(character)
+    return any(start <= codepoint <= end for start, end in _DEFAULT_IGNORABLE_RANGES)
 
 
 def _lexemes(text: str) -> tuple[str, ...] | None:
@@ -503,18 +568,57 @@ def _metric_supported(text: str, evidence: Sequence[_Evidence]) -> bool:
 
 
 def _metric_supported_by_sources(text: str, sources: Sequence[str]) -> bool:
-    metrics = {
-        match.casefold() for match in METRIC_PATTERN.findall(_normalize_text(text))
-    }
-    if not metrics:
-        return True
-    grounded: set[str] = set()
+    statements = _sentences(text)
+    if statements is None:
+        return False
+    source_statements: list[str] = []
     for source in sources:
-        grounded.update(
-            match.casefold()
-            for match in METRIC_PATTERN.findall(_normalize_text(source))
+        segments = _sentences(source)
+        if segments is None:
+            return False
+        source_statements.extend(segments)
+    return all(
+        not METRIC_PATTERN.search(_normalize_text(statement))
+        or any(
+            _metric_statement_matches(statement, source_statement)
+            for source_statement in source_statements
         )
-    return metrics <= grounded
+        for statement in statements
+    )
+
+
+def _metric_statement_matches(statement: str, source: str) -> bool:
+    if _relationship_matches(statement, source):
+        return True
+    statement_metrics = tuple(
+        match.casefold()
+        for match in METRIC_PATTERN.findall(_normalize_text(statement))
+    )
+    source_metrics = tuple(
+        match.casefold()
+        for match in METRIC_PATTERN.findall(_normalize_text(source))
+    )
+    if not statement_metrics or statement_metrics != source_metrics:
+        return False
+    return _metric_relation_lexemes(statement) == _metric_relation_lexemes(source)
+
+
+def _metric_relation_lexemes(text: str) -> tuple[str, ...]:
+    lexemes = _lexemes(text) or ()
+    return tuple(
+        _metric_stem(token)
+        for token in lexemes
+        if token not in _METRIC_WRAPPER_LEXEMES
+    )
+
+
+def _metric_stem(token: str) -> str:
+    for suffix in ("ing", "ed"):
+        if token.endswith(suffix) and len(token) > len(suffix) + 2:
+            return token[: -len(suffix)]
+    if token.endswith("s") and len(token) > 4:
+        return token[:-1]
+    return token
 
 
 def _resolve_evidence(
@@ -729,66 +833,60 @@ def _blocked_material(
     evidence: Sequence[_Evidence],
     rejected: Sequence[str],
     private_claims: Sequence[str],
+    lexeme_cache: dict[str, tuple[str, ...] | None] | None = None,
 ) -> tuple[bool, bool]:
-    rejected_echo = any(_material_overlap(text, claim) for claim in rejected)
-    private_echo = any(_material_overlap(text, claim) for claim in private_claims)
+    rejected_echo = any(
+        _material_overlap(text, claim, lexeme_cache) for claim in rejected
+    )
+    private_echo = any(
+        _material_overlap(text, claim, lexeme_cache) for claim in private_claims
+    )
     private_echo = private_echo or any(
-        item.private and _material_overlap(text, item.summary) for item in evidence
+        item.private and _material_overlap(text, item.summary, lexeme_cache)
+        for item in evidence
     )
     return rejected_echo, private_echo
 
 
-def _material_lexemes(text: str) -> tuple[str, ...] | None:
+def _material_lexemes(
+    text: str,
+    cache: dict[str, tuple[str, ...] | None] | None = None,
+) -> tuple[str, ...] | None:
+    if cache is not None and text in cache:
+        return cache[text]
     lexemes = _lexemes(text)
     if lexemes is None:
+        if cache is not None:
+            cache[text] = None
         return None
-    return tuple(token for token in lexemes if token not in _LOW_SIGNAL_LEXEMES)
+    high_signal = tuple(token for token in lexemes if token not in _LOW_SIGNAL_LEXEMES)
+    result = high_signal or lexemes
+    if cache is not None:
+        cache[text] = result
+    return result
 
 
-def _is_ordered_subsequence(needle: Sequence[str], haystack: Sequence[str]) -> bool:
-    if not needle:
-        return False
-    position = 0
-    for token in haystack:
-        if token == needle[position]:
-            position += 1
-            if position == len(needle):
-                return True
-    return False
-
-
-def _ordered_overlap_length(left: Sequence[str], right: Sequence[str]) -> int:
-    previous = [0] * (len(right) + 1)
-    for left_token in left:
-        current = [0]
-        for index, right_token in enumerate(right, start=1):
-            if left_token == right_token:
-                current.append(previous[index - 1] + 1)
-            else:
-                current.append(max(previous[index], current[-1]))
-        previous = current
-    return previous[-1]
-
-
-def _material_overlap(text: str, blocked: str) -> bool:
-    text_tokens = _material_lexemes(text)
-    blocked_tokens = _material_lexemes(blocked)
+def _material_overlap(
+    text: str,
+    blocked: str,
+    cache: dict[str, tuple[str, ...] | None] | None = None,
+) -> bool:
+    text_tokens = _material_lexemes(text, cache)
+    blocked_tokens = _material_lexemes(blocked, cache)
     if text_tokens is None or blocked_tokens is None:
         return True
     if not text_tokens or not blocked_tokens:
         return False
-    shorter, longer = (
-        (text_tokens, blocked_tokens)
-        if len(text_tokens) <= len(blocked_tokens)
-        else (blocked_tokens, text_tokens)
+    text_counts = Counter(text_tokens)
+    blocked_counts = Counter(blocked_tokens)
+    shorter_size = min(sum(text_counts.values()), sum(blocked_counts.values()))
+    overlap = sum((text_counts & blocked_counts).values())
+    if shorter_size == 1:
+        token = next(iter(text_counts & blocked_counts), "")
+        return overlap == 1 and len(token) >= 4
+    return overlap == shorter_size or (
+        overlap >= 2 and overlap * 2 >= shorter_size
     )
-    if len(shorter) == 1:
-        token = shorter[0]
-        return len(token) >= 4 and token in longer
-    if _is_ordered_subsequence(shorter, longer):
-        return True
-    overlap = _ordered_overlap_length(shorter, longer)
-    return overlap >= 2 and overlap * 2 >= len(shorter)
 
 
 def _verify_analysis(
@@ -826,8 +924,9 @@ def _verify_analysis(
         return _result(task_type, None, [_finding("schema_invalid")])
     if injection_echo:
         findings.append(_finding("prompt_injection_echo"))
+    material_cache: dict[str, tuple[str, ...] | None] = {}
     rejected_echo, private_echo = _blocked_material(
-        output_text, records, rejected, ()
+        output_text, records, rejected, (), material_cache
     )
     if rejected_echo:
         findings.append(_finding("unsupported_claim"))
@@ -897,7 +996,12 @@ def verify_resume_edits(
     else:
         context_data = {}
         evidence_values = evidence if evidence is not None else ()
-        rejected_values = rejected_claims if rejected_claims is not None else ()
+        rejected_values = _bounded_values(
+            rejected_claims if rejected_claims is not None else (),
+            MAX_REJECTED_CLAIMS,
+        )
+        if rejected_values is None:
+            return _result(task_type, None, [_finding("schema_invalid")])
         context_private = ()
         injection_sources = ()
 
@@ -914,17 +1018,31 @@ def verify_resume_edits(
         injection_sources = (
             resume_tex,
             tuple(item.summary for item in records),
-            rejected,
+            rejected_values,
             normalized_private,
         )
 
     findings: list[VerifierFinding] = []
+    material_cache: dict[str, tuple[str, ...] | None] = {}
+    ambiguous_spans: set[int] = set()
+    intervals: list[tuple[int, int, int]] = []
+    for index, suggestion in enumerate(output.suggestions):
+        interval = _unique_source_interval(resume_tex, suggestion.source_text)
+        if interval is None:
+            ambiguous_spans.add(index)
+        else:
+            intervals.append((index, interval[0], interval[1]))
+    for position, (left_index, left_start, left_end) in enumerate(intervals):
+        for right_index, right_start, right_end in intervals[position + 1 :]:
+            if left_start < right_end and right_start < left_end:
+                ambiguous_spans.update((left_index, right_index))
+    findings.extend(
+        _finding("source_span_not_unique", item_index=index)
+        for index in sorted(ambiguous_spans)
+    )
+
     private_materials = normalized_private + context_private
     for index, suggestion in enumerate(output.suggestions):
-        if _overlapping_occurrences(resume_tex, suggestion.source_text) != 1:
-            findings.append(
-                _finding("source_span_not_unique", item_index=index)
-            )
         resolved, reference_findings = _resolve_evidence(
             suggestion.evidence_refs, records, item_index=index
         )
@@ -939,6 +1057,7 @@ def verify_resume_edits(
             records,
             rejected,
             private_materials,
+            material_cache,
         )
         if not claim_supported or rejected_echo:
             findings.append(_finding("unsupported_claim", item_index=index))
@@ -957,6 +1076,7 @@ def verify_resume_edits(
             records,
             rejected,
             private_materials,
+            material_cache,
         )
         if reason_rejected:
             findings.append(_finding("unsupported_claim", item_index=index))
@@ -992,6 +1112,13 @@ def _overlapping_occurrences(text: str, source: str) -> int:
         start = position + 1
 
 
+def _unique_source_interval(text: str, source: str) -> tuple[int, int] | None:
+    first = text.find(source)
+    if first < 0 or text.find(source, first + 1) >= 0:
+        return None
+    return first, first + len(source)
+
+
 def _factual_sentences(text: str) -> tuple[str, ...] | None:
     sentences = _sentences(text)
     if sentences is None:
@@ -1011,14 +1138,23 @@ def _factual_sentences(text: str) -> tuple[str, ...] | None:
 def _unsupported_reason_statement(
     text: str,
     evidence: Sequence[_Evidence],
+    decision: str,
 ) -> bool | None:
     sentences = _sentences(text)
     if sentences is None:
         return None
+    allowed_patterns = _DECISION_REASON_PATTERNS.get(decision)
+    if allowed_patterns is None:
+        return True
     for sentence in sentences:
         normalized = _normalized_text(sentence.rstrip(".!?"))
-        if any(pattern.fullmatch(normalized) for pattern in _NON_FACTUAL_REASON_PATTERNS):
+        if any(pattern.fullmatch(normalized) for pattern in allowed_patterns):
             continue
+        if any(
+            pattern.fullmatch(normalized)
+            for pattern in _ALL_GENERIC_REASON_PATTERNS
+        ):
+            return True
         if not _statement_supported(sentence, evidence):
             return True
     return False
@@ -1053,7 +1189,12 @@ def verify_cover_letter(
     else:
         context_data = {}
         evidence_values = evidence if evidence is not None else ()
-        rejected_values = rejected_claims if rejected_claims is not None else ()
+        rejected_values = _bounded_values(
+            rejected_claims if rejected_claims is not None else (),
+            MAX_REJECTED_CLAIMS,
+        )
+        if rejected_values is None:
+            return _result(task_type, None, [_finding("schema_invalid")])
         context_private = ()
         injection_sources = ()
 
@@ -1067,7 +1208,7 @@ def verify_cover_letter(
     if context is None:
         injection_sources = (
             tuple(item.summary for item in records),
-            rejected,
+            rejected_values,
             normalized_private,
         )
 
@@ -1080,11 +1221,13 @@ def verify_cover_letter(
     metric_supported = all(
         _metric_supported(sentence, resolved) for sentence in factual_sentences
     )
+    material_cache: dict[str, tuple[str, ...] | None] = {}
     rejected_echo, private_echo = _blocked_material(
         output.plain_text,
         records,
         rejected,
         normalized_private + context_private,
+        material_cache,
     )
     if rejected_echo:
         findings.append(_finding("unsupported_claim"))
@@ -1174,6 +1317,7 @@ def verify_claim_review(
         )
 
     findings: list[VerifierFinding] = []
+    material_cache: dict[str, tuple[str, ...] | None] = {}
     for index, decision in enumerate(output.decisions):
         claim = claims_by_id[decision.claim_id]
         resolved, reference_findings = _resolve_evidence(
@@ -1213,6 +1357,7 @@ def verify_claim_review(
             records,
             rejected_claims,
             private_claims,
+            material_cache,
         )
         if reason_rejected:
             findings.append(
@@ -1222,7 +1367,11 @@ def verify_claim_review(
             findings.append(
                 _finding("private_claim", item_index=index, claim_id=claim.id)
             )
-        unsupported_reason = _unsupported_reason_statement(decision.reason, resolved)
+        unsupported_reason = _unsupported_reason_statement(
+            decision.reason,
+            resolved,
+            decision.decision,
+        )
         if unsupported_reason is None:
             return _result(task_type, None, [_finding("schema_invalid")])
         if unsupported_reason:
