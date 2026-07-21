@@ -1,4 +1,4 @@
-import { FormEvent, useCallback, useEffect, useMemo, useState } from "react";
+import { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import {
   ApplicationRecord,
@@ -61,21 +61,41 @@ export default function App() {
   const [busy, setBusy] = useState("");
   const [actionError, setActionError] = useState("");
   const [listError, setListError] = useState("");
+  const listController = useRef<AbortController | null>(null);
+  const listGeneration = useRef(0);
   const { packet, loading: packetLoading, error: packetError, reload: reloadPacket } = useApplicationPacket(selectedId);
 
-  useEffect(() => {
+  const loadApplications = useCallback(async (failureMessage: string) => {
+    listController.current?.abort();
     const controller = new AbortController();
-    listApplications(controller.signal)
-      .then((records) => {
-        if (controller.signal.aborted) return;
+    const requestGeneration = ++listGeneration.current;
+    listController.current = controller;
+    try {
+      const records = await listApplications(controller.signal);
+      if (requestGeneration === listGeneration.current && !controller.signal.aborted) {
         setApplications(records);
-        setSelectedId(records[0]?.id ?? null);
-      })
-      .catch((loadError: unknown) => {
-        if (!controller.signal.aborted) setListError(errorMessage(loadError, "Applications could not be loaded."));
-      });
-    return () => controller.abort();
+        setListError("");
+        setSelectedId((current) => {
+          if (current && records.some((application) => application.id === current)) return current;
+          return records[0]?.id ?? null;
+        });
+        return records;
+      }
+    } catch (loadError) {
+      if (requestGeneration === listGeneration.current && !controller.signal.aborted) {
+        setListError(errorMessage(loadError, failureMessage));
+      }
+    }
+    return null;
   }, []);
+
+  useEffect(() => {
+    void loadApplications("Applications could not be loaded.");
+    return () => {
+      listGeneration.current += 1;
+      listController.current?.abort();
+    };
+  }, [loadApplications]);
 
   const selected = useMemo(
     () => applications.find((application) => application.id === selectedId) ?? null,
@@ -83,19 +103,11 @@ export default function App() {
   );
 
   const refreshData = useCallback(async () => {
-    const [applicationResult] = await Promise.allSettled([listApplications(), reloadPacket()]);
-    if (applicationResult.status === "fulfilled") {
-      const records = applicationResult.value;
-      setApplications(records);
-      setListError("");
-      setSelectedId((current) => {
-        if (current && records.some((application) => application.id === current)) return current;
-        return records[0]?.id ?? null;
-      });
-    } else {
-      setListError(errorMessage(applicationResult.reason, "Applications could not be refreshed."));
-    }
-  }, [reloadPacket]);
+    await Promise.allSettled([
+      loadApplications("Applications could not be refreshed."),
+      reloadPacket()
+    ]);
+  }, [loadApplications, reloadPacket]);
 
   function selectApplication(applicationId: string) {
     setSelectedId(applicationId);
@@ -112,22 +124,27 @@ export default function App() {
       return;
     }
     setBusy("Saving application");
+    let created: ApplicationRecord;
     try {
-      const created = await createApplication({
+      created = await createApplication({
         company: form.company.trim(),
         role_title: form.role_title.trim(),
         location: form.location.trim() || "Unknown",
         source_url: form.source_url.trim(),
         jd_text: form.jd_text.trim()
       });
-      setApplications((current) => [created, ...current.filter((item) => item.id !== created.id)]);
-      setSelectedId(created.id);
-      setShowForm(false);
-      setForm(emptyForm);
-      const records = await listApplications();
-      setApplications(records);
     } catch (saveError) {
       setActionError(errorMessage(saveError, "Save application failed."));
+      setBusy("");
+      return;
+    }
+
+    setApplications((current) => [created, ...current.filter((item) => item.id !== created.id)]);
+    setSelectedId(created.id);
+    setShowForm(false);
+    setForm(emptyForm);
+    try {
+      await loadApplications("Application saved, but applications could not be refreshed.");
     } finally {
       setBusy("");
     }
@@ -209,6 +226,14 @@ export default function App() {
   }
 
   const reviewError = actionError || packetError || listError;
+  const packetReadOnly = Boolean(
+    packet && (
+      packet.approval ||
+      packet.application.status === "approved" ||
+      packet.application.status === "submitted_manual" ||
+      packet.application.submission_state !== "not_submitted"
+    )
+  );
 
   return (
     <main className="app-shell" aria-busy={busy !== ""}>
@@ -259,6 +284,7 @@ export default function App() {
           <AiTasksPanel
             applicationId={selectedId}
             initialTask={packet.latest_ai_task}
+            readOnly={packetReadOnly}
             onPacketChanged={refreshData}
           />
         )}

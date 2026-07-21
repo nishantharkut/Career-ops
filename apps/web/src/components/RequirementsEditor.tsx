@@ -4,6 +4,13 @@ import { Check, FilePlus2, X } from "lucide-react";
 import { JsonValue, RequirementsRecord, getRequirements, updateRequirements } from "../api";
 
 type CorrectionKind = "text" | "number" | "boolean" | "list" | "unknown" | "preserve" | "remove";
+type ListItemKind = "text" | "number" | "boolean" | "unknown";
+
+type ListItemRow = {
+  id: number;
+  kind: ListItemKind;
+  value: string;
+};
 
 type CorrectionRow = {
   id: number;
@@ -12,6 +19,7 @@ type CorrectionRow = {
   key: string;
   value: string;
   kind: CorrectionKind;
+  listItems: ListItemRow[];
   dirty: boolean;
 };
 
@@ -44,9 +52,24 @@ function kindFor(value: JsonValue): CorrectionKind {
 function inputValue(value: JsonValue): string {
   if (value === null) return "";
   if (typeof value === "boolean") return value ? "yes" : "no";
-  if (isPrimitiveList(value)) return value.map((item) => item === null ? "Unknown" : String(item)).join(", ");
   if (typeof value !== "object") return String(value);
   return "";
+}
+
+function listItemKind(value: string | number | boolean | null): ListItemKind {
+  if (value === null) return "unknown";
+  if (typeof value === "number") return "number";
+  if (typeof value === "boolean") return "boolean";
+  return "text";
+}
+
+function listItemsFrom(value: JsonValue, nextId: () => number): ListItemRow[] {
+  if (!isPrimitiveList(value)) return [];
+  return value.map((item) => ({
+    id: nextId(),
+    kind: listItemKind(item),
+    value: item === null ? "" : typeof item === "boolean" ? (item ? "yes" : "no") : String(item)
+  }));
 }
 
 function rowsFrom(requirements: RequirementsRecord, nextId: () => number): CorrectionRow[] {
@@ -57,6 +80,7 @@ function rowsFrom(requirements: RequirementsRecord, nextId: () => number): Corre
     key,
     value: inputValue(value),
     kind: kindFor(value),
+    listItems: listItemsFrom(value, nextId),
     dirty: false
   }));
 }
@@ -97,9 +121,20 @@ function valueForRow(row: CorrectionRow): JsonValue {
     return value;
   }
   if (row.kind === "list") {
-    const values = row.value.split(/[\n,]/).map((item) => item.trim()).filter(Boolean);
-    if (values.length === 0) throw new Error(`Enter at least one list item for ${row.key.trim() || "this correction"}.`);
-    return values;
+    const key = row.key.trim() || "this correction";
+    if (row.listItems.length === 0) throw new Error(`Enter at least one list item for ${key}.`);
+    return row.listItems.map((item, index) => {
+      if (item.kind === "unknown") return null;
+      if (item.kind === "boolean") return item.value === "yes";
+      if (item.kind === "number") {
+        if (!item.value.trim() || !Number.isFinite(Number(item.value))) {
+          throw new Error(`Enter a valid number for list item ${index + 1} in ${key}.`);
+        }
+        return Number(item.value);
+      }
+      if (!item.value) throw new Error(`Enter a value for list item ${index + 1} in ${key}.`);
+      return item.value;
+    });
   }
   return row.value;
 }
@@ -145,6 +180,28 @@ export default function RequirementsEditor({ applicationId, readOnly, onMutated 
 
   function updateRow(rowId: number, changes: Partial<CorrectionRow>) {
     setRows((current) => current.map((row) => row.id === rowId ? { ...row, ...changes, dirty: true } : row));
+  }
+
+  function changeRowKind(row: CorrectionRow, kind: CorrectionKind) {
+    const listItems = kind === "list" && row.listItems.length === 0
+      ? [{ id: newId(), kind: "text" as const, value: row.value }]
+      : row.listItems;
+    updateRow(row.id, { kind, listItems });
+  }
+
+  function updateListItem(rowId: number, itemId: number, changes: Partial<ListItemRow>) {
+    setRows((current) => current.map((row) => row.id === rowId ? {
+      ...row,
+      dirty: true,
+      listItems: row.listItems.map((item) => item.id === itemId ? { ...item, ...changes } : item)
+    } : row));
+  }
+
+  function changeListItemKind(rowId: number, item: ListItemRow, kind: ListItemKind) {
+    updateListItem(rowId, item.id, {
+      kind,
+      value: kind === "boolean" ? (item.value === "no" ? "no" : "yes") : kind === "unknown" ? "" : item.value
+    });
   }
 
   function removeRow(row: CorrectionRow) {
@@ -235,7 +292,7 @@ export default function RequirementsEditor({ applicationId, readOnly, onMutated 
               {`Correction kind for ${row.key || `row ${index + 1}`}`}
               <select
                 value={row.kind}
-                onChange={(event) => updateRow(row.id, { kind: event.target.value as CorrectionKind })}
+                onChange={(event) => changeRowKind(row, event.target.value as CorrectionKind)}
               >
                 <option value="text">Text</option>
                 <option value="number">Number</option>
@@ -246,7 +303,62 @@ export default function RequirementsEditor({ applicationId, readOnly, onMutated 
                 <option value="remove">Remove</option>
               </select>
             </label>
-            {row.kind === "boolean" ? (
+            {row.kind === "list" ? (
+              <div aria-label={`List items for ${row.key || `row ${index + 1}`}`}>
+                {row.listItems.map((item, itemIndex) => (
+                  <div key={item.id}>
+                    <label>
+                      {`List item ${itemIndex + 1} kind for ${row.key || `row ${index + 1}`}`}
+                      <select
+                        value={item.kind}
+                        onChange={(event) => changeListItemKind(row.id, item, event.target.value as ListItemKind)}
+                      >
+                        <option value="text">Text</option>
+                        <option value="number">Number</option>
+                        <option value="boolean">Yes or no</option>
+                        <option value="unknown">Unknown</option>
+                      </select>
+                    </label>
+                    {item.kind === "boolean" ? (
+                      <label>
+                        {`List item ${itemIndex + 1} value for ${row.key || `row ${index + 1}`}`}
+                        <select value={item.value} onChange={(event) => updateListItem(row.id, item.id, { value: event.target.value })}>
+                          <option value="yes">Yes</option>
+                          <option value="no">No</option>
+                        </select>
+                      </label>
+                    ) : item.kind === "unknown" ? (
+                      <p>List item {itemIndex + 1} is Unknown.</p>
+                    ) : (
+                      <label>
+                        {`List item ${itemIndex + 1} value for ${row.key || `row ${index + 1}`}`}
+                        <input
+                          type={item.kind === "number" ? "number" : "text"}
+                          value={item.value}
+                          onChange={(event) => updateListItem(row.id, item.id, { value: event.target.value })}
+                        />
+                      </label>
+                    )}
+                    <button
+                      type="button"
+                      className="secondary"
+                      onClick={() => updateRow(row.id, { listItems: row.listItems.filter((candidate) => candidate.id !== item.id) })}
+                    >
+                      <X aria-hidden="true" size={16} /> Remove list item {itemIndex + 1}
+                    </button>
+                  </div>
+                ))}
+                <button
+                  type="button"
+                  className="secondary"
+                  onClick={() => updateRow(row.id, {
+                    listItems: [...row.listItems, { id: newId(), kind: "text", value: "" }]
+                  })}
+                >
+                  <FilePlus2 aria-hidden="true" size={16} /> Add list item for {row.key || `row ${index + 1}`}
+                </button>
+              </div>
+            ) : row.kind === "boolean" ? (
               <label>
                 {`Correction value for ${row.key || `row ${index + 1}`}`}
                 <select value={row.value} onChange={(event) => updateRow(row.id, { value: event.target.value })}>
@@ -254,13 +366,12 @@ export default function RequirementsEditor({ applicationId, readOnly, onMutated 
                   <option value="no">No</option>
                 </select>
               </label>
-            ) : ["text", "number", "list"].includes(row.kind) ? (
+            ) : ["text", "number"].includes(row.kind) ? (
               <label>
                 {`Correction value for ${row.key || `row ${index + 1}`}`}
                 <input
                   type={row.kind === "number" ? "number" : "text"}
                   value={row.value}
-                  placeholder={row.kind === "list" ? "Comma-separated values" : undefined}
                   onChange={(event) => updateRow(row.id, { value: event.target.value })}
                 />
               </label>
@@ -288,6 +399,7 @@ export default function RequirementsEditor({ applicationId, readOnly, onMutated 
               key: "",
               value: "",
               kind: "text",
+              listItems: [],
               dirty: true
             }])}
           >

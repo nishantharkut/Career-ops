@@ -12,6 +12,7 @@ type FindingsPanelProps = {
   applicationId: string;
   task: AiTaskRecord;
   findings: AiFindingRecord[];
+  readOnly: boolean;
   onFindingUpdated: (finding: AiFindingRecord) => void;
   onPacketChanged: () => Promise<void> | void;
 };
@@ -33,6 +34,7 @@ export default function FindingsPanel({
   applicationId,
   task,
   findings,
+  readOnly,
   onFindingUpdated,
   onPacketChanged
 }: FindingsPanelProps) {
@@ -45,11 +47,13 @@ export default function FindingsPanel({
     .filter((finding) => isDraftEligible(finding) && finding.decision === "accepted")
     .map((finding) => finding.id);
   const canCreateDraft =
+    !readOnly &&
     task.status === "completed" &&
     task.task_type === "suggest_resume_edits" &&
     acceptedFindingIds.length > 0;
 
   async function decide(finding: AiFindingRecord, decision: "accepted" | "rejected") {
+    if (readOnly) return;
     setBusy(finding.id);
     setError("");
     setNotice("");
@@ -71,7 +75,7 @@ export default function FindingsPanel({
       setError("Draft name is required.");
       return;
     }
-    if (!canCreateDraft) return;
+    if (readOnly || !canCreateDraft) return;
     setBusy("draft");
     try {
       await createResumeDraft(applicationId, {
@@ -116,7 +120,7 @@ export default function FindingsPanel({
                   <div className="actions">
                     <button
                       type="button"
-                      disabled={busy !== ""}
+                      disabled={readOnly || busy !== ""}
                       onClick={() => void decide(finding, "accepted")}
                     >
                       <Check aria-hidden="true" size={16} /> {resumeSuggestion ? "Accept suggestion" : "Accept"}
@@ -124,7 +128,7 @@ export default function FindingsPanel({
                     <button
                       type="button"
                       className="secondary"
-                      disabled={busy !== ""}
+                      disabled={readOnly || busy !== ""}
                       onClick={() => void decide(finding, "rejected")}
                     >
                       <X aria-hidden="true" size={16} /> {resumeSuggestion ? "Reject suggestion" : "Reject"}
@@ -142,7 +146,7 @@ export default function FindingsPanel({
         <form className="resume-form" onSubmit={createDraft}>
           <label>
             Draft name
-            <input value={draftName} onChange={(event) => setDraftName(event.target.value)} />
+            <input disabled={readOnly} value={draftName} onChange={(event) => setDraftName(event.target.value)} />
           </label>
           <button type="submit" disabled={!canCreateDraft || busy !== ""}>
             <FilePlus2 aria-hidden="true" size={16} /> Create resume draft

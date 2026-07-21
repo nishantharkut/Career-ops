@@ -1,9 +1,9 @@
-import { act, render, screen, waitFor } from "@testing-library/react";
+import { act, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, test, vi } from "vitest";
 
 import App, { statusLabel } from "./App";
-import type { ApplicationPacket, ApplicationRecord, EvidenceRecord, JsonValue, RequirementsRecord } from "./api";
+import type { ApplicationPacket, ApplicationRecord, EvidenceRecord, JsonValue, ReportRecord, RequirementsRecord } from "./api";
 import ReviewPanel from "./components/ReviewPanel";
 
 const application = (id: string, company: string): ApplicationRecord => ({
@@ -256,9 +256,11 @@ describe("Application Desk UI", () => {
     await userEvent.type(screen.getByLabelText("Correction key 3"), "skills");
     await userEvent.selectOptions(screen.getByLabelText("Correction kind for skills"), "list");
     await userEvent.click(screen.getByRole("button", { name: "Save corrections" }));
-    expect(screen.getByRole("alert")).toHaveTextContent("Enter at least one list item for skills.");
+    expect(screen.getByRole("alert")).toHaveTextContent("Enter a value for list item 1 in skills.");
 
-    await userEvent.type(screen.getByLabelText("Correction value for skills"), "Python, Rust");
+    await userEvent.type(screen.getByLabelText("List item 1 value for skills"), "Python");
+    await userEvent.click(screen.getByRole("button", { name: "Add list item for skills" }));
+    await userEvent.type(screen.getByLabelText("List item 2 value for skills"), "Rust");
     await userEvent.click(screen.getByRole("button", { name: "Save corrections" }));
 
     expect(await screen.findByText("Requirements saved.")).toBeInTheDocument();
@@ -267,6 +269,59 @@ describe("Application Desk UI", () => {
         location: 3,
         compensation: { currency: "INR", bands: [10, 20] },
         skills: ["Python", "Rust"]
+      }
+    });
+  });
+
+  test("edits and renames mixed typed lists without losing commas or unknown values", async () => {
+    const record = application("app_1", "Swiggy");
+    let requirements: RequirementsRecord = {
+      raw_ai: {},
+      deterministic: {},
+      user_corrected: {
+        mixed: [1, true, null, "a,b"],
+        opaque_key: { nested: ["leave", 7] }
+      },
+      uncertainty: { compensation: null }
+    };
+    let savedBody: unknown;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = String(input);
+        if (url.endsWith("/applications")) return jsonResponse([record]);
+        if (url.endsWith("/applications/app_1/packet")) return jsonResponse(packet(record));
+        if (url.endsWith("/ai/providers")) return jsonResponse([]);
+        if (url.endsWith("/applications/app_1/requirements") && init?.method === "PUT") {
+          savedBody = JSON.parse(String(init.body));
+          requirements = { ...requirements, ...(savedBody as { user_corrected: Record<string, JsonValue> }) };
+          return jsonResponse(requirements);
+        }
+        if (url.endsWith("/applications/app_1/requirements")) return jsonResponse(requirements);
+        throw new Error(`Unhandled request: ${url}`);
+      })
+    );
+    render(<App />);
+
+    await userEvent.click(await screen.findByRole("tab", { name: "Requirements" }));
+    const key = await screen.findByLabelText("Correction key 1");
+    await userEvent.clear(key);
+    await userEvent.type(key, "renamed_mixed");
+    expect(screen.getByLabelText("List item 1 kind for renamed_mixed")).toHaveValue("number");
+    expect(screen.getByLabelText("List item 2 kind for renamed_mixed")).toHaveValue("boolean");
+    expect(screen.getByLabelText("List item 3 kind for renamed_mixed")).toHaveValue("unknown");
+    expect(screen.getByLabelText("List item 4 value for renamed_mixed")).toHaveValue("a,b");
+    await userEvent.clear(screen.getByLabelText("List item 1 value for renamed_mixed"));
+    await userEvent.type(screen.getByLabelText("List item 1 value for renamed_mixed"), "2");
+    await userEvent.selectOptions(screen.getByLabelText("List item 2 value for renamed_mixed"), "no");
+    await userEvent.type(screen.getByLabelText("List item 4 value for renamed_mixed"), " updated");
+    await userEvent.click(screen.getByRole("button", { name: "Save corrections" }));
+
+    expect(await screen.findByText("Requirements saved.")).toBeInTheDocument();
+    expect(savedBody).toEqual({
+      user_corrected: {
+        renamed_mixed: [2, false, null, "a,b updated"],
+        opaque_key: { nested: ["leave", 7] }
       }
     });
   });
@@ -411,6 +466,167 @@ describe("Application Desk UI", () => {
 
     await userEvent.click(screen.getByRole("button", { name: "Export JD" }));
     expect(await screen.findByRole("alert")).toHaveTextContent("Approval artifact is stale.");
+  });
+
+  test("renders deterministic warning objects and AI warning strings without blank rows", () => {
+    const report: ReportRecord = {
+      id: "rpt_1",
+      application_id: "app_1",
+      resume_version_id: "res_1",
+      jd_snapshot_id: "jd_1",
+      blocking_issue_count: 0,
+      warning_count: 2,
+      fit: {},
+      risks: {
+        blockers: [],
+        warnings: [
+          { severity: "warning", label: "Keyword gap", source: "resume", why: "Kubernetes is absent", next_action: "Add it only with evidence" },
+          "AI review: clarify ownership of the migration"
+        ]
+      },
+      created_at: ""
+    };
+    render(
+      <ReviewPanel
+        applicationId="app_1"
+        resume={null}
+        report={report}
+        approval={null}
+        submitted={false}
+        busy=""
+        error=""
+        onApprove={vi.fn()}
+        onSubmitted={vi.fn()}
+      />
+    );
+
+    const warningList = screen.getByRole("list");
+    expect(within(warningList).getAllByRole("listitem")).toHaveLength(2);
+    expect(within(warningList).getByText("Keyword gap")).toBeInTheDocument();
+    expect(within(warningList).getByText("Kubernetes is absent")).toBeInTheDocument();
+    expect(within(warningList).getByText("Add it only with evidence")).toBeInTheDocument();
+    expect(within(warningList).getByText("AI review: clarify ownership of the migration")).toBeInTheDocument();
+  });
+
+  test.each([
+    ["approved", "not_submitted"],
+    ["submitted_manual", "submitted_manual"]
+  ])("keeps AI and finding mutations read-only for %s applications", async (status, submissionState) => {
+    const record = {
+      ...application("app_1", "Swiggy"),
+      status,
+      submission_state: submissionState,
+      approval_id: status === "approved" ? "apr_1" : null
+    };
+    const completedTask = {
+      id: "ait_1",
+      application_id: "app_1",
+      task_type: "review_claims" as const,
+      provider_config_id: "provider_1",
+      prompt_template_id: "claims_v1",
+      prompt_sha256: "checksum",
+      input_artifact_ids: [],
+      status: "completed" as const,
+      privacy_mode: "local_private",
+      started_at: "",
+      completed_at: "",
+      error_summary: "",
+      created_at: "",
+      updated_at: ""
+    };
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL) => {
+        const url = String(input);
+        if (url.endsWith("/applications")) return jsonResponse([record]);
+        if (url.endsWith("/applications/app_1/packet")) return jsonResponse(packet(record, { latest_ai_task: completedTask }));
+        if (url.endsWith("/ai/providers")) return jsonResponse([]);
+        if (url.endsWith("/ai-tasks/ait_1/findings")) {
+          return jsonResponse([{ id: "aif_1", task_id: "ait_1", finding_type: "claim_review_decision", severity: "warning", claim_text: "Supported claim", evidence_item_id: "evd_1", recommendation: "Keep", verifier_state: "verified", decision: "pending", payload: {}, created_at: "", updated_at: "" }]);
+        }
+        throw new Error(`Unhandled request: ${url}`);
+      })
+    );
+    render(<App />);
+
+    expect(await screen.findByRole("button", { name: "Run AI review" })).toBeDisabled();
+    expect(await screen.findByRole("button", { name: "Accept" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Reject" })).toBeDisabled();
+  });
+
+  test("ignores an older application list that resolves after post-create refresh", async () => {
+    const stale = application("app_old", "Old Co");
+    const created = application("app_new", "New Co");
+    let resolveInitial!: (value: ReturnType<typeof jsonResponse>) => void;
+    const initial = new Promise<ReturnType<typeof jsonResponse>>((resolve) => {
+      resolveInitial = resolve;
+    });
+    let listCalls = 0;
+    let initialSignal: AbortSignal | undefined;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = String(input);
+        if (url.endsWith("/applications") && init?.method === "POST") return jsonResponse(created, true, 201);
+        if (url.endsWith("/applications")) {
+          listCalls += 1;
+          if (listCalls === 1) {
+            initialSignal = init?.signal ?? undefined;
+            return initial;
+          }
+          return jsonResponse([created]);
+        }
+        if (url.endsWith("/applications/app_new/packet")) return jsonResponse(packet(created));
+        if (url.endsWith("/applications/app_old/packet")) return jsonResponse(packet(stale));
+        if (url.endsWith("/ai/providers")) return jsonResponse([]);
+        throw new Error(`Unhandled request: ${url}`);
+      })
+    );
+    render(<App />);
+
+    await userEvent.click(screen.getByRole("button", { name: "Add application" }));
+    await userEvent.type(screen.getByLabelText("Company"), "New Co");
+    await userEvent.type(screen.getByLabelText("Role title"), "Engineer");
+    await userEvent.type(screen.getByLabelText("JD text"), "Build systems");
+    await userEvent.click(screen.getByRole("button", { name: "Save application" }));
+    expect(await screen.findByRole("heading", { name: "New Co" })).toBeInTheDocument();
+    expect(initialSignal?.aborted).toBe(true);
+
+    await act(async () => resolveInitial(jsonResponse([stale])));
+    expect(screen.getByRole("heading", { name: "New Co" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /Old Co/ })).not.toBeInTheDocument();
+  });
+
+  test("reports post-create list refresh failure separately from create failure", async () => {
+    const created = application("app_new", "New Co");
+    let listCalls = 0;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = String(input);
+        if (url.endsWith("/applications") && init?.method === "POST") return jsonResponse(created, true, 201);
+        if (url.endsWith("/applications")) {
+          listCalls += 1;
+          if (listCalls === 1) return jsonResponse([]);
+          throw "offline";
+        }
+        if (url.endsWith("/applications/app_new/packet")) return jsonResponse(packet(created));
+        if (url.endsWith("/ai/providers")) return jsonResponse([]);
+        throw new Error(`Unhandled request: ${url}`);
+      })
+    );
+    render(<App />);
+
+    await screen.findByText("No applications yet. Add a JD to start a packet.");
+    await userEvent.click(screen.getByRole("button", { name: "Add application" }));
+    await userEvent.type(screen.getByLabelText("Company"), "New Co");
+    await userEvent.type(screen.getByLabelText("Role title"), "Engineer");
+    await userEvent.type(screen.getByLabelText("JD text"), "Build systems");
+    await userEvent.click(screen.getByRole("button", { name: "Save application" }));
+
+    expect(await screen.findByRole("alert")).toHaveTextContent("Application saved, but applications could not be refreshed.");
+    expect(screen.queryByText("Save application failed.")).not.toBeInTheDocument();
+    expect(screen.getAllByRole("alert")).toHaveLength(1);
   });
 
   test("a stale packet response cannot replace the current application", async () => {

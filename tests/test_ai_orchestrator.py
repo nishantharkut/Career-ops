@@ -433,6 +433,42 @@ def test_enqueue_persists_pending_task_without_running_provider(tmp_path: Path):
     assert provider.calls == 0
 
 
+@pytest.mark.parametrize("submitted", [False, True], ids=["approved", "submitted"])
+def test_enqueue_rejects_read_only_application_before_provider_access(
+    tmp_path: Path, submitted: bool
+):
+    from careerops.ai.orchestrator import AiOrchestrator
+
+    repo = make_repo(tmp_path)
+    application = create_application(repo)
+    resume = select_resume(repo, application.id)
+    report = repo.save_report(
+        application_id=application.id,
+        resume_version_id=resume.id,
+        jd_snapshot_id=application.jd_snapshot_id,
+        fit={"score": 100},
+        risks={"blockers": [], "warnings": []},
+    )
+    repo.approve_application(application.id, report.id, "Reviewed")
+    if submitted:
+        repo.mark_submitted_manual(application.id, "Submitted")
+    config = create_provider_config(repo)
+
+    class ProviderMustNotBeConsulted:
+        def availability(self):
+            raise AssertionError("read-only enqueue must not inspect the provider")
+
+        def run(self, _request):
+            raise AssertionError("read-only enqueue must not invoke the provider")
+
+    orchestrator = AiOrchestrator(repo, {config.id: ProviderMustNotBeConsulted()})
+
+    with pytest.raises(ValueError, match="read-only"):
+        orchestrator.enqueue(application.id, "analyze_jd", config.id)
+
+    assert repo.list_ai_tasks(application.id) == []
+
+
 def test_heartbeat_setup_failure_fails_exact_claim_without_invoking_provider(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
@@ -1104,8 +1140,6 @@ def test_provider_failure_never_falls_back_or_mutates_application(tmp_path: Path
         fit={"score": 100},
         risks={"blockers": [], "warnings": []},
     )
-    repo.approve_application(application.id, original_report.id, "Reviewed")
-    repo.mark_submitted_manual(application.id, "Submitted")
     before_application = repo.get_application(application.id)
     before_jd = repo.get_jd_snapshot(application.jd_snapshot_id)
     before_report = repo.get_report(original_report.id)
@@ -1813,7 +1847,7 @@ def test_analyze_jd_invalidates_stale_fit_report_atomically(tmp_path: Path):
         repo.approve_application(application.id, report.id, "Reviewed")
 
 
-def test_analyze_jd_cannot_mutate_an_approved_packet(tmp_path: Path):
+def test_analyze_jd_cannot_enqueue_for_an_approved_packet(tmp_path: Path):
     from careerops.ai.orchestrator import AiOrchestrator
 
     repo = make_repo(tmp_path)
@@ -1832,12 +1866,12 @@ def test_analyze_jd_cannot_mutate_an_approved_packet(tmp_path: Path):
     config = create_provider_config(repo)
     provider = ScriptedProvider(availability())
     orchestrator = AiOrchestrator(repo, {config.id: provider})
-    task = orchestrator.enqueue(application.id, "analyze_jd", config.id)
 
-    result = orchestrator.run(task.id)
+    with pytest.raises(ValueError, match="read-only"):
+        orchestrator.enqueue(application.id, "analyze_jd", config.id)
 
-    assert result.status == "failed"
-    assert provider.calls == 1
+    assert provider.calls == 0
+    assert repo.list_ai_tasks(application.id) == []
     assert repo.get_application(application.id) == before_application
     assert repo.get_jd_snapshot(application.jd_snapshot_id) == before_jd
     assert repo.list_application_versions(application.id) == []

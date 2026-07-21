@@ -202,6 +202,52 @@ describe("AI tasks panel", () => {
     expect(gets).toBe(2);
   });
 
+  test("keeps polling when packet refresh persists the same pending task", async () => {
+    const pending = task({ status: "pending", completed_at: null });
+    let gets = 0;
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.endsWith("/ai/providers")) {
+        return jsonResponse([provider({ privacy_mode: "local_private", data_leaves_machine: false })]);
+      }
+      if (url.endsWith("/applications/app_1/ai-tasks")) return jsonResponse(pending, true, 202);
+      if (url.endsWith("/ai-tasks/ait_1")) {
+        gets += 1;
+        return jsonResponse(task({ status: "completed" }));
+      }
+      if (url.endsWith("/ai-tasks/ait_1/findings")) return jsonResponse([]);
+      throw new Error(`Unhandled request: ${url}`);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    let finishPacketRefresh!: () => void;
+    const packetRefresh = new Promise<void>((resolve) => {
+      finishPacketRefresh = resolve;
+    });
+    const onPacketChanged = vi.fn(() => packetRefresh);
+    const view = render(
+      <AiTasksPanel applicationId="app_1" initialTask={null} onPacketChanged={onPacketChanged} />
+    );
+
+    const runButton = await screen.findByRole("button", { name: "Run AI review" });
+    vi.useFakeTimers();
+    await act(async () => {
+      fireEvent.click(runButton);
+      await vi.advanceTimersByTimeAsync(0);
+    });
+    expect(screen.getByText("Pending")).toBeInTheDocument();
+    view.rerender(
+      <AiTasksPanel applicationId="app_1" initialTask={pending} onPacketChanged={onPacketChanged} />
+    );
+    await act(async () => {
+      finishPacketRefresh();
+      await packetRefresh;
+    });
+    await act(async () => vi.advanceTimersByTimeAsync(1500));
+
+    expect(gets).toBe(1);
+    expect(screen.getByText("Completed")).toBeInTheDocument();
+  });
+
   test("retries a transient poll failure, clears the error, and stops at terminal", async () => {
     let gets = 0;
     const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
@@ -296,6 +342,40 @@ describe("AI tasks panel", () => {
     expect(await screen.findByText("Decision: accepted")).toBeInTheDocument();
   });
 
+  test("disables AI task, finding decision, and draft controls when read-only", async () => {
+    const completed = task({ task_type: "suggest_resume_edits", status: "completed" });
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.endsWith("/ai/providers")) return jsonResponse([provider({ identity_name: "codex2" })]);
+      if (url.endsWith("/ai-tasks/ait_1/findings")) {
+        return jsonResponse([
+          { id: "aif_safe", task_id: "ait_1", finding_type: "resume_edit_suggestion", severity: "info", claim_text: "Use verified wording", evidence_item_id: null, recommendation: "Replace it", verifier_state: "verified", decision: "pending", payload: {}, created_at: "", updated_at: "" }
+        ]);
+      }
+      throw new Error(`Unhandled request: ${url}`);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    render(
+      <AiTasksPanel
+        applicationId="app_1"
+        initialTask={completed}
+        readOnly
+        onPacketChanged={vi.fn()}
+      />
+    );
+
+    expect(await screen.findByLabelText("Provider")).toBeDisabled();
+    expect(screen.getByLabelText("Task")).toBeDisabled();
+    expect(screen.getByLabelText("Acknowledge Codex data transfer for this run")).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Run AI review" })).toBeDisabled();
+    expect(await screen.findByRole("button", { name: "Accept suggestion" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Reject suggestion" })).toBeDisabled();
+    expect(screen.getByLabelText("Draft name")).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Create resume draft" })).toBeDisabled();
+    expect(fetchMock.mock.calls.some(([input]) => String(input).includes("/decision"))).toBe(false);
+  });
+
   test("accepts one safe suggestion, blocks unsafe findings, and creates a child draft", async () => {
     const completed = task({ task_type: "suggest_resume_edits", status: "completed", provider_config_id: "provider_selected" });
     let safeDecision = "pending";
@@ -352,11 +432,15 @@ describe("AI tasks panel", () => {
 
     const { rerender } = render(<AiTasksPanel applicationId="app_1" initialTask={task({ status: "blocked", error_summary: "verification_blocked" })} onPacketChanged={vi.fn()} />);
 
-    expect(await screen.findByText(/Provider unavailable: runtime_unavailable/)).toBeInTheDocument();
+    const unavailable = await screen.findByText(/Provider unavailable: runtime_unavailable/);
+    expect(unavailable).toHaveAttribute("role", "status");
+    expect(unavailable).toHaveAttribute("aria-live", "polite");
+    expect(screen.getByLabelText("Provider")).toHaveAttribute("aria-describedby", unavailable.id);
     expect(screen.getByRole("button", { name: "Run AI review" })).toBeDisabled();
     expect(screen.getByText("Blocked")).toBeInTheDocument();
+    expect(screen.getByText("verification_blocked")).toHaveAttribute("role", "alert");
     rerender(<AiTasksPanel applicationId="app_1" initialTask={task({ status: "failed", error_summary: "provider_unavailable" })} onPacketChanged={vi.fn()} />);
     expect(screen.getByText("Failed")).toBeInTheDocument();
-    expect(screen.getByText("provider_unavailable")).toBeInTheDocument();
+    expect(screen.getByText("provider_unavailable")).toHaveAttribute("role", "alert");
   });
 });

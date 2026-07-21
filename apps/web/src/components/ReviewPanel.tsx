@@ -6,6 +6,7 @@ import {
   DownloadedArtifact,
   ReportRecord,
   ResumeRecord,
+  RiskIssue,
   downloadApproval,
   downloadJd,
   downloadReport,
@@ -25,6 +26,11 @@ type ReviewPanelProps = {
 };
 
 type DownloadClient = (applicationId: string) => Promise<DownloadedArtifact>;
+
+function warningHasContent(warning: RiskIssue | string): boolean {
+  if (typeof warning === "string") return warning.trim().length > 0;
+  return [warning.label, warning.why, warning.next_action].some((value) => value.trim().length > 0);
+}
 
 function ExportAction({
   available,
@@ -63,6 +69,7 @@ export default function ReviewPanel({
   const [exportBusy, setExportBusy] = useState("");
   const [exportError, setExportError] = useState("");
   const hasCleanReport = Boolean(report && report.blocking_issue_count === 0);
+  const warnings = report?.risks.warnings.filter(warningHasContent) ?? [];
 
   async function exportArtifact(label: string, download: DownloadClient) {
     if (!applicationId || exportBusy) return;
@@ -109,12 +116,15 @@ export default function ReviewPanel({
               ))}
             </ul>
           )}
-          {report.risks.warnings.length > 0 && (
+          {warnings.length > 0 && (
             <ul className="issue-list">
-              {report.risks.warnings.map((issue, index) => (
-                <li key={`${issue.label}-${issue.source}-${index}`}>
-                  <strong>{issue.label}</strong>
-                  <span>{issue.next_action}</span>
+              {warnings.map((warning, index) => typeof warning === "string" ? (
+                <li key={`ai-warning-${index}`}><span>{warning}</span></li>
+              ) : (
+                <li key={`${warning.label}-${warning.source}-${index}`}>
+                  {warning.label && <strong>{warning.label}</strong>}
+                  {warning.why && <span>{warning.why}</span>}
+                  {warning.next_action && <span>{warning.next_action}</span>}
                 </li>
               ))}
             </ul>

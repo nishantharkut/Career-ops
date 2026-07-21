@@ -1110,6 +1110,15 @@ def test_packet_snapshot_fails_closed_on_broken_aggregate_binding(
         fit={"score": 100},
         risks={"blockers": [], "warnings": []},
     )
+    task = None
+    if mismatch == "task_input_manifest":
+        from careerops.ai.orchestrator import AiOrchestrator
+
+        status = availability()
+        config = create_provider_config(repo, status)
+        task = AiOrchestrator(repo, {config.id: ControlledProvider(status)}).enqueue(
+            application.id, "analyze_jd", config.id
+        )
     approval = repo.approve_application(application.id, report.id, "Reviewed")
     foreign_application = create_application(repo, company="Foreign Corp")
     foreign_resume = select_resume(repo, foreign_application.id)
@@ -1120,15 +1129,6 @@ def test_packet_snapshot_fails_closed_on_broken_aggregate_binding(
         fit={"score": 100},
         risks={"blockers": [], "warnings": []},
     )
-    task = None
-    if mismatch == "task_input_manifest":
-        from careerops.ai.orchestrator import AiOrchestrator
-
-        status = availability()
-        config = create_provider_config(repo, status)
-        task = AiOrchestrator(repo, {config.id: ControlledProvider(status)}).enqueue(
-            application.id, "analyze_jd", config.id
-        )
     with repo.connection() as connection:
         if mismatch == "jd_application":
             connection.execute(

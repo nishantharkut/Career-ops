@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { Play, RefreshCw, ShieldCheck } from "lucide-react";
 
 import {
@@ -16,6 +16,7 @@ import FindingsPanel from "./FindingsPanel";
 type AiTasksPanelProps = {
   applicationId: string;
   initialTask: AiTaskRecord | null;
+  readOnly?: boolean;
   onPacketChanged: () => Promise<void> | void;
 };
 
@@ -56,8 +57,9 @@ function bounded(value: string): string {
   return `${value.slice(0, 16)}...${value.slice(-8)}`;
 }
 
-export default function AiTasksPanel({ applicationId, initialTask, onPacketChanged }: AiTasksPanelProps) {
+export default function AiTasksPanel({ applicationId, initialTask, readOnly = false, onPacketChanged }: AiTasksPanelProps) {
   const [providers, setProviders] = useState<AiProviderRecord[]>([]);
+  const [providersLoaded, setProvidersLoaded] = useState(false);
   const [providerId, setProviderId] = useState("");
   const [taskType, setTaskType] = useState<AiTaskType>("analyze_fit");
   const [acknowledged, setAcknowledged] = useState(false);
@@ -65,7 +67,6 @@ export default function AiTasksPanel({ applicationId, initialTask, onPacketChang
   const [findings, setFindings] = useState<AiFindingRecord[]>([]);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
-  const taskGeneration = useRef(0);
 
   useEffect(() => {
     const controller = new AbortController();
@@ -73,6 +74,7 @@ export default function AiTasksPanel({ applicationId, initialTask, onPacketChang
     listAiProviders(controller.signal)
       .then((loaded) => {
         if (controller.signal.aborted) return;
+        setProvidersLoaded(true);
         setProviders(loaded);
         setProviderId((current) => {
           if (loaded.some((provider) => provider.id === current)) return current;
@@ -81,6 +83,7 @@ export default function AiTasksPanel({ applicationId, initialTask, onPacketChang
       })
       .catch((loadError: unknown) => {
         if (!controller.signal.aborted) {
+          setProvidersLoaded(true);
           setError(loadError instanceof Error ? loadError.message : "Providers could not be loaded.");
         }
       });
@@ -88,7 +91,6 @@ export default function AiTasksPanel({ applicationId, initialTask, onPacketChang
   }, []);
 
   useEffect(() => {
-    taskGeneration.current += 1;
     setActiveTask(initialTask);
     setFindings([]);
     setAcknowledged(false);
@@ -114,7 +116,6 @@ export default function AiTasksPanel({ applicationId, initialTask, onPacketChang
   useEffect(() => {
     if (!activeTask || !["pending", "running"].includes(activeTask.status)) return;
     const expectedTaskId = activeTask.id;
-    const requestGeneration = ++taskGeneration.current;
     let timer: ReturnType<typeof setTimeout> | undefined;
     let disposed = false;
     let controller: AbortController | null = null;
@@ -123,7 +124,7 @@ export default function AiTasksPanel({ applicationId, initialTask, onPacketChang
       controller = new AbortController();
       try {
         const updated = await getAiTask(expectedTaskId, controller.signal);
-        if (disposed || requestGeneration !== taskGeneration.current) return;
+        if (disposed) return;
         setError("");
         setActiveTask(updated);
         if (TERMINAL_STATUSES.has(updated.status)) {
@@ -132,7 +133,7 @@ export default function AiTasksPanel({ applicationId, initialTask, onPacketChang
         }
         timer = setTimeout(() => void poll(), 1500);
       } catch (pollError) {
-        if (!disposed && !controller.signal.aborted && requestGeneration === taskGeneration.current) {
+        if (!disposed && !controller.signal.aborted) {
           setError(pollError instanceof Error ? pollError.message : "Task status could not be refreshed.");
           timer = setTimeout(() => void poll(), 1500);
         }
@@ -145,7 +146,7 @@ export default function AiTasksPanel({ applicationId, initialTask, onPacketChang
       if (timer) clearTimeout(timer);
       controller?.abort();
     };
-  }, [activeTask?.id, activeTask?.status, onPacketChanged]);
+  }, [activeTask?.id, activeTask?.status, applicationId, onPacketChanged]);
 
   const selectedProvider = useMemo(
     () => providers.find((provider) => provider.id === providerId) ?? null,
@@ -159,11 +160,17 @@ export default function AiTasksPanel({ applicationId, initialTask, onPacketChang
     selectedProvider?.provider_kind === "codex" && selectedProvider.privacy_mode === "cloud_external";
   const providerUnavailable =
     !selectedProvider || !selectedProvider.enabled || !selectedProvider.available;
+  const unavailableReason = !selectedProvider
+    ? "no providers configured"
+    : selectedProvider.enabled
+      ? selectedProvider.availability_detail
+      : "disabled";
+  const unavailableReasonId = `provider-unavailable-${applicationId}`;
   const taskInProgress = activeTask?.status === "pending" || activeTask?.status === "running";
-  const runDisabled = busy || taskInProgress || providerUnavailable || (cloudCodex && !acknowledged);
+  const runDisabled = readOnly || busy || taskInProgress || providerUnavailable || (cloudCodex && !acknowledged);
 
   async function runTask() {
-    if (!selectedProvider || runDisabled) return;
+    if (readOnly || !selectedProvider || runDisabled) return;
     setBusy(true);
     setError("");
     setFindings([]);
@@ -192,6 +199,8 @@ export default function AiTasksPanel({ applicationId, initialTask, onPacketChang
         Provider
         <select
           value={providerId}
+          disabled={readOnly}
+          aria-describedby={providersLoaded && providerUnavailable ? unavailableReasonId : undefined}
           onChange={(event) => {
             setProviderId(event.target.value);
             setAcknowledged(false);
@@ -209,6 +218,7 @@ export default function AiTasksPanel({ applicationId, initialTask, onPacketChang
         Task
         <select
           value={taskType}
+          disabled={readOnly}
           onChange={(event) => {
             setTaskType(event.target.value as AiTaskType);
             setAcknowledged(false);
@@ -218,9 +228,9 @@ export default function AiTasksPanel({ applicationId, initialTask, onPacketChang
         </select>
       </label>
 
-      {selectedProvider && providerUnavailable && (
-        <p className="error">
-          Provider unavailable: {selectedProvider.enabled ? selectedProvider.availability_detail : "disabled"}
+      {providersLoaded && providerUnavailable && (
+        <p id={unavailableReasonId} className="error" role="status" aria-live="polite">
+          Provider unavailable: {unavailableReason}
         </p>
       )}
       {cloudCodex && (
@@ -230,6 +240,7 @@ export default function AiTasksPanel({ applicationId, initialTask, onPacketChang
             <input
               type="checkbox"
               checked={acknowledged}
+              disabled={readOnly}
               onChange={(event) => setAcknowledged(event.target.checked)}
             />
             Acknowledge Codex data transfer for this run
@@ -252,7 +263,7 @@ export default function AiTasksPanel({ applicationId, initialTask, onPacketChang
         <section aria-label="Task status">
           <h3>Status</h3>
           <p role="status">{statusLabel(activeTask.status)}</p>
-          {activeTask.error_summary && <p className="error">{activeTask.error_summary}</p>}
+          {activeTask.error_summary && <p className="error" role="alert" aria-live="assertive">{activeTask.error_summary}</p>}
           <dl className="meta">
             <div><dt>Provider</dt><dd>{taskProvider ? providerLabel(taskProvider) : activeTask.provider_config_id}</dd></div>
             <div><dt>Model</dt><dd>{taskProvider?.model || "Not reported"}</dd></div>
@@ -269,6 +280,7 @@ export default function AiTasksPanel({ applicationId, initialTask, onPacketChang
           applicationId={applicationId}
           task={activeTask}
           findings={findings}
+          readOnly={readOnly}
           onFindingUpdated={(updated) =>
             setFindings((current) => current.map((finding) => (finding.id === updated.id ? updated : finding)))
           }

@@ -61,7 +61,7 @@ export type ReportRecord = {
   };
   risks: {
     blockers: RiskIssue[];
-    warnings: RiskIssue[];
+    warnings: Array<RiskIssue | string>;
     [key: string]: unknown;
   };
   created_at: string;

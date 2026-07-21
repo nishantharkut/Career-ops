@@ -41,7 +41,7 @@ from careerops.core.repository import (
     CareerOpsRepository,
     canonical_provider_binding,
 )
-from careerops.core.status import PrivacyMode
+from careerops.core.status import ApplicationStatus, PrivacyMode, SubmissionState
 
 
 _RESUME_TASKS = frozenset(
@@ -86,6 +86,15 @@ class AiOrchestrator:
         provider_config_id: str,
         input_artifact_ids: Sequence[str] = (),
     ) -> AiTask:
+        application = self._repository.get_application(application_id)
+        if (
+            application.approval_id is not None
+            or application.status
+            in {ApplicationStatus.APPROVED, ApplicationStatus.SUBMITTED_MANUAL}
+            or application.submission_state != SubmissionState.NOT_SUBMITTED
+        ):
+            raise ValueError("Application is read-only")
+
         config = self._repository.get_ai_provider_config(provider_config_id)
         if not config.enabled:
             raise ValueError("AI provider configuration is disabled")
@@ -99,7 +108,6 @@ class AiOrchestrator:
             canonical_provider_binding(self._availability_binding(availability))
         )
 
-        application = self._repository.get_application(application_id)
         template = load_prompt_template(task_type)
         self._build_context(application.id, task_type)
         return self._repository.create_ai_task(
