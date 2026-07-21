@@ -156,7 +156,7 @@ CareerOps must make privacy mode explicit.
 ### Local Private Mode
 
 - Resume text, profile facts, evidence, and generated drafts stay on the user's machine.
-- Uses only a CareerOps-managed model runtime with cloud features disabled, OS/container egress blocked, and a frozen deployment attestation supplied by trusted launcher wiring. An unmanaged Ollama endpoint is fail-closed and unavailable rather than labelled local-private.
+- Uses only a CareerOps-managed model runtime with cloud features disabled and OS/container egress blocked. The API process keeps a private authority key and issues an immutable HMAC-SHA256 capability bound to the canonical endpoint, exact model, runtime instance, and concrete process/container handle derived from the launched runtime. An unmanaged Ollama endpoint, environment assertion, mismatched capability, or capability from another authority is fail-closed and unavailable rather than labelled local-private.
 - Does not include ChatGPT-authenticated Codex; that provider is cloud-external and requires explicit enablement.
 - Best default for day-to-day work.
 
@@ -194,7 +194,7 @@ Recommended shape:
 - `restart: unless-stopped` for VM/container restarts;
 - scheduled backup of `data/` and `vault/`;
 - AI tasks stored as resumable records before provider execution;
-- managed no-egress local OSS AI worker on the user's machine or trusted host;
+- managed no-egress local OSS AI worker created by `ManagedOllamaRuntimeFactory` in `careerops/operations/ollama_runtime.py` on the user's machine or trusted host;
 - Codex worker only for explicit deep-review tasks;
 - cloud AI disabled by default;
 - hosted mode labels whether private processing is local, trusted-host, cloud AI, or verifier-only fallback.
@@ -389,7 +389,7 @@ Mock providers must be used for normal CI. Live provider tests should be opt-in.
 
 These are the best default choices for the first AI implementation:
 
-1. First live local runtime: CareerOps-managed no-egress Ollama, because it is headless and fits a background app better than a desktop-first runtime. The launcher must own the runtime, disable cloud features, enforce an OS/container egress block, and supply the provider's deployment attestation. LM Studio can be added later only through an equivalent fail-closed isolation contract.
+1. First live local runtime: CareerOps-managed no-egress Ollama, because it is headless and fits a background app better than a desktop-first runtime. Task 10 implements `ManagedOllamaRuntimeFactory` in `careerops/operations/ollama_runtime.py`, `scripts/start-managed-ollama.ps1`, and `tests/test_managed_ollama_runtime.py`. The factory must own the runtime, disable cloud features, enforce an OS/container egress block, derive endpoint/model/runtime identity from the launched instance, retain the authority secret in the API process, and pass provider plus bound capability together. LM Studio can be added later only through an equivalent fail-closed isolation contract.
 2. First implementation task: AI JD analysis plus semantic fit review, because resume tailoring and cover letters depend on understanding the role correctly.
 3. Codex worker mode: implement after the local provider path is stable, then use it for evidence and repository deep review.
 4. OpenAI API mode: keep documented but disabled and unimplemented in the first AI build unless explicitly approved later.

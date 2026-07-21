@@ -55,6 +55,18 @@ LongText = Annotated[str, StringConstraints(min_length=1, max_length=4_000)]
 CoverLetterText = Annotated[str, StringConstraints(min_length=1, max_length=12_000)]
 ReasonText = Annotated[str, StringConstraints(min_length=1, max_length=1_000)]
 MetadataText = Annotated[str, StringConstraints(max_length=2_048)]
+BoundMetadataText = Annotated[
+    str,
+    StringConstraints(min_length=1, max_length=2_048),
+]
+RuntimeHandleText = Annotated[
+    str,
+    StringConstraints(
+        min_length=1,
+        max_length=256,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9._:/-]*$",
+    ),
+]
 RawOutputText = Annotated[
     str, StringConstraints(max_length=MAX_PROVIDER_OUTPUT_BYTES)
 ]
@@ -128,15 +140,43 @@ class StrictModel(BaseModel):
 
 
 class OllamaIsolationEvidence(StrictModel):
-    attestation_version: Literal["ollama_isolation_v1"]
-    runtime_owner: Literal["careerops"]
-    cloud_disabled: Literal[True]
-    egress_enforced: Literal[True]
+    attestation_version: Literal["ollama_isolation_v2"]
+    canonical_endpoint: BoundMetadataText
+    model: RuntimeHandleText
+    runtime_instance_id: Identifier
+    runtime_handle: RuntimeHandleText
     egress_policy: Literal[
         "container_internal_no_egress",
         "os_firewall_block",
     ]
-    runtime_instance_id: Identifier
+    cloud_disabled: Literal[True]
+    egress_enforced: Literal[True]
+    issuer_instance_id: Identifier
+    integrity: Sha256Text
+
+    def canonical_payload_bytes(self) -> bytes:
+        payload = {
+            "attestation_version": self.attestation_version,
+            "canonical_endpoint": self.canonical_endpoint,
+            "cloud_disabled": self.cloud_disabled,
+            "egress_enforced": self.egress_enforced,
+            "egress_policy": self.egress_policy,
+            "issuer_instance_id": self.issuer_instance_id,
+            "model": self.model,
+            "runtime_handle": self.runtime_handle,
+            "runtime_instance_id": self.runtime_instance_id,
+        }
+        return json.dumps(
+            payload,
+            ensure_ascii=False,
+            allow_nan=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+
+    @property
+    def canonical_sha256(self) -> str:
+        return hashlib.sha256(self.canonical_payload_bytes()).hexdigest()
 
 
 class AnalyzeJdOutput(StrictModel):
@@ -429,7 +469,7 @@ def serialize_provider_output_bytes(output: TaskOutput) -> bytes:
             separators=(",", ":"),
             sort_keys=True,
         ).encode("utf-8")
-    except (TypeError, ValueError, UnicodeError):
+    except (TypeError, ValueError, UnicodeError, RecursionError):
         failed = True
     if failed:
         raise ProviderOutputError("Provider output could not be serialized")
@@ -451,6 +491,17 @@ class InvocationMetadata(StrictModel):
     executable_version: MetadataText = ""
     codex_home: MetadataText = ""
     model_digest: MetadataText = ""
+    model_metadata_sha256: Sha256Text | Literal[""] = ""
+    show_metadata_sha256: Sha256Text | Literal[""] = ""
+    attestation_version: MetadataText = ""
+    runtime_instance_id: MetadataText = ""
+    runtime_handle: MetadataText = ""
+    issuer_instance_id: MetadataText = ""
+    egress_policy: MetadataText = ""
+    cloud_disabled: bool = False
+    egress_enforced: bool = False
+    isolation_evidence_sha256: Sha256Text | Literal[""] = ""
+    isolation_evidence_signature: Sha256Text | Literal[""] = ""
     reasoning_effort: MetadataText = ""
     raw_output_sha256: Sha256Text | Literal[""] = ""
     command: tuple[MetadataText, ...] = Field(default=(), max_length=40)
@@ -464,12 +515,24 @@ class ProviderAvailability(StrictModel):
     data_leaves_machine: bool
     is_ai: bool
     detail: MetadataText
+    endpoint: MetadataText = ""
     identity_name: MetadataText = ""
     executable: MetadataText = ""
     executable_sha256: MetadataText = ""
     executable_version: MetadataText = ""
     codex_home: MetadataText = ""
     model_digest: MetadataText = ""
+    model_metadata_sha256: Sha256Text | Literal[""] = ""
+    show_metadata_sha256: Sha256Text | Literal[""] = ""
+    attestation_version: MetadataText = ""
+    runtime_instance_id: MetadataText = ""
+    runtime_handle: MetadataText = ""
+    issuer_instance_id: MetadataText = ""
+    egress_policy: MetadataText = ""
+    cloud_disabled: bool = False
+    egress_enforced: bool = False
+    isolation_evidence_sha256: Sha256Text | Literal[""] = ""
+    isolation_evidence_signature: Sha256Text | Literal[""] = ""
     reasoning_effort: MetadataText = ""
 
 
@@ -531,7 +594,7 @@ def parse_json_object(
     failed = False
     try:
         value = _strict_json_loads(text)
-    except (TypeError, ValueError, UnicodeError):
+    except (TypeError, ValueError, UnicodeError, RecursionError):
         failed = True
     if failed:
         raise ProviderOutputError("Provider output was not valid JSON")

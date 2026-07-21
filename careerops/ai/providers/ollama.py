@@ -2,11 +2,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 import hashlib
+import hmac
 import http.client
 import ipaddress
 import json
 import math
 import re
+import secrets
 import socket
 import time
 from typing import Any
@@ -33,6 +35,8 @@ from careerops.core.status import PrivacyMode
 
 _DIGEST_PATTERN = re.compile(r"^[0-9a-fA-F]{64}$")
 MAX_OLLAMA_ENVELOPE_BYTES = (6 * MAX_PROVIDER_OUTPUT_BYTES) + 64_000
+MAX_OLLAMA_METADATA_DEPTH = 32
+MAX_OLLAMA_METADATA_NODES = 4_096
 
 
 @dataclass(frozen=True)
@@ -42,10 +46,138 @@ class _Endpoint:
     port: int
     base_path: str
 
+    @property
+    def canonical(self) -> str:
+        host = f"[{self.host}]" if ":" in self.host else self.host
+        return f"{self.scheme}://{host}:{self.port}{self.base_path}"
+
+
+def _parse_endpoint(endpoint: str) -> _Endpoint | None:
+    try:
+        parsed = urlsplit(endpoint.strip().rstrip("/"))
+        scheme = parsed.scheme.casefold()
+        host = (parsed.hostname or "").casefold()
+        port = parsed.port or (443 if scheme == "https" else 80)
+        if host == "localhost":
+            local_host = True
+        else:
+            address = ipaddress.ip_address(host)
+            local_host = address.is_loopback
+            host = address.compressed
+        valid = bool(
+            scheme in {"http", "https"}
+            and parsed.netloc
+            and not parsed.username
+            and not parsed.password
+            and not parsed.query
+            and not parsed.fragment
+            and 0 < port <= 65_535
+            and local_host
+        )
+    except ValueError:
+        return None
+    if not valid:
+        return None
+    return _Endpoint(
+        scheme=scheme,
+        host=host,
+        port=port,
+        base_path=parsed.path.rstrip("/"),
+    )
+
+
+def canonicalize_ollama_endpoint(endpoint: str) -> str:
+    parsed = _parse_endpoint(endpoint)
+    if parsed is None:
+        raise ValueError("Ollama endpoint was not canonicalizable")
+    return parsed.canonical
+
+
+@dataclass(frozen=True, init=False)
+class OllamaRuntimeAuthority:
+    issuer_instance_id: str
+    _key: bytes = field(repr=False, compare=False)
+
+    def __init__(self, issuer_instance_id: str, key: bytes):
+        if (
+            re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", issuer_instance_id)
+            is None
+        ):
+            raise ValueError("Ollama authority issuer instance ID was invalid")
+        if not isinstance(key, bytes) or len(key) < 32:
+            raise ValueError("Ollama authority key must contain at least 32 bytes")
+        object.__setattr__(self, "issuer_instance_id", issuer_instance_id)
+        object.__setattr__(self, "_key", bytes(key))
+
+    @classmethod
+    def generate(cls, issuer_instance_id: str) -> OllamaRuntimeAuthority:
+        return cls(issuer_instance_id, secrets.token_bytes(32))
+
+    def issue(
+        self,
+        *,
+        endpoint: str,
+        model: str,
+        runtime_instance_id: str,
+        runtime_handle: str,
+        egress_policy: str,
+    ) -> OllamaIsolationEvidence:
+        unsigned = OllamaIsolationEvidence(
+            attestation_version="ollama_isolation_v2",
+            canonical_endpoint=canonicalize_ollama_endpoint(endpoint),
+            model=model,
+            runtime_instance_id=runtime_instance_id,
+            runtime_handle=runtime_handle,
+            egress_policy=egress_policy,
+            cloud_disabled=True,
+            egress_enforced=True,
+            issuer_instance_id=self.issuer_instance_id,
+            integrity="0" * 64,
+        )
+        signature = hmac.new(
+            self._key,
+            unsigned.canonical_payload_bytes(),
+            hashlib.sha256,
+        ).hexdigest()
+        return unsigned.model_copy(update={"integrity": signature})
+
+    def verifies(
+        self,
+        evidence: OllamaIsolationEvidence,
+        *,
+        endpoint: str,
+        model: str,
+        runtime_instance_id: str,
+        runtime_handle: str,
+    ) -> bool:
+        try:
+            exact_fields = set(type(evidence).model_fields)
+            if (
+                type(evidence) is not OllamaIsolationEvidence
+                or set(evidence.__dict__) != exact_fields
+                or evidence.canonical_endpoint
+                != canonicalize_ollama_endpoint(endpoint)
+                or evidence.model != model
+                or evidence.runtime_instance_id != runtime_instance_id
+                or evidence.runtime_handle != runtime_handle
+                or evidence.issuer_instance_id != self.issuer_instance_id
+                or evidence.cloud_disabled is not True
+                or evidence.egress_enforced is not True
+            ):
+                return False
+            expected = hmac.new(
+                self._key,
+                evidence.canonical_payload_bytes(),
+                hashlib.sha256,
+            ).hexdigest()
+            return hmac.compare_digest(expected, evidence.integrity)
+        except Exception:
+            return False
+
 
 @dataclass(frozen=True)
-class _LocalModel:
-    name: str
+class OllamaModelIdentity:
+    model: str
     digest: str
     size: int
     tags_metadata_sha256: str
@@ -172,6 +304,13 @@ class OllamaProvider:
     endpoint: str = field(default="http://127.0.0.1:11434", repr=False)
     model: str = "qwen2.5:7b"
     timeout_seconds: float = 30
+    runtime_instance_id: str = ""
+    runtime_handle: str = ""
+    isolation_authority: OllamaRuntimeAuthority | None = field(
+        default=None,
+        repr=False,
+        compare=False,
+    )
     isolation_evidence: OllamaIsolationEvidence | None = field(
         default=None,
         repr=False,
@@ -182,65 +321,91 @@ class OllamaProvider:
 
     def __post_init__(self) -> None:
         endpoint = self.endpoint.strip().rstrip("/")
-        parsed_endpoint = self._parse_endpoint(endpoint)
+        parsed_endpoint = _parse_endpoint(endpoint)
         if not math.isfinite(self.timeout_seconds) or self.timeout_seconds <= 0:
             raise ValueError("timeout_seconds must be finite and positive")
         if self.isolation_evidence is not None and not isinstance(
             self.isolation_evidence, OllamaIsolationEvidence
         ):
             raise ValueError("isolation_evidence must be a trusted attestation")
-        object.__setattr__(self, "endpoint", endpoint)
+        if self.isolation_authority is not None and not isinstance(
+            self.isolation_authority, OllamaRuntimeAuthority
+        ):
+            raise ValueError("isolation_authority must be a trusted authority")
+        object.__setattr__(
+            self,
+            "endpoint",
+            parsed_endpoint.canonical if parsed_endpoint is not None else endpoint,
+        )
         object.__setattr__(self, "_parsed_endpoint", parsed_endpoint)
 
     @staticmethod
     def _parse_endpoint(endpoint: str) -> _Endpoint | None:
-        try:
-            parsed = urlsplit(endpoint)
-            host = parsed.hostname or ""
-            port = parsed.port or (443 if parsed.scheme == "https" else 80)
-            if host.casefold() == "localhost":
-                local_host = True
-            else:
-                local_host = ipaddress.ip_address(host).is_loopback
-            valid = bool(
-                parsed.scheme in {"http", "https"}
-                and parsed.netloc
-                and not parsed.username
-                and not parsed.password
-                and not parsed.query
-                and not parsed.fragment
-                and 0 < port <= 65_535
-                and local_host
+        return _parse_endpoint(endpoint)
+
+    def _verified_isolation_evidence(self) -> OllamaIsolationEvidence | None:
+        if (
+            self._parsed_endpoint is None
+            or self.isolation_authority is None
+            or self.isolation_evidence is None
+            or not self.runtime_instance_id
+            or not self.runtime_handle
+            or not self.isolation_authority.verifies(
+                self.isolation_evidence,
+                endpoint=self._parsed_endpoint.canonical,
+                model=self.model,
+                runtime_instance_id=self.runtime_instance_id,
+                runtime_handle=self.runtime_handle,
             )
-        except ValueError:
+        ):
             return None
-        if not valid:
-            return None
-        return _Endpoint(
-            scheme=parsed.scheme,
-            host=host,
-            port=port,
-            base_path=parsed.path.rstrip("/"),
-        )
+        return self.isolation_evidence
 
     def availability(self) -> ProviderAvailability:
-        if self.isolation_evidence is None:
-            return self._availability_status(False, "isolation_evidence_required")
         if self._parsed_endpoint is None:
             return self._availability_status(False, "invalid_configuration")
+        evidence = self._verified_isolation_evidence()
+        if evidence is None:
+            configured = any(
+                (
+                    self.isolation_authority is not None,
+                    self.isolation_evidence is not None,
+                    bool(self.runtime_instance_id),
+                    bool(self.runtime_handle),
+                )
+            )
+            return self._availability_status(
+                False,
+                "isolation_evidence_invalid"
+                if configured
+                else "isolation_evidence_required",
+            )
         try:
             deadline = time.monotonic() + self.timeout_seconds
             local_model = self._resolve_local_model(deadline)
         except Exception:
-            return self._availability_status(False, "unavailable")
+            return self._availability_status(
+                False,
+                "unavailable",
+                evidence=evidence,
+            )
         return self._availability_status(
-            True, "available", model_digest=local_model.digest
+            True,
+            "available",
+            model_digest=local_model.digest,
+            evidence=evidence,
+            local_model=local_model,
         )
 
     def _availability_status(
-        self, available: bool, detail: str, model_digest: str = ""
+        self,
+        available: bool,
+        detail: str,
+        model_digest: str = "",
+        evidence: OllamaIsolationEvidence | None = None,
+        local_model: OllamaModelIdentity | None = None,
     ) -> ProviderAvailability:
-        isolated = self.isolation_evidence is not None
+        isolated = evidence is not None
         return ProviderAvailability(
             available=available,
             provider_kind="ollama",
@@ -253,8 +418,38 @@ class OllamaProvider:
             data_leaves_machine=not isolated,
             is_ai=True,
             detail=detail,
+            endpoint=(
+                self._parsed_endpoint.canonical
+                if self._parsed_endpoint is not None
+                else ""
+            ),
             model_digest=model_digest,
+            model_metadata_sha256=(
+                local_model.tags_metadata_sha256 if local_model else ""
+            ),
+            show_metadata_sha256=(
+                local_model.show_metadata_sha256 if local_model else ""
+            ),
+            **self._isolation_provenance(evidence),
         )
+
+    @staticmethod
+    def _isolation_provenance(
+        evidence: OllamaIsolationEvidence | None,
+    ) -> dict[str, Any]:
+        if evidence is None:
+            return {}
+        return {
+            "attestation_version": evidence.attestation_version,
+            "runtime_instance_id": evidence.runtime_instance_id,
+            "runtime_handle": evidence.runtime_handle,
+            "issuer_instance_id": evidence.issuer_instance_id,
+            "egress_policy": evidence.egress_policy,
+            "cloud_disabled": evidence.cloud_disabled,
+            "egress_enforced": evidence.egress_enforced,
+            "isolation_evidence_sha256": evidence.canonical_sha256,
+            "isolation_evidence_signature": evidence.integrity,
+        }
 
     def run(self, request: ProviderRequest) -> ProviderResult:
         failure: ProviderError | None = None
@@ -264,13 +459,28 @@ class OllamaProvider:
             failure = error
         raise sanitized_provider_error(failure)
 
-    def _run(self, request: ProviderRequest) -> ProviderResult:
-        if self.isolation_evidence is None:
-            raise ProviderUnavailableError(
-                "Ollama isolation evidence is required"
+    def compatibility_probe(self) -> OllamaModelIdentity:
+        failure: ProviderError | None = None
+        try:
+            if self._parsed_endpoint is None:
+                raise ProviderUnavailableError(
+                    "Ollama provider configuration is invalid"
+                )
+            return self._resolve_local_model(
+                time.monotonic() + self.timeout_seconds
             )
+        except ProviderError as error:
+            failure = error
+        raise sanitized_provider_error(failure)
+
+    def _run(self, request: ProviderRequest) -> ProviderResult:
         if self._parsed_endpoint is None:
             raise ProviderUnavailableError("Ollama provider configuration is invalid")
+        evidence = self._verified_isolation_evidence()
+        if evidence is None:
+            raise ProviderUnavailableError(
+                "Ollama isolation evidence is invalid or unavailable"
+            )
         deadline = time.monotonic() + self.timeout_seconds
         local_model = self._resolve_local_model(deadline)
         body = json.dumps(
@@ -318,10 +528,13 @@ class OllamaProvider:
                 mode="api_chat",
                 endpoint=self.endpoint,
                 model_digest=local_model.digest,
+                model_metadata_sha256=local_model.tags_metadata_sha256,
+                show_metadata_sha256=local_model.show_metadata_sha256,
+                **self._isolation_provenance(evidence),
             ),
         )
 
-    def _resolve_local_model(self, deadline: float) -> _LocalModel:
+    def _resolve_local_model(self, deadline: float) -> OllamaModelIdentity:
         payload = self._request_json("GET", "/api/tags", None, deadline)
         if self._contains_remote_metadata(payload):
             raise ProviderUnavailableError(
@@ -350,17 +563,13 @@ class OllamaProvider:
             ).encode("utf-8"),
             deadline,
         )
-        show_digest, show_size = self._validate_local_metadata(show)
-        if show_digest != digest or show_size != size:
-            raise ProviderUnavailableError(
-                "Ollama model metadata did not agree across local APIs"
-            )
-        return _LocalModel(
-            name=self.model,
+        show_metadata_sha256 = self._validate_show_metadata(show)
+        return OllamaModelIdentity(
+            model=self.model,
             digest=digest,
             size=size,
             tags_metadata_sha256=self._metadata_sha256(metadata),
-            show_metadata_sha256=self._metadata_sha256(show),
+            show_metadata_sha256=show_metadata_sha256,
         )
 
     def _validate_local_metadata(self, metadata: dict[str, Any]) -> tuple[str, int]:
@@ -381,6 +590,23 @@ class OllamaProvider:
             )
         return digest.lower(), size
 
+    def _validate_show_metadata(self, metadata: dict[str, Any]) -> str:
+        capabilities = metadata.get("capabilities")
+        if (
+            not isinstance(metadata.get("parameters"), str)
+            or not isinstance(metadata.get("license"), str)
+            or not isinstance(metadata.get("modified_at"), str)
+            or not isinstance(metadata.get("details"), dict)
+            or not isinstance(capabilities, list)
+            or not all(isinstance(item, str) for item in capabilities)
+            or not isinstance(metadata.get("model_info"), dict)
+            or self._contains_remote_metadata(metadata)
+        ):
+            raise ProviderUnavailableError(
+                "Ollama show metadata was invalid or remote"
+            )
+        return self._metadata_sha256(metadata)
+
     @staticmethod
     def _metadata_sha256(metadata: dict[str, Any]) -> str:
         raw = json.dumps(
@@ -393,27 +619,54 @@ class OllamaProvider:
         return hashlib.sha256(raw).hexdigest()
 
     @classmethod
-    def _contains_remote_metadata(cls, value: Any, key: str = "") -> bool:
-        if isinstance(value, dict):
-            for raw_key, nested in value.items():
-                normalized_key = str(raw_key).casefold()
-                if normalized_key in {
-                    "remote_host",
-                    "remote_model",
-                } and cls._metadata_value_is_present(nested):
-                    return True
-                if "cloud" in normalized_key and cls._metadata_value_is_present(
-                    nested
-                ):
-                    return True
-                if cls._contains_remote_metadata(nested, normalized_key):
-                    return True
-            return False
-        if isinstance(value, (list, tuple)):
-            return any(cls._contains_remote_metadata(item, key) for item in value)
-        if isinstance(value, str):
-            return "cloud" in value.casefold()
+    def _contains_remote_metadata(cls, value: Any) -> bool:
+        stack: list[tuple[Any, int]] = [(value, 0)]
+        observed = 0
+        while stack:
+            current, depth = stack.pop()
+            observed += 1
+            if (
+                depth > MAX_OLLAMA_METADATA_DEPTH
+                or observed > MAX_OLLAMA_METADATA_NODES
+            ):
+                raise ProviderOutputError(
+                    "Ollama metadata exceeded the complexity limit"
+                )
+            if isinstance(current, dict):
+                for raw_key, nested in current.items():
+                    normalized_key = str(raw_key).casefold()
+                    if normalized_key in {
+                        "remote_host",
+                        "remote_model",
+                    } and cls._metadata_value_is_present(nested):
+                        return True
+                    if "cloud" in normalized_key and cls._metadata_value_is_present(
+                        nested
+                    ):
+                        return True
+                    cls._push_metadata_node(stack, observed, nested, depth + 1)
+            elif isinstance(current, (list, tuple)):
+                for item in current:
+                    cls._push_metadata_node(stack, observed, item, depth + 1)
+            elif isinstance(current, str) and "cloud" in current.casefold():
+                return True
         return False
+
+    @staticmethod
+    def _push_metadata_node(
+        stack: list[tuple[Any, int]],
+        observed: int,
+        value: Any,
+        depth: int,
+    ) -> None:
+        if (
+            depth > MAX_OLLAMA_METADATA_DEPTH
+            or observed + len(stack) >= MAX_OLLAMA_METADATA_NODES
+        ):
+            raise ProviderOutputError(
+                "Ollama metadata exceeded the complexity limit"
+            )
+        stack.append((value, depth))
 
     @staticmethod
     def _metadata_value_is_present(value: Any) -> bool:

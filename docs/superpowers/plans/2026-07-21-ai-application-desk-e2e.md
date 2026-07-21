@@ -341,7 +341,7 @@ class AiProvider(Protocol):
 
 Use a discriminated `TaskOutput` union with `AnalyzeJdOutput`, `AnalyzeFitOutput`, `ResumeEditsOutput`, `CoverLetterOutput`, and `ClaimReviewOutput`. The only allowed task names are `analyze_jd`, `analyze_fit`, `suggest_resume_edits`, `draft_cover_letter`, and `review_claims`. JD output validates normalized fields plus uncertainty; fit output validates matches, gaps, risks, and recommendations; resume suggestions require `source_text`, `replacement_text`, `reason`, and `evidence_refs`; cover letters contain bounded plain text plus evidence references; claim review returns one decision per supplied claim. All string and list fields are length-limited.
 
-Unmanaged Ollama is fail-closed because a generic localhost daemon can offload cloud models. The adapter accepts only a frozen deployment attestation supplied by trusted CareerOps wiring that identifies an app-owned runtime with cloud features disabled and OS/container egress blocked; a loose environment boolean is not proof. With that attestation, Ollama uses direct proxy-free loopback HTTP, verifies the exact installed model through both `/api/tags` and `POST /api/show` before sending task content, calls `POST /api/chat` with `stream: false` and `format` set to the JSON Schema, rejects cloud/remote metadata, then repeats both provenance checks and requires an unchanged digest. All calls share one finite deadline. Task 10 owns creation of the attestation from its internal no-egress container or OS-firewall launcher. Codex discovery reads `CAREEROPS_CODEX_COMMANDS` in order (`codex2,codex` for the current machine) or a single `CAREEROPS_CODEX_COMMAND` override. Each resolved identity is registered as a separate provider; `codex2` is preferred, and a running task never falls back to another identity. A `.cmd` wrapper is an identity descriptor only: CareerOps validates the approved wrapper shape, resolves its `CODEX_HOME`, resolves and hashes the native `codex.exe`, and invokes that native executable directly. Codex uses a managed `Popen` process tree with an argument list, bounded stdin/output, an overall deadline, `--ignore-user-config`, `--ignore-rules`, `--strict-config`, an explicit model and reasoning effort, `--cd <attempt_dir>`, `--sandbox read-only`, `--skip-git-repo-check`, `--ephemeral`, `--output-schema <schema>`, and `--output-last-message <output>`; shell interpolation is forbidden. The deterministic provider returns verifier-only output and has `is_ai=False`.
+Unmanaged Ollama is fail-closed because a generic localhost daemon can offload cloud models. The adapter accepts only an immutable authority-signed capability bound to the canonical endpoint, exact model, runtime instance and concrete process/container handle, with cloud features disabled and OS/container egress blocked; a loose environment boolean or reusable assertion object is not proof. With that capability, Ollama uses direct proxy-free loopback HTTP, treats `/api/tags` as the sole name/model/digest/size authority, validates the official `/api/show` shape separately, and hashes both metadata responses before sending task content. It calls `POST /api/chat` with `stream: false` and `format` set to the JSON Schema, rejects cloud/remote metadata, then repeats tags/show and requires unchanged independent provenance. All calls share one finite deadline. Task 10 owns the managed runtime factory and capability issuance. Codex discovery reads `CAREEROPS_CODEX_COMMANDS` in order (`codex2,codex` for the current machine) or a single `CAREEROPS_CODEX_COMMAND` override. Each resolved identity is registered as a separate provider; `codex2` is preferred, and a running task never falls back to another identity. A `.cmd` wrapper is an identity descriptor only: CareerOps validates the approved wrapper shape, resolves its `CODEX_HOME`, resolves and hashes the native `codex.exe`, and invokes that native executable directly. Codex uses a managed `Popen` process tree with an argument list, bounded stdin/output, an overall deadline, `--ignore-user-config`, `--ignore-rules`, `--strict-config`, an explicit model and reasoning effort, `--cd <attempt_dir>`, `--sandbox read-only`, `--skip-git-repo-check`, `--ephemeral`, `--output-schema <schema>`, and `--output-last-message <output>`; shell interpolation is forbidden. The deterministic provider returns verifier-only output and has `is_ai=False`.
 
 Codex provider metadata sets `data_leaves_machine=True` for ChatGPT-authenticated runs and exposes the exact command/version. The UI must require per-task acknowledgement before sending private context through that provider. Only an attested managed no-egress Ollama runtime sets `privacy_mode=local_private` and `data_leaves_machine=False`; unmanaged Ollama remains unavailable.
 
@@ -570,7 +570,7 @@ GET    /applications/{id}/artifacts/report
 GET    /applications/{id}/artifacts/approval
 ```
 
-`create_app()` accepts an injected provider registry for tests. Production startup registers deterministic fallback, an unavailable-by-default Ollama adapter from `CAREEROPS_OLLAMA_URL`/`CAREEROPS_OLLAMA_MODEL`, and Codex when `CAREEROPS_CODEX_ENABLED=true`. Ollama becomes local-private only when Task 10 trusted deployment wiring supplies its no-egress isolation attestation; endpoint/model environment values alone never do so. Optional API-key cloud AI remains absent. FastAPI `BackgroundTasks` runs the persisted task after the 202 response; startup requeues interrupted tasks. Artifact routes resolve repository-owned paths and require `candidate.is_relative_to(repo.vault_path.resolve())`.
+`create_app()` accepts an injected provider registry for tests. Production startup registers deterministic fallback, an unavailable-by-default Ollama adapter from `CAREEROPS_OLLAMA_URL`/`CAREEROPS_OLLAMA_MODEL`, and Codex when `CAREEROPS_CODEX_ENABLED=true`. Ollama becomes local-private only when the Task 10 managed runtime factory supplies the provider, its private in-process authority, and the capability bound to the runtime it actually launched; endpoint/model environment values alone never do so. Optional API-key cloud AI remains absent. FastAPI `BackgroundTasks` runs the persisted task after the 202 response; startup requeues interrupted tasks. Artifact routes resolve repository-owned paths and require `candidate.is_relative_to(repo.vault_path.resolve())`.
 
 Requirements responses preserve `raw_ai`, `deterministic`, and `user_corrected` groups plus uncertainty instead of merging away provenance. Profile facts use the five approved verification states. Evidence can be linked to an application only through repository-owned IDs; rejected or `private_do_not_publish` records are included in verifier context but never treated as publishable support.
 
@@ -851,14 +851,17 @@ git commit -m "test: cover the AI application workflow end to end"
 **Files:**
 - Create: `careerops/operations/__init__.py`
 - Create: `careerops/operations/backups.py`
+- Create: `careerops/operations/ollama_runtime.py`
 - Create: `scripts/backup.ps1`
 - Create: `scripts/restore.ps1`
+- Create: `scripts/start-managed-ollama.ps1`
 - Create: `tests/test_backup_restore.py`
+- Create: `tests/test_managed_ollama_runtime.py`
 - Modify: `compose.yaml`
 - Modify: `.env.example`
 - Modify: `tests/test_hosting_configuration.py`
 
-- [ ] **Step 1: Write failing backup and hosting tests**
+- [ ] **Step 1: Write failing backup, hosting, and managed-runtime tests**
 
 ```python
 def test_backup_restores_database_and_vault_with_checksums(repo, tmp_path):
@@ -873,32 +876,53 @@ def test_restore_rejects_changed_archive(repo, tmp_path):
     corrupt_archive(backup.path)
     with pytest.raises(BackupIntegrityError):
         restore_backup(backup.path, tmp_path / "data", tmp_path / "vault")
+
+
+def test_managed_ollama_factory_issues_capability_from_launched_runtime(factory):
+    managed = factory.launch(model="qwen2.5:7b")
+    assert managed.provider.endpoint == managed.endpoint
+    assert managed.evidence.runtime_instance_id == managed.runtime_instance_id
+    assert managed.evidence.runtime_handle == managed.runtime_handle
+    assert managed.authority.verifies(
+        managed.evidence,
+        endpoint=managed.endpoint,
+        model=managed.model,
+        runtime_instance_id=managed.runtime_instance_id,
+        runtime_handle=managed.runtime_handle,
+    )
+
+
+def test_managed_ollama_factory_refuses_runtime_without_enforced_no_egress(factory):
+    with pytest.raises(ManagedRuntimeIsolationError):
+        factory.launch(model="qwen2.5:7b", egress_enforcement="unavailable")
 ```
 
-Hosting checks assert `restart: unless-stopped`, persistent `/app/data`, `/app/vault`, `/app/backups`, auth enabled, `/health` check, no bundled API key, and explicit Ollama/Codex settings.
+Hosting checks assert `restart: unless-stopped`, persistent `/app/data`, `/app/vault`, `/app/backups`, auth enabled, `/health` check, no bundled API key, explicit Ollama/Codex settings, an app-owned Ollama process/container, cloud-disabled configuration, and an internal network or OS-firewall rule that blocks egress.
 
 - [ ] **Step 2: Run tests and confirm RED**
 
-Run: `.\.venv\Scripts\python.exe -m pytest tests/test_backup_restore.py tests/test_hosting_configuration.py -q`
+Run: `.\.venv\Scripts\python.exe -m pytest tests/test_backup_restore.py tests/test_hosting_configuration.py tests/test_managed_ollama_runtime.py -q`
 
-Expected: FAIL because backup support and backup volume do not exist.
+Expected: FAIL because backup support, backup volume, and the managed Ollama runtime factory do not exist.
 
 - [ ] **Step 3: Implement consistent checksummed backup and guarded restore**
 
 Use `sqlite3.Connection.backup()` to copy the live database. Build a ZIP containing `data/careerops.db`, vault files, and `manifest.json` with relative paths, byte sizes, and SHA-256 values. Write to a temporary archive and atomically rename. Restore first extracts into a new temporary directory, rejects absolute/parent paths, verifies every checksum, and only then replaces explicitly supplied empty targets; it never deletes a non-empty target.
 
-PowerShell wrappers accept explicit `-BackupRoot`, `-DataPath`, and `-VaultPath`. Compose mounts `./backups:/app/backups` and carries provider settings without secrets in source.
+`careerops/operations/ollama_runtime.py` implements `ManagedOllamaRuntimeFactory`. The factory creates the app-owned process/container with cloud functionality disabled, establishes and verifies the OS-firewall or container-internal no-egress boundary before exposing it, and derives the canonical endpoint, exact model, runtime instance ID, and concrete process/container handle from that launched instance. It keeps a private `OllamaRuntimeAuthority` key of at least 32 random bytes only in the API process, issues the bound `OllamaIsolationEvidence`, and returns provider, authority, and capability together. It must never accept an environment assertion as isolation proof. Runtime restart or replacement creates a new runtime identity and capability.
+
+PowerShell backup wrappers accept explicit `-BackupRoot`, `-DataPath`, and `-VaultPath`. `scripts/start-managed-ollama.ps1` owns Windows process launch and firewall enforcement and returns the concrete process identity to the factory; it does not mint capabilities. Compose mounts `./backups:/app/backups`, places managed Ollama on an internal no-egress network, and carries provider settings without authority keys or other secrets in source.
 
 - [ ] **Step 4: Run backup and hosting tests**
 
-Run: `.\.venv\Scripts\python.exe -m pytest tests/test_backup_restore.py tests/test_hosting_configuration.py -q`
+Run: `.\.venv\Scripts\python.exe -m pytest tests/test_backup_restore.py tests/test_hosting_configuration.py tests/test_managed_ollama_runtime.py -q`
 
 Expected: PASS.
 
 - [ ] **Step 5: Commit**
 
 ```powershell
-git add careerops/operations scripts compose.yaml .env.example tests/test_backup_restore.py tests/test_hosting_configuration.py
+git add careerops/operations scripts compose.yaml .env.example tests/test_backup_restore.py tests/test_hosting_configuration.py tests/test_managed_ollama_runtime.py
 git commit -m "feat: add verified backup and recovery"
 ```
 
@@ -920,7 +944,7 @@ Document:
 
 ```text
 1. Codex mode: `CAREEROPS_CODEX_COMMANDS=codex2,codex`, `codex2` preferred, exact selected identity shown, and bounded task data sent through that signed-in account only after acknowledgement.
-2. Managed Ollama mode: app-owned endpoint, model, health check, cloud-disabled runtime, enforced no-egress boundary, deployment attestation, and fail-closed behavior when any evidence is absent.
+2. Managed Ollama mode: app-owned endpoint, model, health check, cloud-disabled runtime, enforced no-egress boundary, authority-signed runtime-bound capability, and fail-closed behavior when any evidence is absent or mismatched.
 3. Verifier-only mode: clearly useful for safety, clearly not AI.
 4. Hosted mode: AI runs only where the configured provider is reachable.
 5. Day-one workflow: task launch, polling, finding decisions, draft render, rerun, approval, export, submission.

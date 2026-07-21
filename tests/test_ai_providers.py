@@ -36,6 +36,7 @@ from careerops.ai.contracts import (
     validate_task_output,
 )
 from careerops.ai.providers.base import (
+    ProviderError,
     ProviderInvocationError,
     ProviderOutputError,
     ProviderTimeoutError,
@@ -224,6 +225,22 @@ def test_strict_json_rejects_nonstandard_numeric_constants(constant: str):
         ai_contracts.parse_json_object(f'{{"value":{constant}}}')
 
 
+def test_strict_json_sanitizes_deep_nesting_recursion_error(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    marker = "PRIVATE_DEEP_JSON_MARKER_5d3e"
+
+    def reject_deeply_nested(_raw: str | bytes) -> Any:
+        raise RecursionError(marker)
+
+    monkeypatch.setattr(ai_contracts, "_strict_json_loads", reject_deeply_nested)
+
+    with pytest.raises(ProviderOutputError, match="JSON") as captured:
+        ai_contracts.parse_json_object('{"deeply_nested":true}')
+
+    assert_public_error_is_sanitized(captured.value, marker)
+
+
 def test_untrusted_contract_and_result_errors_have_no_secret_chain():
     marker = "PRIVATE_CONTRACT_MARKER_7e91"
     invalid_output = {
@@ -354,18 +371,54 @@ def test_deterministic_provider_is_verifier_only_and_never_marked_as_ai(
 
 OLLAMA_MODEL = "qwen2.5:7b"
 OLLAMA_DIGEST = "a" * 64
-OLLAMA_ISOLATION = ai_contracts.OllamaIsolationEvidence(
-    attestation_version="ollama_isolation_v1",
-    runtime_owner="careerops",
-    cloud_disabled=True,
-    egress_enforced=True,
+OLLAMA_RUNTIME_INSTANCE = "careerops_ollama_test"
+OLLAMA_RUNTIME_HANDLE = "container:careerops_ollama_test"
+OLLAMA_AUTHORITY = ollama_provider_module.OllamaRuntimeAuthority(
+    issuer_instance_id="careerops_api_test",
+    key=b"careerops-test-ollama-authority-key",
+)
+OLLAMA_ISOLATION = OLLAMA_AUTHORITY.issue(
+    endpoint="http://127.0.0.1:11434",
+    model=OLLAMA_MODEL,
+    runtime_instance_id=OLLAMA_RUNTIME_INSTANCE,
+    runtime_handle=OLLAMA_RUNTIME_HANDLE,
     egress_policy="container_internal_no_egress",
-    runtime_instance_id="careerops_ollama_test",
 )
 
 
 def isolated_ollama(**values: Any) -> OllamaProvider:
-    return OllamaProvider(isolation_evidence=OLLAMA_ISOLATION, **values)
+    configured = dict(values)
+    endpoint = configured.pop("endpoint", "http://127.0.0.1:11434")
+    model = configured.pop("model", OLLAMA_MODEL)
+    runtime_instance_id = configured.pop(
+        "runtime_instance_id", OLLAMA_RUNTIME_INSTANCE
+    )
+    runtime_handle = configured.pop("runtime_handle", OLLAMA_RUNTIME_HANDLE)
+    authority = configured.pop("isolation_authority", OLLAMA_AUTHORITY)
+    evidence = configured.pop("isolation_evidence", None)
+    if evidence is None:
+        try:
+            evidence_endpoint = ollama_provider_module.canonicalize_ollama_endpoint(
+                endpoint
+            )
+        except ValueError:
+            evidence_endpoint = "http://127.0.0.1:11434"
+        evidence = authority.issue(
+            endpoint=evidence_endpoint,
+            model=model,
+            runtime_instance_id=runtime_instance_id,
+            runtime_handle=runtime_handle,
+            egress_policy="container_internal_no_egress",
+        )
+    return OllamaProvider(
+        endpoint=endpoint,
+        model=model,
+        runtime_instance_id=runtime_instance_id,
+        runtime_handle=runtime_handle,
+        isolation_authority=authority,
+        isolation_evidence=evidence,
+        **configured,
+    )
 
 
 class _OllamaTestServer(ThreadingHTTPServer):
@@ -434,6 +487,29 @@ def local_model_metadata(**overrides: Any) -> dict[str, Any]:
     }
 
 
+def official_show_metadata(**overrides: Any) -> dict[str, Any]:
+    return {
+        "parameters": "temperature 0.7\nnum_ctx 2048",
+        "license": "Model license fixture",
+        "modified_at": "2025-08-14T15:49:43.634137516-07:00",
+        "details": {
+            "parent_model": "",
+            "format": "gguf",
+            "family": "qwen2",
+            "families": ["qwen2"],
+            "parameter_size": "7.6B",
+            "quantization_level": "Q4_K_M",
+        },
+        "capabilities": ["completion", "tools"],
+        "model_info": {
+            "general.architecture": "qwen2",
+            "general.parameter_count": 7_600_000_000,
+            "qwen2.context_length": 32_768,
+        },
+        **overrides,
+    }
+
+
 def successful_ollama_responder(
     observed: dict[str, Any],
     *,
@@ -442,7 +518,7 @@ def successful_ollama_responder(
     chat_payload: Any | None = None,
 ) -> Callable[[BaseHTTPRequestHandler], None]:
     metadata = model_metadata or local_model_metadata()
-    shown = show_metadata or metadata
+    shown = show_metadata or official_show_metadata()
     envelope = chat_payload or {
         "model": OLLAMA_MODEL,
         "done": True,
@@ -474,19 +550,152 @@ def successful_ollama_responder(
 def test_ollama_isolation_evidence_is_strict_structured_and_frozen():
     evidence = OLLAMA_ISOLATION
 
-    assert evidence.runtime_owner == "careerops"
+    assert evidence.runtime_handle == OLLAMA_RUNTIME_HANDLE
     with pytest.raises(ValidationError):
         evidence.cloud_disabled = False
     with pytest.raises(ValidationError):
         ai_contracts.OllamaIsolationEvidence(
-            attestation_version="ollama_isolation_v1",
-            runtime_owner="careerops",
-            cloud_disabled=True,
-            egress_enforced=True,
-            egress_policy="container_internal_no_egress",
-            runtime_instance_id="careerops_ollama_1",
-            environment_override=True,
+            **{
+                **evidence.model_dump(),
+                "runtime_instance_id": "careerops_ollama_1",
+                "environment_override": True,
+            }
         )
+
+
+def test_ollama_runtime_authority_requires_private_256_bit_key():
+    authority_type = ollama_provider_module.OllamaRuntimeAuthority
+
+    with pytest.raises(ValueError, match="32"):
+        authority_type(
+            issuer_instance_id="careerops_api_test",
+            key=b"too-short",
+        )
+
+
+def test_managed_ollama_runtime_contracts_are_exported():
+    providers = importlib.import_module("careerops.ai.providers")
+
+    assert providers.OllamaRuntimeAuthority is (
+        ollama_provider_module.OllamaRuntimeAuthority
+    )
+    assert providers.OllamaModelIdentity is ollama_provider_module.OllamaModelIdentity
+    assert providers.canonicalize_ollama_endpoint is (
+        ollama_provider_module.canonicalize_ollama_endpoint
+    )
+
+
+def test_ollama_endpoint_canonicalization_normalizes_ipv6_loopback():
+    canonicalize = ollama_provider_module.canonicalize_ollama_endpoint
+
+    assert canonicalize("HTTP://[0:0:0:0:0:0:0:1]:11434/") == (
+        canonicalize("http://[::1]:11434")
+    )
+
+
+@pytest.mark.parametrize(
+    "mismatch",
+    [
+        "endpoint",
+        "model",
+        "runtime_instance",
+        "runtime_handle",
+        "authority",
+        "tamper",
+    ],
+)
+def test_ollama_bound_capability_mismatch_fails_before_any_request(
+    tmp_path: Path,
+    mismatch: str,
+):
+    observed: list[str] = []
+
+    def record_request(handler: BaseHTTPRequestHandler) -> None:
+        observed.append(handler.path)
+        send_http_json(handler, 500, {"secret": "must-not-be-reached"})
+
+    with ollama_test_server(record_request) as endpoint:
+        authority = ollama_provider_module.OllamaRuntimeAuthority.generate(
+            "careerops_api_test"
+        )
+        provider_endpoint = endpoint
+        provider_model = OLLAMA_MODEL
+        provider_runtime = "runtime_test_b"
+        provider_handle = "container:ollama_test_b"
+        evidence = authority.issue(
+            endpoint=(
+                "http://127.0.0.1:11434"
+                if mismatch == "endpoint"
+                else endpoint
+            ),
+            model=("other-model:7b" if mismatch == "model" else provider_model),
+            runtime_instance_id=(
+                "runtime_test_a"
+                if mismatch == "runtime_instance"
+                else provider_runtime
+            ),
+            runtime_handle=(
+                "container:ollama_test_a"
+                if mismatch == "runtime_handle"
+                else provider_handle
+            ),
+            egress_policy="container_internal_no_egress",
+        )
+        selected_authority = (
+            ollama_provider_module.OllamaRuntimeAuthority.generate(
+                "careerops_api_other"
+            )
+            if mismatch == "authority"
+            else authority
+        )
+        if mismatch == "tamper":
+            evidence = evidence.model_copy(update={"model": "tampered-model:7b"})
+        provider = OllamaProvider(
+            endpoint=provider_endpoint,
+            model=provider_model,
+            runtime_instance_id=provider_runtime,
+            runtime_handle=provider_handle,
+            isolation_authority=selected_authority,
+            isolation_evidence=evidence,
+        )
+
+        availability = provider.availability()
+        with pytest.raises(ProviderUnavailableError, match="isolation"):
+            provider.run(make_request(tmp_path))
+
+    assert availability.available is False
+    assert availability.detail == "isolation_evidence_invalid"
+    assert availability.privacy_mode is PrivacyMode.CLOUD_EXTERNAL
+    assert observed == []
+
+
+def test_ollama_bound_capability_accepts_equivalent_canonical_endpoint(
+    tmp_path: Path,
+):
+    observed: dict[str, Any] = {}
+    with ollama_test_server(successful_ollama_responder(observed)) as endpoint:
+        authority = ollama_provider_module.OllamaRuntimeAuthority.generate(
+            "careerops_api_test"
+        )
+        evidence = authority.issue(
+            endpoint=f"HTTP://127.0.0.1:{endpoint.rsplit(':', 1)[1]}/",
+            model=OLLAMA_MODEL,
+            runtime_instance_id="runtime_test_a",
+            runtime_handle="process:12345",
+            egress_policy="os_firewall_block",
+        )
+        provider = OllamaProvider(
+            endpoint=endpoint,
+            model=OLLAMA_MODEL,
+            runtime_instance_id="runtime_test_a",
+            runtime_handle="process:12345",
+            isolation_authority=authority,
+            isolation_evidence=evidence,
+        )
+
+        result = provider.run(make_request(tmp_path))
+
+    assert result.privacy_mode is PrivacyMode.LOCAL_PRIVATE
 
 
 def test_unmanaged_ollama_is_fail_closed_without_any_http_request(tmp_path: Path):
@@ -593,9 +802,128 @@ def test_isolated_ollama_preflight_and_postflight_bind_local_model(tmp_path: Pat
     assert result.invocation.model_digest == OLLAMA_DIGEST
 
 
+def test_ollama_accepts_official_current_show_response(tmp_path: Path):
+    observed: dict[str, Any] = {}
+    with ollama_test_server(
+        successful_ollama_responder(
+            observed,
+            show_metadata=official_show_metadata(),
+        )
+    ) as endpoint:
+        result = isolated_ollama(endpoint=endpoint).run(make_request(tmp_path))
+
+    assert result.invocation.model_digest == OLLAMA_DIGEST
+    assert observed["paths"] == [
+        "/api/tags",
+        "/api/show",
+        "/api/chat",
+        "/api/tags",
+        "/api/show",
+    ]
+
+
+def test_ollama_local_private_result_persists_complete_justification(
+    tmp_path: Path,
+):
+    tags = local_model_metadata()
+    shown = official_show_metadata()
+    observed: dict[str, Any] = {}
+    with ollama_test_server(
+        successful_ollama_responder(
+            observed,
+            model_metadata=tags,
+            show_metadata=shown,
+        )
+    ) as endpoint:
+        authority = ollama_provider_module.OllamaRuntimeAuthority.generate(
+            "careerops_api_provenance"
+        )
+        evidence = authority.issue(
+            endpoint=endpoint,
+            model=OLLAMA_MODEL,
+            runtime_instance_id="runtime_provenance",
+            runtime_handle="container:ollama_provenance",
+            egress_policy="container_internal_no_egress",
+        )
+        provider = OllamaProvider(
+            endpoint=endpoint,
+            model=OLLAMA_MODEL,
+            runtime_instance_id="runtime_provenance",
+            runtime_handle="container:ollama_provenance",
+            isolation_authority=authority,
+            isolation_evidence=evidence,
+        )
+
+        availability = provider.availability()
+        result = provider.run(make_request(tmp_path))
+
+    tags_hash = hashlib.sha256(
+        json.dumps(tags, separators=(",", ":"), sort_keys=True).encode("utf-8")
+    ).hexdigest()
+    show_hash = hashlib.sha256(
+        json.dumps(shown, separators=(",", ":"), sort_keys=True).encode("utf-8")
+    ).hexdigest()
+    for provenance in (availability, result.invocation):
+        assert provenance.endpoint == endpoint
+        assert provenance.attestation_version == "ollama_isolation_v2"
+        assert provenance.runtime_instance_id == "runtime_provenance"
+        assert provenance.runtime_handle == "container:ollama_provenance"
+        assert provenance.issuer_instance_id == "careerops_api_provenance"
+        assert provenance.egress_policy == "container_internal_no_egress"
+        assert provenance.cloud_disabled is True
+        assert provenance.egress_enforced is True
+        assert provenance.isolation_evidence_sha256 == evidence.canonical_sha256
+        assert provenance.isolation_evidence_signature == evidence.integrity
+        assert provenance.model_metadata_sha256 == tags_hash
+        assert provenance.show_metadata_sha256 == show_hash
+    assert availability.privacy_mode is PrivacyMode.LOCAL_PRIVATE
+    assert availability.data_leaves_machine is False
+    assert result.privacy_mode is PrivacyMode.LOCAL_PRIVATE
+    assert result.data_leaves_machine is False
+
+
+def test_ollama_compatibility_probe_calls_only_tags_and_show():
+    observed: dict[str, Any] = {}
+    with ollama_test_server(successful_ollama_responder(observed)) as endpoint:
+        identity = OllamaProvider(
+            endpoint=endpoint,
+            model=OLLAMA_MODEL,
+        ).compatibility_probe()
+
+    assert identity.model == OLLAMA_MODEL
+    assert identity.digest == OLLAMA_DIGEST
+    assert identity.size == 1_024
+    assert re.fullmatch(r"[0-9a-f]{64}", identity.show_metadata_sha256)
+    assert observed["paths"] == ["/api/tags", "/api/show"]
+
+
+@pytest.mark.skipif(
+    os.environ.get("CAREEROPS_RUN_OLLAMA_IDENTITY_SMOKE") != "1",
+    reason="Opt-in real Ollama tags/show compatibility probe",
+)
+def test_ollama_real_machine_tags_show_compatibility_probe():
+    endpoint = os.environ.get(
+        "CAREEROPS_OLLAMA_SMOKE_ENDPOINT",
+        "http://127.0.0.1:11434",
+    )
+    model = os.environ.get("CAREEROPS_OLLAMA_SMOKE_MODEL", OLLAMA_MODEL)
+    provider = OllamaProvider(endpoint=endpoint, model=model, timeout_seconds=5)
+
+    try:
+        identity = provider.compatibility_probe()
+    except ProviderError as error:
+        pytest.skip(f"Ollama tags/show compatibility unavailable: {error}")
+
+    assert identity.model == model
+    assert identity.size > 0
+    assert re.fullmatch(r"[0-9a-f]{64}", identity.digest)
+    assert re.fullmatch(r"[0-9a-f]{64}", identity.tags_metadata_sha256)
+    assert re.fullmatch(r"[0-9a-f]{64}", identity.show_metadata_sha256)
+
+
 def test_ollama_show_remote_metadata_blocks_before_task_content(tmp_path: Path):
     observed: dict[str, Any] = {}
-    remote_show = local_model_metadata(remote_host="cloud.ollama.com")
+    remote_show = official_show_metadata(remote_host="cloud.ollama.com")
     with ollama_test_server(
         successful_ollama_responder(observed, show_metadata=remote_show)
     ) as endpoint:
@@ -626,6 +954,55 @@ def test_ollama_tags_remote_metadata_anywhere_blocks_before_task_content(
         with pytest.raises(ProviderUnavailableError):
             isolated_ollama(endpoint=endpoint).run(make_request(tmp_path))
 
+    assert observed == ["/api/tags"]
+
+
+@pytest.mark.parametrize("exhaustion", ["depth", "nodes"])
+def test_ollama_metadata_complexity_is_bounded_and_sanitized(
+    tmp_path: Path,
+    exhaustion: str,
+):
+    marker = "PRIVATE_METADATA_MARKER_65ba"
+    observed: list[str] = []
+    if exhaustion == "depth":
+        hostile: Any = marker
+        for _index in range(40):
+            hostile = {"layer": hostile}
+    else:
+        hostile = [marker] * 5_000
+
+    def excessive(handler: BaseHTTPRequestHandler) -> None:
+        observed.append(handler.path)
+        if handler.path == "/api/tags":
+            send_http_json(
+                handler,
+                200,
+                {
+                    "models": [local_model_metadata()],
+                    "audit": hostile,
+                },
+            )
+            return
+        if handler.path == "/api/show":
+            send_http_json(handler, 200, official_show_metadata())
+            return
+        send_http_json(
+            handler,
+            200,
+            {
+                "model": OLLAMA_MODEL,
+                "done": True,
+                "message": {
+                    "content": json.dumps(VALID_OUTPUTS["analyze_fit"])
+                },
+            },
+        )
+
+    with ollama_test_server(excessive) as endpoint:
+        with pytest.raises(ProviderOutputError, match="complexity") as captured:
+            isolated_ollama(endpoint=endpoint).run(make_request(tmp_path))
+
+    assert_public_error_is_sanitized(captured.value, marker)
     assert observed == ["/api/tags"]
 
 
@@ -677,7 +1054,7 @@ def test_ollama_envelope_rejects_recursive_duplicate_members(tmp_path: Path):
             send_http_json(handler, 200, {"models": [local_model_metadata()]})
             return
         if handler.path == "/api/show":
-            send_http_json(handler, 200, local_model_metadata())
+            send_http_json(handler, 200, official_show_metadata())
             return
         raw = (
             '{"model":"qwen2.5:7b","done":true,'
@@ -713,7 +1090,7 @@ def test_ollama_postflight_model_or_digest_drift_is_rejected(
             send_http_json(handler, 200, {"models": [metadata]})
             return
         if handler.path == "/api/show":
-            send_http_json(handler, 200, metadata)
+            send_http_json(handler, 200, official_show_metadata())
             return
         after_chat = True
         send_http_json(
@@ -733,6 +1110,55 @@ def test_ollama_postflight_model_or_digest_drift_is_rejected(
             isolated_ollama(endpoint=endpoint).run(make_request(tmp_path))
 
     assert observed[:3] == ["/api/tags", "/api/show", "/api/chat"]
+
+
+def test_ollama_postflight_show_metadata_hash_drift_is_rejected(tmp_path: Path):
+    after_chat = False
+    observed: list[str] = []
+
+    def drift(handler: BaseHTTPRequestHandler) -> None:
+        nonlocal after_chat
+        observed.append(handler.path)
+        if handler.path == "/api/tags":
+            send_http_json(handler, 200, {"models": [local_model_metadata()]})
+            return
+        if handler.path == "/api/show":
+            send_http_json(
+                handler,
+                200,
+                official_show_metadata(
+                    modified_at=(
+                        "2025-08-15T15:49:43Z"
+                        if after_chat
+                        else "2025-08-14T15:49:43Z"
+                    )
+                ),
+            )
+            return
+        after_chat = True
+        send_http_json(
+            handler,
+            200,
+            {
+                "model": OLLAMA_MODEL,
+                "done": True,
+                "message": {
+                    "content": json.dumps(VALID_OUTPUTS["analyze_fit"])
+                },
+            },
+        )
+
+    with ollama_test_server(drift) as endpoint:
+        with pytest.raises(ProviderUnavailableError, match="provenance"):
+            isolated_ollama(endpoint=endpoint).run(make_request(tmp_path))
+
+    assert observed == [
+        "/api/tags",
+        "/api/show",
+        "/api/chat",
+        "/api/tags",
+        "/api/show",
+    ]
 
 
 def test_ollama_redirect_is_rejected_without_following(tmp_path: Path):
@@ -765,7 +1191,7 @@ def test_ollama_slow_drip_obeys_one_overall_deadline(tmp_path: Path):
             send_http_json(handler, 200, {"models": [local_model_metadata()]})
             return
         if handler.path == "/api/show":
-            send_http_json(handler, 200, local_model_metadata())
+            send_http_json(handler, 200, official_show_metadata())
             return
         body = json.dumps(
             {
@@ -841,7 +1267,7 @@ def test_ollama_rejects_oversized_envelope_incrementally(tmp_path: Path):
             send_http_json(handler, 200, {"models": [local_model_metadata()]})
             return
         if handler.path == "/api/show":
-            send_http_json(handler, 200, local_model_metadata())
+            send_http_json(handler, 200, official_show_metadata())
             return
         send_http_bytes(
             handler,
@@ -883,7 +1309,7 @@ def test_ollama_http_error_is_typed_sanitized_and_not_retried(tmp_path: Path):
             send_http_json(handler, 200, {"models": [local_model_metadata()]})
             return
         if handler.path == "/api/show":
-            send_http_json(handler, 200, local_model_metadata())
+            send_http_json(handler, 200, official_show_metadata())
             return
         chat_calls += 1
         send_http_json(handler, 500, {"api_key": "private-server-secret"})
@@ -945,7 +1371,7 @@ def test_ollama_rejects_malformed_incomplete_or_wrong_model_chat(
         if handler.path == "/api/tags":
             send_http_json(handler, 200, {"models": [local_model_metadata()]})
         elif handler.path == "/api/show":
-            send_http_json(handler, 200, local_model_metadata())
+            send_http_json(handler, 200, official_show_metadata())
         else:
             send_http_bytes(handler, 200, chat_body)
 
