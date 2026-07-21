@@ -2288,20 +2288,18 @@ def test_begin_invocation_rejects_non_pristine_application_in_same_update(
     assert repo.get_ai_task(task.id).invocation_started_at is None
 
 
-def test_approval_wins_before_invocation_and_cancels_pending_task(
+def test_approval_commit_wins_race_with_task_claim(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
     repo = make_repo(tmp_path)
     application, _resume, report = prepare_approvable_application(repo, tmp_path)
-    provider_config = create_provider(repo)
-    task = create_bound_task(
-        repo, application.id, provider_config.id, "analyze_jd"
-    )
+    provider = create_provider(repo)
+    task = create_bound_task(repo, application.id, provider.id, "analyze_jd")
     approval_repo = CareerOpsRepository(repo.database_path, repo.vault_path)
-    invocation_repo = CareerOpsRepository(repo.database_path, repo.vault_path)
+    claim_repo = CareerOpsRepository(repo.database_path, repo.vault_path)
     approval_updated = Event()
     release_approval = Event()
-    invocation_started = Event()
+    claim_started = Event()
     original_write_audit = approval_repo._write_audit
 
     def pause_approval_audit(
@@ -2316,20 +2314,9 @@ def test_approval_wins_before_invocation_and_cancels_pending_task(
 
     monkeypatch.setattr(approval_repo, "_write_audit", pause_approval_audit)
 
-    class ProviderRunCounter:
-        calls = 0
-
-        def run(self):
-            self.calls += 1
-
-    provider = ProviderRunCounter()
-
-    def begin_invocation():
-        invocation_started.set()
-        began = invocation_repo.begin_ai_task_invocation(task.id, "stale-claim")
-        if began:
-            provider.run()
-        return began
+    def claim():
+        claim_started.set()
+        return claim_repo.claim_ai_task(task.id)
 
     with ThreadPoolExecutor(max_workers=2) as executor:
         approval_future = executor.submit(
@@ -2339,17 +2326,68 @@ def test_approval_wins_before_invocation_and_cancels_pending_task(
             "Reviewed",
         )
         assert approval_updated.wait(2)
-        invocation_future = executor.submit(begin_invocation)
-        assert invocation_started.wait(2)
+        claim_future = executor.submit(claim)
+        assert claim_started.wait(2)
+        assert not claim_future.done()
         release_approval.set()
         approval_future.result(timeout=2)
-        assert invocation_future.result(timeout=2) is False
+        assert claim_future.result(timeout=2) is None
 
     cancelled = repo.get_ai_task(task.id)
     assert cancelled.status == "failed"
     assert cancelled.error_summary == "cancelled"
-    assert provider.calls == 0
     assert repo.get_application(application.id).approval_id is not None
+
+
+def test_task_claim_commit_wins_race_with_approval(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    repo = make_repo(tmp_path)
+    application, _resume, report = prepare_approvable_application(repo, tmp_path)
+    provider = create_provider(repo)
+    task = create_bound_task(repo, application.id, provider.id, "analyze_jd")
+    claim_repo = CareerOpsRepository(repo.database_path, repo.vault_path)
+    approval_repo = CareerOpsRepository(repo.database_path, repo.vault_path)
+    claim_updated = Event()
+    release_claim = Event()
+    approval_started = Event()
+    original_connection = claim_repo.connection
+
+    @contextmanager
+    def pause_claim_commit():
+        with original_connection() as connection:
+            yield connection
+            status = connection.execute(
+                "SELECT status FROM ai_tasks WHERE id = ?", (task.id,)
+            ).fetchone()["status"]
+            if status == "running":
+                claim_updated.set()
+                assert release_claim.wait(2)
+
+    monkeypatch.setattr(claim_repo, "connection", pause_claim_commit)
+
+    def approve():
+        approval_started.set()
+        return approval_repo.approve_application(
+            application.id, report.id, "Reviewed"
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        claim_future = executor.submit(claim_repo.claim_ai_task, task.id)
+        assert claim_updated.wait(2)
+        approval_future = executor.submit(approve)
+        assert approval_started.wait(2)
+        assert not approval_future.done()
+        release_claim.set()
+        claim_token = claim_future.result(timeout=2)
+        assert isinstance(claim_token, str)
+        with pytest.raises(ValueError, match="Application has a running AI task"):
+            approval_future.result(timeout=2)
+
+    unchanged = repo.get_application(application.id)
+    assert unchanged.approval_id is None
+    assert unchanged.status == "ready_for_review"
+    assert repo.get_ai_task(task.id).status == "running"
 
 
 def test_invocation_wins_before_approval_and_application_stays_unapproved(
@@ -2898,28 +2936,94 @@ def test_approval_validation_holds_write_lock_until_audit_commit(
     assert approval.report_id == report.id
 
 
+def test_approval_audit_failure_rolls_back_pending_cancellation_and_state(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    repo = make_repo(tmp_path)
+    application, _resume, report = prepare_approvable_application(repo, tmp_path)
+    provider = create_provider(repo)
+    pending = create_bound_task(repo, application.id, provider.id, "analyze_jd")
+    terminal = create_bound_task(repo, application.id, provider.id, "analyze_jd")
+    terminal_claim = claim_task(repo, terminal.id)
+    repo.fail_ai_task(terminal.id, terminal_claim, "provider_error")
+    before_application = repo.get_application(application.id)
+    before_pending = repo.get_ai_task(pending.id)
+    before_terminal = repo.get_ai_task(terminal.id)
+    before_events = repo.list_audit_events()
+    original = repo._write_audit
+    attempted_events: list[str] = []
+
+    def fail_approval_audit(connection, event_type, *args, **kwargs):
+        attempted_events.append(event_type)
+        if event_type == "application.approved":
+            assert attempted_events[-2:] == ["ai_task.failed", "application.approved"]
+            raise RuntimeError("injected approval audit failure")
+        return original(connection, event_type, *args, **kwargs)
+
+    monkeypatch.setattr(repo, "_write_audit", fail_approval_audit)
+    with pytest.raises(RuntimeError, match="injected approval audit failure"):
+        repo.approve_application(application.id, report.id, "Reviewed")
+
+    assert repo.get_application(application.id) == before_application
+    assert repo.get_ai_task(pending.id) == before_pending
+    assert repo.get_ai_task(terminal.id) == before_terminal
+    assert repo.list_audit_events() == before_events
+    assert attempted_events == ["ai_task.failed", "application.approved"]
+    with repo.connection() as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM approvals WHERE application_id = ?",
+            (application.id,),
+        ).fetchone()[0] == 0
+
+
 def test_submission_failure_rolls_back_state_and_audit(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
     repo = make_repo(tmp_path)
-    application, _resume, _report, _approval = create_approved_application(
-        repo, tmp_path
-    )
-    before = repo.get_application(application.id)
+    application, _resume, report = prepare_approvable_application(repo, tmp_path)
+    provider = create_provider(repo)
+    pending = create_bound_task(repo, application.id, provider.id, "analyze_jd")
+    terminal = create_bound_task(repo, application.id, provider.id, "analyze_jd")
+    terminal_claim = claim_task(repo, terminal.id)
+    repo.fail_ai_task(terminal.id, terminal_claim, "provider_error")
+    repo.approve_application(application.id, report.id, "Reviewed")
+    with repo.connection() as connection:
+        connection.execute(
+            """
+            UPDATE ai_tasks
+            SET status = 'pending', started_at = NULL, completed_at = NULL,
+                error_summary = '', claim_token = NULL, claim_expires_at = NULL,
+                invocation_started_at = NULL
+            WHERE id = ?
+            """,
+            (pending.id,),
+        )
+    before_application = repo.get_application(application.id)
+    before_pending = repo.get_ai_task(pending.id)
+    before_terminal = repo.get_ai_task(terminal.id)
     before_events = repo.list_audit_events()
     original = repo._write_audit
+    attempted_events: list[str] = []
 
     def fail_submission_audit(connection, event_type, *args, **kwargs):
+        attempted_events.append(event_type)
         if event_type == "application.submitted_manual":
-            raise RuntimeError("injected audit failure")
+            assert attempted_events[-2:] == [
+                "ai_task.failed",
+                "application.submitted_manual",
+            ]
+            raise RuntimeError("injected submission audit failure")
         return original(connection, event_type, *args, **kwargs)
 
     monkeypatch.setattr(repo, "_write_audit", fail_submission_audit)
-    with pytest.raises(RuntimeError, match="injected audit failure"):
+    with pytest.raises(RuntimeError, match="injected submission audit failure"):
         repo.mark_submitted_manual(application.id, "Submitted")
 
-    assert repo.get_application(application.id) == before
+    assert repo.get_application(application.id) == before_application
+    assert repo.get_ai_task(pending.id) == before_pending
+    assert repo.get_ai_task(terminal.id) == before_terminal
     assert repo.list_audit_events() == before_events
+    assert attempted_events == ["ai_task.failed", "application.submitted_manual"]
 
 
 def test_database_contexts_commit_or_rollback_and_always_close(tmp_path: Path):
