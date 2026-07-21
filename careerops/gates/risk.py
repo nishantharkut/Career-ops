@@ -28,7 +28,9 @@ class RiskReport:
 
 
 METRIC_PATTERN = re.compile(r"(\d+%|\d+\+|\b\d+\s+regression\b)", re.IGNORECASE)
-SECRET_PATTERN = re.compile(r"(?i)(password|secret|token|api[_-]?key)\s*[:=]\s*\S+")
+SECRET_PATTERN = re.compile(
+    r"(?i)(password|secret|token|api(?:[\s_-]*key))\s*[:=]\s*\S+"
+)
 NDA_TERMS = (
     "cdi testing",
     "oig exclusion",

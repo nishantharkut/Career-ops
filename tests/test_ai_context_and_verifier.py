@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from dataclasses import asdict
 from concurrent.futures import ThreadPoolExecutor
 from threading import Lock
 import time
@@ -2692,6 +2693,7 @@ def test_verification_sidecar_is_bound_to_the_exact_provider_context():
         sha256=context.sha256,
         verification_bytes=forged_bytes,
         verification_sha256=hashlib.sha256(forged_bytes).hexdigest(),
+        authority_seal=context.authority_seal,
     )
 
     result = verify_analyze_fit(_fit_output(), context=forged)
@@ -2758,3 +2760,330 @@ def test_maximum_analysis_shape_reuses_precomputed_source_grounding():
 
     assert result.safe is True
     assert elapsed < 5.0
+
+
+@pytest.mark.parametrize(
+    ("jd_text", "resume_text", "output"),
+    [
+        (
+            "We do not use COBOL. Python is not required.",
+            "Python developer",
+            _jd_output(
+                normalized_title="Unspecified",
+                normalized_company="Unspecified",
+                normalized_location="Unspecified",
+                responsibilities=[],
+                required_skills=["COBOL", "Python"],
+                preferred_skills=[],
+                keywords=[],
+                uncertainties=[],
+            ),
+        ),
+        (
+            "Kubernetes role",
+            "I do not know Kubernetes",
+            _fit_output(matches=["Kubernetes"], gaps=[], risks=[], recommendations=[]),
+        ),
+        (
+            "Python may be useful.",
+            "",
+            _jd_output(
+                normalized_title="Unspecified",
+                normalized_company="Unspecified",
+                normalized_location="Unspecified",
+                responsibilities=[],
+                required_skills=["Python"],
+                preferred_skills=[],
+                keywords=[],
+                uncertainties=[],
+            ),
+        ),
+    ],
+)
+def test_analysis_grounding_preserves_source_negation(
+    jd_text: str,
+    resume_text: str,
+    output: dict[str, object],
+):
+    task_type = str(output["task_type"])
+    values: dict[str, object] = {
+        "job_description": {"snapshot_id": "jd-negated", "text": jd_text}
+    }
+    if task_type == "analyze_fit":
+        values["resume"] = {
+            "version_id": "resume-negated",
+            "source_kind": "latex",
+            "source_text": resume_text,
+        }
+    context = ContextPacketBuilder().build(task_type, **values)
+
+    result = verify_task_output(task_type, output, context=context)
+
+    assert "unsupported_claim" in {finding.code for finding in result.findings}
+
+
+def test_analysis_blocks_unrecognized_source_directives():
+    context = ContextPacketBuilder().build(
+        "analyze_jd",
+        job_description={
+            "snapshot_id": "jd-directive",
+            "text": "Do not report title Chief Executive Officer.",
+        },
+    )
+    output = _jd_output(
+        normalized_title="Chief Executive Officer",
+        normalized_company="Unspecified",
+        normalized_location="Unspecified",
+        responsibilities=[],
+        required_skills=[],
+        preferred_skills=[],
+        keywords=[],
+        uncertainties=[],
+    )
+
+    result = verify_analyze_jd(output, context=context)
+
+    assert "unsupported_claim" in {finding.code for finding in result.findings}
+
+
+def test_private_entity_cannot_be_hidden_by_unrelated_padding():
+    text = (
+        "I delivered reliable systems and collaborated across teams for Goldman Sachs."
+    )
+    result = verify_cover_letter(
+        {
+            "task_type": "draft_cover_letter",
+            "plain_text": text,
+            "evidence_refs": ["ev-padding"],
+        },
+        evidence=[_evidence("ev-padding", summary=text)],
+        private_claims=["Handled confidential work for Goldman Sachs"],
+    )
+
+    assert "private_claim" in {finding.code for finding in result.findings}
+
+
+def test_generic_prefix_of_private_evidence_does_not_overblock_fit_analysis():
+    context = ContextPacketBuilder().build(
+        "analyze_fit",
+        job_description={"snapshot_id": "jd-generic", "text": "Python backend role"},
+        resume={
+            "version_id": "resume-generic",
+            "source_kind": "latex",
+            "source_text": "Python backend developer",
+        },
+        evidence=[
+            _evidence(
+                "ev-private-generic",
+                summary="Python backend migration for ClientX",
+                verification_state="private_do_not_publish",
+                privacy_level="private",
+            )
+        ],
+    )
+
+    result = verify_analyze_fit(
+        _fit_output(matches=["Python backend"], gaps=[], risks=[], recommendations=[]),
+        context=context,
+    )
+
+    assert result.safe is True
+
+
+def test_private_material_matching_handles_common_inflections():
+    text = "Migrated payments for Acme."
+    result = verify_cover_letter(
+        {
+            "task_type": "draft_cover_letter",
+            "plain_text": text,
+            "evidence_refs": ["ev-acme"],
+        },
+        evidence=[_evidence("ev-acme", summary=text)],
+        private_claims=["Led the Acme payment migration"],
+    )
+
+    assert "private_claim" in {finding.code for finding in result.findings}
+
+
+def test_cover_letter_role_reference_must_match_the_selected_job():
+    context = _cover_context(jd_text="Software Engineer role")
+
+    result = verify_cover_letter(
+        {
+            "task_type": "draft_cover_letter",
+            "plain_text": "I am excited to apply for the Chief Executive Officer role.",
+            "evidence_refs": [],
+        },
+        context=context,
+    )
+
+    assert "unsupported_claim" in {finding.code for finding in result.findings}
+
+
+def test_resume_edit_reason_cannot_invent_ats_metrics_or_requirements():
+    payload = _resume_output()
+    payload["suggestions"][0]["reason"] = (
+        "Raises the ATS score by 99% and satisfies the employer COBOL requirement"
+    )
+
+    result = verify_resume_edits(
+        payload,
+        resume_tex="Built PocketBuddy",
+        evidence=[],
+    )
+
+    assert "unsupported_claim" in {finding.code for finding in result.findings}
+    assert "unsupported_metric" in {finding.code for finding in result.findings}
+
+
+def test_context_adapter_exceptions_are_redacted_without_chaining():
+    private_marker = "PRIVATE-CONTEXT-PAYLOAD"
+
+    class ExplodingModel:
+        def model_dump(self, **_values):
+            raise RuntimeError(private_marker)
+
+    with pytest.raises(ContextBuildError) as caught:
+        ContextPacketBuilder().build(
+            "analyze_fit",
+            job_description={"snapshot_id": "jd-exploding", "text": "Python role"},
+            resume={
+                "version_id": "resume-exploding",
+                "source_kind": "latex",
+                "source_text": "Python developer",
+            },
+            confirmed_facts=[ExplodingModel()],
+        )
+
+    assert private_marker not in str(caught.value)
+    assert private_marker not in repr(caught.value)
+    assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None
+
+
+def test_spaced_api_key_is_always_secret_like_text():
+    text = "Configured API key = sk-live-123."
+    result = verify_cover_letter(
+        {
+            "task_type": "draft_cover_letter",
+            "plain_text": text,
+            "evidence_refs": ["ev-secret"],
+        },
+        evidence=[_evidence("ev-secret", summary=text)],
+    )
+
+    assert "secret_like_text" in {finding.code for finding in result.findings}
+
+
+def test_provider_context_omits_source_urls_and_query_credentials():
+    secret_url = "https://jobs.example/apply?token=private-value"
+    context = ContextPacketBuilder().build(
+        "analyze_jd",
+        job_description={
+            "snapshot_id": "jd-url",
+            "text": "Python role",
+            "source_url": secret_url,
+        },
+    )
+
+    assert "source_url" not in context.to_dict()["job_description"]
+    assert secret_url not in context.canonical_json
+
+
+def test_needs_review_cannot_ignore_exact_verified_evidence():
+    result = verify_claim_review(
+        {
+            "task_type": "review_claims",
+            "decisions": [
+                {
+                    "claim_id": "claim-needs-review",
+                    "decision": "needs_review",
+                    "reason": "Needs human review",
+                    "evidence_refs": ["ev-exact"],
+                }
+            ],
+        },
+        claims=[
+            {
+                "id": "claim-needs-review",
+                "text": "Built PocketBuddy",
+                "verification_state": "needs_verification",
+                "privacy_level": "public",
+            }
+        ],
+        evidence=[_evidence("ev-exact", summary="Built PocketBuddy")],
+    )
+
+    assert "unsupported_claim" in {finding.code for finding in result.findings}
+
+
+def test_context_packet_rejects_generic_dataclass_serialization():
+    private_marker = "PRIVATE-SIDECAR-MARKER"
+    context = ContextPacketBuilder().build(
+        "analyze_fit",
+        job_description={"snapshot_id": "jd-asdict", "text": "Python role"},
+        resume={
+            "version_id": "resume-asdict",
+            "source_kind": "latex",
+            "source_text": "Python developer",
+        },
+        confirmed_facts=[
+            {
+                "id": "fact-asdict",
+                "key": "private",
+                "value": private_marker,
+                "verification_state": "private_do_not_publish",
+                "privacy_level": "private",
+            }
+        ],
+    )
+
+    with pytest.raises(TypeError):
+        asdict(context)
+    assert private_marker not in repr(context)
+
+
+def test_rehashed_private_sidecar_cannot_reuse_the_original_packet_authority():
+    private_marker = "PRIVATE-AUTHORITY-MARKER"
+    context = ContextPacketBuilder().build(
+        "analyze_fit",
+        job_description={"snapshot_id": "jd-authority", "text": "Python role"},
+        resume={
+            "version_id": "resume-authority",
+            "source_kind": "latex",
+            "source_text": "Python developer",
+        },
+        confirmed_facts=[
+            {
+                "id": "fact-authority",
+                "key": "private",
+                "value": private_marker,
+                "verification_state": "private_do_not_publish",
+                "privacy_level": "private",
+            }
+        ],
+    )
+    sidecar = context.verification_dict()
+    sidecar["confirmed_profile_facts"] = []
+    forged_bytes = json.dumps(
+        sidecar,
+        ensure_ascii=False,
+        allow_nan=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    forged = ContextPacket(
+        task_type=context.task_type,
+        canonical_bytes=context.canonical_bytes,
+        sha256=context.sha256,
+        verification_bytes=forged_bytes,
+        verification_sha256=hashlib.sha256(forged_bytes).hexdigest(),
+        authority_seal=context.authority_seal,
+    )
+
+    result = verify_analyze_fit(
+        _fit_output(matches=["Python"], gaps=[], risks=[], recommendations=[]),
+        context=forged,
+    )
+
+    assert [finding.code for finding in result.findings] == ["schema_invalid"]

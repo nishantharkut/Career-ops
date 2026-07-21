@@ -92,20 +92,31 @@ _INJECTION_PATTERN = re.compile(
     r"\bapprove\s+me\b|\breport\s+(?:a\s+)?perfect\s+match\b|"
     r"\b(?:output|return|respond\s+with)\b.{0,80}\binstead\b)"
 )
+_SOURCE_DIRECTIVE_PATTERN = re.compile(
+    r"(?i)\b(?:do\s+not|don't|never)\s+"
+    r"(?:claim|include|list|output|report|return|say|state)\b"
+)
+_INSTRUCTION_PATTERNS = (_INJECTION_PATTERN, _SOURCE_DIRECTIVE_PATTERN)
+_NEGATION_PATTERN = re.compile(
+    r"(?i)\b(?:cannot|can't|did\s+not|didn't|do\s+not|don't|does\s+not|"
+    r"doesn't|lacks?|lacking|never|no|not|without)\b"
+)
+_OPTIONAL_MODALITY_PATTERN = re.compile(
+    r"(?i)\b(?:may|might|nice\s+to\s+have|optional|preferred)\b"
+)
 _NON_FACTUAL_SENTENCE_PATTERNS = (
     re.compile(r"(?i)^dear [a-z][a-z .'-]*,?$"),
     re.compile(r"(?i)^(?:sincerely|regards|best regards),?$"),
     re.compile(r"(?i)^thank you(?: for considering my application)?$"),
-    re.compile(
-        r"(?i)^i(?: am|'m) interested in (?:this|the) "
-        r"(?:[a-z0-9+#.-]+ ){0,8}role$"
-    ),
-    re.compile(
-        r"(?i)^i(?: am|'m) excited to apply(?: for (?:this|the) "
-        r"(?:[a-z0-9+#.-]+ ){0,8}role)?$"
-    ),
+    re.compile(r"(?i)^i(?: am|'m) interested in (?:this|the) role$"),
+    re.compile(r"(?i)^i(?: am|'m) excited to apply(?: for (?:this|the) role)?$"),
     re.compile(r"(?i)^please consider my application$"),
 )
+_COVER_ROLE_REFERENCE_PATTERN = re.compile(
+    r"(?i)^i(?: am|'m) (?:interested in|excited to apply for) "
+    r"(?:this|the) (?P<role>[a-z0-9+#.-]+(?: [a-z0-9+#.-]+){0,7}) role$"
+)
+_GENERIC_COVER_ROLE_DESCRIPTORS = frozenset({"engineering", "software engineering"})
 _SUPPORTED_REASON_PATTERNS = (
     re.compile(r"(?i)^direct (?:evidence|match)$"),
     re.compile(r"(?i)^matches? (?:the )?(?:supplied )?(?:evidence|record)$"),
@@ -220,6 +231,13 @@ _GENERIC_UNCERTAINTY_PATTERN = re.compile(
     r"seniority|title|work arrangement)(?: is)? "
     r"(?:not specified|not stated|unclear|unknown|unspecified)$"
 )
+_RESUME_GENERIC_REASON_PATTERNS = (
+    re.compile(r"(?i)^exact wording$"),
+    re.compile(r"(?i)^aligns? (?:the )?wording with (?:the )?evidence$"),
+    re.compile(r"(?i)^matches? (?:the )?(?:supplied )?evidence$"),
+    re.compile(r"(?i)^improves? (?:clarity|readability)$"),
+)
+_ATS_PATTERN = re.compile(r"(?i)\bats\b")
 _METRIC_WRAPPER_LEXEMES = frozenset(
     {
         "a",
@@ -275,6 +293,45 @@ _LOW_SIGNAL_LEXEMES = frozenset(
         "with",
     }
 )
+_RESTRICTED_LEXEME_EQUIVALENTS = {
+    "led": "lead",
+    "leading": "lead",
+    "migrated": "migrate",
+    "migrating": "migrate",
+    "migration": "migrate",
+    "migrations": "migrate",
+    "payments": "payment",
+    "served": "serve",
+    "serving": "serve",
+}
+_GENERIC_ENTITY_LEXEMES = frozenset(
+    {
+        "ai",
+        "api",
+        "aws",
+        "azure",
+        "backend",
+        "cloud",
+        "data",
+        "developer",
+        "development",
+        "engineer",
+        "engineering",
+        "enterprise",
+        "frontend",
+        "india",
+        "java",
+        "javascript",
+        "migration",
+        "project",
+        "python",
+        "react",
+        "software",
+        "sql",
+        "team",
+        "typescript",
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -326,6 +383,9 @@ class _Claim:
     text: str
     verification_state: str
     privacy_level: str
+
+
+MaterialCache = dict[tuple[str, str], Any]
 
 
 def _finding(
@@ -712,12 +772,17 @@ def _ordered_subsequence(needle: Sequence[str], haystack: Sequence[str]) -> bool
 
 def _contains_injection(text: str) -> bool:
     return any(
-        _INJECTION_PATTERN.search(variant) is not None
+        pattern.search(variant) is not None
         for variant in _injection_text_variants(text)
+        for pattern in _INSTRUCTION_PATTERNS
     )
 
 
-def _trusted_source_segments(sources: Sequence[str]) -> tuple[str, ...] | None:
+def _trusted_source_segments(
+    sources: Sequence[str],
+    *,
+    exclude_optional: bool = False,
+) -> tuple[str, ...] | None:
     trusted: list[str] = []
     for source in sources:
         sentences = _sentences(source)
@@ -725,9 +790,12 @@ def _trusted_source_segments(sources: Sequence[str]) -> tuple[str, ...] | None:
             return None
         rejected_any = False
         for sentence in sentences:
+            normalized = _normalized_text(sentence)
             if _contains_injection(sentence):
                 rejected_any = True
-            else:
+            elif not _NEGATION_PATTERN.search(normalized) and not (
+                exclude_optional and _OPTIONAL_MODALITY_PATTERN.search(normalized)
+            ):
                 trusted.append(sentence)
         if _contains_injection(source) and not rejected_any:
             return ()
@@ -736,8 +804,10 @@ def _trusted_source_segments(sources: Sequence[str]) -> tuple[str, ...] | None:
 
 def _trusted_source_lexemes(
     sources: Sequence[str],
+    *,
+    exclude_optional: bool = False,
 ) -> tuple[tuple[str, ...], ...] | None:
-    segments = _trusted_source_segments(sources)
+    segments = _trusted_source_segments(sources, exclude_optional=exclude_optional)
     if segments is None:
         return None
     result: list[tuple[str, ...]] = []
@@ -769,6 +839,22 @@ def _analysis_statement_supported(
         if _ordered_subsequence(required, available):
             return True
     return False
+
+
+def _resume_reason_supported(
+    reason: str,
+    sources: Sequence[str],
+) -> tuple[bool | None, bool]:
+    normalized = _normalized_text(reason).strip(" .!?")
+    metric_supported = _metric_supported_by_sources(reason, sources)
+    if _ATS_PATTERN.search(normalized):
+        return False, metric_supported
+    if any(pattern.fullmatch(normalized) for pattern in _RESUME_GENERIC_REASON_PATTERNS):
+        return True, metric_supported
+    grounding = _trusted_source_lexemes(sources)
+    if grounding is None:
+        return None, metric_supported
+    return _analysis_statement_supported(reason, grounding), metric_supported
 
 
 def _metric_statement_matches(statement: str, source: str) -> bool:
@@ -924,21 +1010,25 @@ def _injection_fragments(source_values: Sequence[Any]) -> tuple[str, ...] | None
     fragments: set[str] = set()
     for source in source_texts:
         for normalized_variant in _injection_text_variants(source):
-            fragments.update(
-                _normalized_text(match.group(0))
-                for match in _INJECTION_PATTERN.finditer(normalized_variant)
-            )
+            for pattern in _INSTRUCTION_PATTERNS:
+                fragments.update(
+                    _normalized_text(match.group(0))
+                    for match in pattern.finditer(normalized_variant)
+                )
         sentences = _sentences(source)
         if sentences is None:
             return None
         for candidate in sentences:
             normalized = _normalized_text(candidate.strip(" \t\r\n.!?"))
-            if normalized and _INJECTION_PATTERN.search(normalized):
+            if normalized and any(
+                pattern.search(normalized) for pattern in _INSTRUCTION_PATTERNS
+            ):
                 fragments.add(normalized)
-                fragments.update(
-                    _normalized_text(match.group(0))
-                    for match in _INJECTION_PATTERN.finditer(normalized)
-                )
+                for pattern in _INSTRUCTION_PATTERNS:
+                    fragments.update(
+                        _normalized_text(match.group(0))
+                        for match in pattern.finditer(normalized)
+                    )
     return tuple(sorted(fragments))
 
 
@@ -1033,7 +1123,7 @@ def _blocked_material(
     evidence: Sequence[_Evidence],
     rejected: Sequence[str],
     private_claims: Sequence[str],
-    lexeme_cache: dict[str, tuple[str, ...] | None] | None = None,
+    lexeme_cache: MaterialCache | None = None,
 ) -> tuple[bool, bool]:
     rejected_echo = any(
         _material_overlap(text, claim, lexeme_cache) for claim in rejected
@@ -1050,26 +1140,112 @@ def _blocked_material(
 
 def _material_lexemes(
     text: str,
-    cache: dict[str, tuple[str, ...] | None] | None = None,
+    cache: MaterialCache | None = None,
 ) -> tuple[str, ...] | None:
-    if cache is not None and text in cache:
-        return cache[text]
+    cache_key = ("lexemes", text)
+    if cache is not None and cache_key in cache:
+        return cache[cache_key]
     lexemes = _lexemes(text)
     if lexemes is None:
         if cache is not None:
-            cache[text] = None
+            cache[cache_key] = None
         return None
     high_signal = tuple(token for token in lexemes if token not in _LOW_SIGNAL_LEXEMES)
     result = high_signal or lexemes
+    result = tuple(_RESTRICTED_LEXEME_EQUIVALENTS.get(token, token) for token in result)
     if cache is not None:
-        cache[text] = result
+        cache[cache_key] = result
     return result
+
+
+def _surface_lexemes(text: str) -> tuple[str, ...] | None:
+    result: list[str] = []
+    current: list[str] = []
+    normalized = unicodedata.normalize("NFKC", text)
+    for character in normalized:
+        if _is_default_ignorable(character):
+            continue
+        category = unicodedata.category(character)
+        if category[0] in {"L", "M", "N"}:
+            current.append(character)
+        elif current:
+            result.append("".join(current))
+            current = []
+            if len(result) > MAX_LEXEMES_PER_TEXT:
+                return None
+    if current:
+        result.append("".join(current))
+    return tuple(result) if len(result) <= MAX_LEXEMES_PER_TEXT else None
+
+
+def _distinctive_material_sequences(
+    text: str,
+    cache: MaterialCache | None = None,
+) -> tuple[tuple[str, ...], ...] | None:
+    cache_key = ("entities", text)
+    if cache is not None and cache_key in cache:
+        return cache[cache_key]
+    surface = _surface_lexemes(text)
+    if surface is None:
+        if cache is not None:
+            cache[cache_key] = None
+        return None
+    sequences: list[tuple[str, ...]] = []
+    run: list[str] = []
+    for index, token in enumerate(surface):
+        folded = token.casefold()
+        has_upper = any(character.isupper() for character in token)
+        has_lower = any(character.islower() for character in token)
+        mixed_case = has_upper and has_lower and not token.istitle()
+        all_caps = has_upper and not has_lower and len(token) >= 2
+        title_case = token.istitle() and folded not in _GENERIC_ENTITY_LEXEMES
+        if title_case:
+            run.append(_RESTRICTED_LEXEME_EQUIVALENTS.get(folded, folded))
+        else:
+            if len(run) >= 2:
+                sequences.append(tuple(run))
+            elif len(run) == 1 and index > 1:
+                sequences.append(tuple(run))
+            run = []
+        if (mixed_case or all_caps) and folded not in _GENERIC_ENTITY_LEXEMES:
+            sequences.append(
+                (_RESTRICTED_LEXEME_EQUIVALENTS.get(folded, folded),)
+            )
+    if len(run) >= 2:
+        sequences.append(tuple(run))
+    elif len(run) == 1 and len(surface) > 1:
+        sequences.append(tuple(run))
+    result = tuple(dict.fromkeys(sequences))
+    if cache is not None:
+        cache[cache_key] = result
+    return result
+
+
+def _material_metrics(text: str, cache: MaterialCache | None = None) -> frozenset[str]:
+    cache_key = ("metrics", text)
+    if cache is not None and cache_key in cache:
+        return cache[cache_key]
+    result = frozenset(METRIC_PATTERN.findall(_normalize_text(text)))
+    if cache is not None:
+        cache[cache_key] = result
+    return result
+
+
+def _contains_token_sequence(
+    haystack: Sequence[str],
+    needle: Sequence[str],
+) -> bool:
+    size = len(needle)
+    return bool(size) and any(
+        tuple(haystack[index : index + size]) == tuple(needle)
+        for index in range(len(haystack) - size + 1)
+    )
 
 
 def _material_overlap(
     text: str,
     blocked: str,
-    cache: dict[str, tuple[str, ...] | None] | None = None,
+    cache: MaterialCache | None = None,
 ) -> bool:
     text_tokens = _material_lexemes(text, cache)
     blocked_tokens = _material_lexemes(blocked, cache)
@@ -1079,13 +1255,20 @@ def _material_overlap(
         return False
     text_counts = Counter(text_tokens)
     blocked_counts = Counter(blocked_tokens)
-    shorter_size = min(sum(text_counts.values()), sum(blocked_counts.values()))
     overlap = sum((text_counts & blocked_counts).values())
-    if shorter_size == 1:
-        return overlap == 1
-    return overlap == shorter_size or (
-        overlap >= 2 and overlap * 2 >= shorter_size
-    )
+    blocked_size = sum(blocked_counts.values())
+    if overlap == blocked_size:
+        return True
+    if blocked_size >= 2 and overlap >= 2 and overlap * 4 >= blocked_size * 3:
+        return True
+    text_metrics = _material_metrics(text, cache)
+    blocked_metrics = _material_metrics(blocked, cache)
+    if text_metrics & blocked_metrics and overlap >= 2:
+        return True
+    entities = _distinctive_material_sequences(blocked, cache)
+    if entities is None:
+        return True
+    return any(_contains_token_sequence(text_tokens, entity) for entity in entities)
 
 
 def _verify_analysis(
@@ -1137,8 +1320,15 @@ def _verify_analysis(
         )
 
     job_grounding = _trusted_source_lexemes(job_sources)
+    strict_job_grounding = _trusted_source_lexemes(
+        job_sources, exclude_optional=True
+    )
     candidate_grounding = _trusted_source_lexemes(candidate_sources)
-    if job_grounding is None or candidate_grounding is None:
+    if (
+        job_grounding is None
+        or strict_job_grounding is None
+        or candidate_grounding is None
+    ):
         return _result(task_type, None, [_finding("schema_invalid")])
     all_grounding = job_grounding + candidate_grounding
 
@@ -1155,7 +1345,7 @@ def _verify_analysis(
         return _result(task_type, None, [_finding("schema_invalid")])
     if injection_echo:
         findings.append(_finding("prompt_injection_echo"))
-    material_cache: dict[str, tuple[str, ...] | None] = {}
+    material_cache: MaterialCache = {}
     rejected_echo, private_echo = _blocked_material(
         output_text, records, rejected, context_private, material_cache
     )
@@ -1178,14 +1368,16 @@ def _verify_analysis(
             else True
             for value in normalized_fields
         )
-        extracted = (
-            output.responsibilities
-            + output.required_skills
-            + output.preferred_skills
-            + output.keywords
+        strict_extracted = output.responsibilities + output.required_skills
+        descriptive_extracted = output.preferred_skills + output.keywords
+        extracted = strict_extracted + descriptive_extracted
+        support_checks.extend(
+            _analysis_statement_supported(value, strict_job_grounding)
+            for value in strict_extracted
         )
         support_checks.extend(
-            _analysis_statement_supported(value, job_grounding) for value in extracted
+            _analysis_statement_supported(value, job_grounding)
+            for value in descriptive_extracted
         )
         support_checks.extend(
             _analysis_statement_supported(
@@ -1305,6 +1497,10 @@ def verify_resume_edits(
             else None
         )
         injection_sources = _context_source_values(context_data)
+        job = _mapping(context_data.get("job_description"))
+        if job is None or type(job.get("text")) is not str:
+            return _result(task_type, None, [_finding("schema_invalid")])
+        reason_context_sources = (job["text"],)
     else:
         context_data = {}
         evidence_values = evidence if evidence is not None else ()
@@ -1316,6 +1512,7 @@ def verify_resume_edits(
             return _result(task_type, None, [_finding("schema_invalid")])
         context_private = ()
         injection_sources = ()
+        reason_context_sources = ()
 
     records = _evidence_records(evidence_values)
     rejected = _rejected_texts(rejected_values)
@@ -1335,7 +1532,7 @@ def verify_resume_edits(
         )
 
     findings: list[VerifierFinding] = []
-    material_cache: dict[str, tuple[str, ...] | None] = {}
+    material_cache: MaterialCache = {}
     ambiguous_spans: set[int] = set()
     intervals: list[tuple[int, int, int]] = []
     for index, suggestion in enumerate(output.suggestions):
@@ -1394,10 +1591,23 @@ def verify_resume_edits(
             findings.append(_finding("unsupported_claim", item_index=index))
         if reason_private:
             findings.append(_finding("private_claim", item_index=index))
+        reason_supported, reason_metric_supported = _resume_reason_supported(
+            suggestion.reason,
+            reason_context_sources
+            + (
+                suggestion.source_text,
+                suggestion.replacement_text,
+                *(item.summary for item in resolved),
+            ),
+        )
+        if reason_supported is None:
+            return _result(task_type, None, [_finding("schema_invalid")])
+        if not reason_supported:
+            findings.append(_finding("unsupported_claim", item_index=index))
         findings.extend(
             _risk_findings(
                 suggestion.reason,
-                metric_supported=True,
+                metric_supported=reason_metric_supported,
                 private_material=reason_private,
                 item_index=index,
             )
@@ -1445,6 +1655,20 @@ def _factual_sentences(text: str) -> tuple[str, ...] | None:
             continue
         factual.append(sentence)
     return tuple(factual)
+
+
+def _cover_role_reference_support(
+    sentence: str,
+    job_grounding: Sequence[Sequence[str]],
+) -> tuple[bool, bool | None]:
+    normalized = _normalized_text(sentence.rstrip(".!?"))
+    match = _COVER_ROLE_REFERENCE_PATTERN.fullmatch(normalized)
+    if match is None:
+        return False, False
+    descriptor = match.group("role")
+    if descriptor in _GENERIC_COVER_ROLE_DESCRIPTORS:
+        return True, True
+    return True, _analysis_statement_supported(descriptor, job_grounding)
 
 
 def _unsupported_reason_statement(
@@ -1499,6 +1723,12 @@ def verify_cover_letter(
             context_data, verification_data
         )
         injection_sources = _context_source_values(context_data)
+        job = _mapping(context_data.get("job_description"))
+        if job is None or type(job.get("text")) is not str:
+            return _result(task_type, None, [_finding("schema_invalid")])
+        job_grounding = _trusted_source_lexemes((job["text"],))
+        if job_grounding is None:
+            return _result(task_type, None, [_finding("schema_invalid")])
     else:
         context_data = {}
         evidence_values = evidence if evidence is not None else ()
@@ -1510,6 +1740,7 @@ def verify_cover_letter(
             return _result(task_type, None, [_finding("schema_invalid")])
         context_private = ()
         injection_sources = ()
+        job_grounding = ()
 
     records = _evidence_records(evidence_values)
     rejected = _rejected_texts(rejected_values)
@@ -1529,12 +1760,20 @@ def verify_cover_letter(
     factual_sentences = _factual_sentences(output.plain_text)
     if factual_sentences is None:
         return _result(task_type, None, [_finding("schema_invalid")])
-    if any(not _statement_supported(sentence, resolved) for sentence in factual_sentences):
-        findings.append(_finding("unsupported_claim"))
+    for sentence in factual_sentences:
+        is_role_reference, role_support = _cover_role_reference_support(
+            sentence, job_grounding
+        )
+        if is_role_reference and role_support is None:
+            return _result(task_type, None, [_finding("schema_invalid")])
+        if (is_role_reference and not role_support) or (
+            not is_role_reference and not _statement_supported(sentence, resolved)
+        ):
+            findings.append(_finding("unsupported_claim"))
     metric_supported = all(
         _metric_supported(sentence, resolved) for sentence in factual_sentences
     )
-    material_cache: dict[str, tuple[str, ...] | None] = {}
+    material_cache: MaterialCache = {}
     rejected_echo, private_echo = _blocked_material(
         output.plain_text,
         records,
@@ -1631,7 +1870,7 @@ def verify_claim_review(
         )
 
     findings: list[VerifierFinding] = []
-    material_cache: dict[str, tuple[str, ...] | None] = {}
+    material_cache: MaterialCache = {}
     for index, decision in enumerate(output.decisions):
         claim = claims_by_id[decision.claim_id]
         resolved, reference_findings = _resolve_evidence(
@@ -1665,7 +1904,7 @@ def verify_claim_review(
             findings.append(
                 _finding("unsupported_claim", item_index=index, claim_id=claim.id)
             )
-        if decision.decision == "unsupported" and claim_supported:
+        if decision.decision in {"unsupported", "needs_review"} and claim_supported:
             findings.append(
                 _finding("unsupported_claim", item_index=index, claim_id=claim.id)
             )
