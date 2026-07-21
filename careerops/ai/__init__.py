@@ -15,6 +15,12 @@ from careerops.ai.contracts import (
     validate_task_output,
 )
 from careerops.ai.context import (
+    MAX_CONTEXT_TRAVERSAL_NODES,
+    MAX_EVIDENCE_ITEMS,
+    MAX_LEXEMES_PER_TEXT,
+    MAX_PROFILE_FACTS,
+    MAX_REJECTED_CLAIMS,
+    MAX_WRITING_PREFERENCES,
     ContextBuildError,
     ContextPacket,
     ContextPacketBuilder,
@@ -22,6 +28,7 @@ from careerops.ai.context import (
     build_context_packet,
     load_prompt_template,
     prompt_templates,
+    validate_context_packet,
 )
 from careerops.ai.verifier import (
     BLOCKING_CODES,
@@ -40,6 +47,12 @@ __all__ = [
     "AnalyzeFitOutput",
     "AnalyzeJdOutput",
     "ClaimReviewOutput",
+    "MAX_CONTEXT_TRAVERSAL_NODES",
+    "MAX_EVIDENCE_ITEMS",
+    "MAX_LEXEMES_PER_TEXT",
+    "MAX_PROFILE_FACTS",
+    "MAX_REJECTED_CLAIMS",
+    "MAX_WRITING_PREFERENCES",
     "ContextBuildError",
     "ContextPacket",
     "ContextPacketBuilder",
@@ -60,6 +73,7 @@ __all__ = [
     "output_schema_for_task",
     "prompt_templates",
     "validate_task_output",
+    "validate_context_packet",
     "verify_analyze_fit",
     "verify_analyze_jd",
     "verify_claim_review",

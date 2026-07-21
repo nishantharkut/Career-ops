@@ -2,9 +2,21 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import re
+import unicodedata
 from typing import Any, Iterable, Mapping, Sequence
 
-from careerops.ai.context import ContextPacket
+from careerops.ai.context import (
+    MAX_CONTEXT_TRAVERSAL_NODES,
+    MAX_EVIDENCE_ITEMS,
+    MAX_LEXEMES_PER_TEXT,
+    MAX_PROFILE_FACTS,
+    MAX_REJECTED_CLAIMS,
+    MAX_SOURCE_CHARACTERS,
+    PRIVACY_LEVELS,
+    VERIFICATION_STATES,
+    ContextPacket,
+    validate_context_packet,
+)
 from careerops.ai.contracts import (
     AnalyzeFitOutput,
     AnalyzeJdOutput,
@@ -67,7 +79,6 @@ _RISK_CODES = {
     "NDA-sensitive wording": "nda_sensitive_wording",
     "Unsupported title": "unsafe_title",
 }
-_TOKEN_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9+#.-]*")
 _SENTENCE_PATTERN = re.compile(r"[^.!?\n]+(?:[.!?]+|$)")
 _INJECTION_PATTERN = re.compile(
     r"(?i)(?:\b(?:ignore|disregard|override|forget)\b.{0,100}"
@@ -90,6 +101,26 @@ _NON_FACTUAL_SENTENCE_PATTERNS = (
     ),
     re.compile(r"(?i)^please consider my application$"),
 )
+_NON_FACTUAL_REASON_PATTERNS = (
+    re.compile(r"(?i)^direct (?:evidence|match)$"),
+    re.compile(r"(?i)^matches? (?:the )?(?:supplied )?(?:evidence|record)$"),
+    re.compile(r"(?i)^(?:no|missing|insufficient) (?:supporting )?(?:evidence|proof)$"),
+    re.compile(
+        r"(?i)^(?:supporting )?(?:evidence|proof) (?:is )?"
+        r"(?:required|missing|insufficient)$"
+    ),
+    re.compile(
+        r"(?i)^(?:the )?evidence (?:does not|doesn't|cannot|can't) "
+        r"support (?:this|the) claim$"
+    ),
+    re.compile(r"(?i)^(?:requires?|needs?) (?:human )?review$"),
+    re.compile(r"(?i)^private(?: material)?$"),
+    re.compile(
+        r"(?i)^(?:the )?claim (?:is )?"
+        r"(?:not supported|unsupported|unverified|private|rejected)"
+        r"(?: by (?:the )?(?:supplied )?evidence)?$"
+    ),
+)
 _UNTRUSTED_CONTEXT_FIELDS = (
     "job_description",
     "selected_resume",
@@ -97,6 +128,41 @@ _UNTRUSTED_CONTEXT_FIELDS = (
     "linked_evidence",
     "rejected_claims",
     "writing_preferences",
+)
+_MAX_TEXT_SEGMENTS = 256
+_LOW_SIGNAL_LEXEMES = frozenset(
+    {
+        "a",
+        "an",
+        "and",
+        "as",
+        "at",
+        "be",
+        "built",
+        "by",
+        "claim",
+        "for",
+        "from",
+        "i",
+        "in",
+        "is",
+        "it",
+        "led",
+        "my",
+        "of",
+        "on",
+        "or",
+        "project",
+        "role",
+        "team",
+        "the",
+        "this",
+        "to",
+        "was",
+        "we",
+        "were",
+        "with",
+    }
 )
 
 
@@ -217,13 +283,7 @@ def _context_data(
 ) -> dict[str, Any] | None:
     if context is None:
         return {}
-    if type(context) is not ContextPacket or context.task_type != task_type:
-        return None
-    try:
-        value = context.to_dict()
-    except (TypeError, ValueError, UnicodeError):
-        return None
-    return value if isinstance(value, dict) else None
+    return validate_context_packet(context, task_type)
 
 
 def _mapping(value: Any) -> Mapping[str, Any] | None:
@@ -231,7 +291,7 @@ def _mapping(value: Any) -> Mapping[str, Any] | None:
 
 
 def _safe_text(value: Any) -> str | None:
-    if type(value) is not str or len(value) > 80_000:
+    if type(value) is not str or len(value) > MAX_SOURCE_CHARACTERS:
         return None
     try:
         value.encode("utf-8")
@@ -240,13 +300,31 @@ def _safe_text(value: Any) -> str | None:
     return value
 
 
-def _evidence_records(values: Sequence[Any]) -> tuple[_Evidence, ...] | None:
+def _bounded_values(values: Iterable[Any], limit: int) -> tuple[Any, ...] | None:
     if isinstance(values, (str, bytes, bytearray)):
+        return None
+    items: list[Any] = []
+    try:
+        iterator = iter(values)
+        for _index in range(limit + 1):
+            try:
+                value = next(iterator)
+            except StopIteration:
+                break
+            items.append(value)
+    except Exception:
+        return None
+    return tuple(items) if len(items) <= limit else None
+
+
+def _evidence_records(values: Iterable[Any]) -> tuple[_Evidence, ...] | None:
+    bounded = _bounded_values(values, MAX_EVIDENCE_ITEMS)
+    if bounded is None:
         return None
     records: list[_Evidence] = []
     seen: set[str] = set()
     try:
-        for value in values:
+        for value in bounded:
             item = _mapping(value)
             if item is None:
                 return None
@@ -260,6 +338,8 @@ def _evidence_records(values: Sequence[Any]) -> tuple[_Evidence, ...] | None:
                 or state is None
                 or privacy is None
                 or evidence_id in seen
+                or state not in VERIFICATION_STATES
+                or privacy not in PRIVACY_LEVELS
             ):
                 return None
             seen.add(evidence_id)
@@ -269,21 +349,48 @@ def _evidence_records(values: Sequence[Any]) -> tuple[_Evidence, ...] | None:
     return tuple(sorted(records, key=lambda item: item.id))
 
 
-def _claim_records(values: Sequence[Any]) -> tuple[_Claim, ...] | None:
-    if isinstance(values, (str, bytes, bytearray)):
+def _claim_records(
+    values: Iterable[Any],
+    *,
+    fact_shape: bool = False,
+) -> tuple[_Claim, ...] | None:
+    bounded = _bounded_values(values, MAX_PROFILE_FACTS)
+    if bounded is None:
         return None
     records: list[_Claim] = []
     seen: set[str] = set()
     try:
-        for value in values:
+        for value in bounded:
             item = _mapping(value)
             if item is None:
                 return None
             claim_id = _safe_text(item.get("id"))
-            text = _safe_text(item.get("text", item.get("claim_text")))
+            text_fields = [
+                field
+                for field in ("text", "claim_text")
+                if field in item
+            ]
+            has_value = "value" in item
+            if len(text_fields) > 1 or (text_fields and has_value):
+                return None
+            if has_value:
+                if not fact_shape and _safe_text(item.get("key")) is None:
+                    return None
+                text = _safe_text(item.get("value"))
+            elif text_fields:
+                if fact_shape:
+                    return None
+                text = _safe_text(item.get(text_fields[0]))
+            else:
+                return None
             state = _safe_text(item.get("verification_state", "needs_verification"))
             privacy = _safe_text(item.get("privacy_level", "public"))
-            if not claim_id or text is None or state is None or privacy is None:
+            if (
+                not claim_id
+                or text is None
+                or state not in VERIFICATION_STATES
+                or privacy not in PRIVACY_LEVELS
+            ):
                 return None
             if claim_id in seen:
                 return None
@@ -294,27 +401,50 @@ def _claim_records(values: Sequence[Any]) -> tuple[_Claim, ...] | None:
     return tuple(sorted(records, key=lambda item: item.id))
 
 
-def _ordered_statement_tokens(text: str) -> tuple[str, ...]:
-    tokens = tuple(
-        token
-        for token in (
-            match.group(0).casefold().strip(".-")
-            for match in _TOKEN_PATTERN.finditer(text)
-        )
-        if token
+def _normalize_text(text: str) -> str:
+    normalized = unicodedata.normalize("NFKC", text).casefold()
+    return "".join(
+        character
+        for character in normalized
+        if unicodedata.category(character) != "Cf"
     )
-    if tokens and tokens[0] in {"i", "we"}:
-        return tokens[1:]
-    return tokens
+
+
+def _lexemes(text: str) -> tuple[str, ...] | None:
+    result: list[str] = []
+    current: list[str] = []
+    for character in _normalize_text(text):
+        category = unicodedata.category(character)
+        if category[0] in {"L", "N"} or category[0] == "M":
+            current.append(character)
+        elif character in {"+", "#"} and current:
+            current.append(character)
+        elif current:
+            result.append("".join(current))
+            if len(result) > MAX_LEXEMES_PER_TEXT:
+                return None
+            current = []
+    if current:
+        result.append("".join(current))
+    if len(result) > MAX_LEXEMES_PER_TEXT:
+        return None
+    return tuple(result)
 
 
 def _normalized_text(text: str) -> str:
-    return " ".join(text.casefold().split())
+    return " ".join(_normalize_text(text).split())
 
 
-def _contains_claim(text: str, claim: str) -> bool:
-    normalized_claim = _normalized_text(claim)
-    return len(normalized_claim) >= 4 and normalized_claim in _normalized_text(text)
+def _relationship_matches(statement: str, evidence: str) -> bool:
+    statement_tokens = _lexemes(statement)
+    evidence_tokens = _lexemes(evidence)
+    if statement_tokens is None or evidence_tokens is None:
+        return False
+    if not statement_tokens or not evidence_tokens:
+        return False
+    if statement_tokens == evidence_tokens:
+        return True
+    return statement_tokens[0] == "i" and statement_tokens[1:] == evidence_tokens
 
 
 def _new_content_supported(
@@ -322,46 +452,69 @@ def _new_content_supported(
     replacement_text: str,
     evidence: Sequence[_Evidence],
 ) -> bool:
-    replacement = _ordered_statement_tokens(replacement_text)
-    if replacement == _ordered_statement_tokens(source_text):
+    replacement = _lexemes(replacement_text)
+    source = _lexemes(source_text)
+    if replacement is None or source is None:
+        return False
+    if replacement and replacement == source:
         return True
     return bool(replacement) and any(
-        replacement == _ordered_statement_tokens(segment)
+        _relationship_matches(replacement_text, segment)
         for item in evidence
-        for segment in _sentences(item.summary)
+        for segment in (_sentences(item.summary) or ())
     )
 
 
 def _statement_supported(statement: str, evidence: Sequence[_Evidence]) -> bool:
-    required = _ordered_statement_tokens(statement)
-    if not required:
-        return True
+    required = _lexemes(statement)
+    if required is None or not required:
+        return False
     return any(
-        required == _ordered_statement_tokens(segment)
+        _relationship_matches(statement, segment)
         for item in evidence
-        for segment in _sentences(item.summary)
+        for segment in (_sentences(item.summary) or ())
     )
 
 
-def _sentences(text: str) -> tuple[str, ...]:
-    sentences = tuple(
-        match.group(0).strip()
-        for match in _SENTENCE_PATTERN.finditer(text)
-        if match.group(0).strip()
-    )
-    return sentences or (text,)
+def _sentences(text: str) -> tuple[str, ...] | None:
+    sentences: list[str] = []
+    for match in _SENTENCE_PATTERN.finditer(text):
+        sentence = match.group(0).strip()
+        if sentence:
+            sentences.append(sentence)
+            if len(sentences) > _MAX_TEXT_SEGMENTS:
+                return None
+    return tuple(sentences) or (text,)
 
 
 def _metric_supported(text: str, evidence: Sequence[_Evidence]) -> bool:
-    metrics = {match.casefold() for match in METRIC_PATTERN.findall(text)}
+    metrics = {
+        match.casefold() for match in METRIC_PATTERN.findall(_normalize_text(text))
+    }
     if not metrics:
         return True
     evidence_metrics: set[str] = set()
     for item in evidence:
         evidence_metrics.update(
-            match.casefold() for match in METRIC_PATTERN.findall(item.summary)
+            match.casefold()
+            for match in METRIC_PATTERN.findall(_normalize_text(item.summary))
         )
     return metrics <= evidence_metrics
+
+
+def _metric_supported_by_sources(text: str, sources: Sequence[str]) -> bool:
+    metrics = {
+        match.casefold() for match in METRIC_PATTERN.findall(_normalize_text(text))
+    }
+    if not metrics:
+        return True
+    grounded: set[str] = set()
+    for source in sources:
+        grounded.update(
+            match.casefold()
+            for match in METRIC_PATTERN.findall(_normalize_text(source))
+        )
+    return metrics <= grounded
 
 
 def _resolve_evidence(
@@ -428,11 +581,12 @@ def _risk_findings(
     item_index: int | None = None,
     claim_id: str | None = None,
 ) -> list[VerifierFinding]:
+    normalized_text = _normalize_text(text)
     report = evaluate_risks(
-        resume_text=text,
+        resume_text=normalized_text,
         claims=[
             {
-                "text": text,
+                "text": normalized_text,
                 "verification_state": (
                     "verified" if metric_supported else "needs_verification"
                 ),
@@ -450,10 +604,14 @@ def _risk_findings(
     return findings
 
 
-def _output_text(output: TaskOutput) -> str:
+def _output_text(output: TaskOutput) -> str | None:
     values: list[str] = []
     stack: list[Any] = [output.model_dump(mode="python")]
+    observed = 0
     while stack:
+        observed += 1
+        if observed > MAX_CONTEXT_TRAVERSAL_NODES:
+            return None
         value = stack.pop()
         if isinstance(value, str):
             values.append(value)
@@ -464,10 +622,14 @@ def _output_text(output: TaskOutput) -> str:
     return "\n".join(values)
 
 
-def _injection_fragments(context: Mapping[str, Any]) -> tuple[str, ...]:
+def _injection_fragments(source_values: Sequence[Any]) -> tuple[str, ...] | None:
     source_texts: list[str] = []
-    stack = [context.get(field) for field in _UNTRUSTED_CONTEXT_FIELDS]
+    stack = list(source_values)
+    observed = 0
     while stack:
+        observed += 1
+        if observed > MAX_CONTEXT_TRAVERSAL_NODES:
+            return None
         value = stack.pop()
         if type(value) is str:
             source_texts.append(value)
@@ -478,7 +640,10 @@ def _injection_fragments(context: Mapping[str, Any]) -> tuple[str, ...]:
 
     fragments: set[str] = set()
     for source in source_texts:
-        for candidate in _SENTENCE_PATTERN.findall(source):
+        sentences = _sentences(source)
+        if sentences is None:
+            return None
+        for candidate in sentences:
             normalized = _normalized_text(candidate.strip(" \t\r\n.!?"))
             if normalized and _INJECTION_PATTERN.search(normalized):
                 fragments.add(normalized)
@@ -489,24 +654,29 @@ def _injection_fragments(context: Mapping[str, Any]) -> tuple[str, ...]:
     return tuple(sorted(fragments))
 
 
-def _has_injection_echo(output: TaskOutput, context: Mapping[str, Any]) -> bool:
-    generated = _normalized_text(_output_text(output))
-    return any(fragment in generated for fragment in _injection_fragments(context))
+def _has_injection_echo(
+    output: TaskOutput,
+    source_values: Sequence[Any],
+) -> bool | None:
+    output_text = _output_text(output)
+    if output_text is None:
+        return None
+    generated = _normalized_text(output_text)
+    fragments = _injection_fragments(source_values)
+    if fragments is None:
+        return None
+    return any(fragment in generated for fragment in fragments)
+
+
+def _context_source_values(context: Mapping[str, Any]) -> tuple[Any, ...]:
+    return tuple(context.get(field) for field in _UNTRUSTED_CONTEXT_FIELDS)
 
 
 def _context_auxiliary(
     context: Mapping[str, Any],
-    evidence: Sequence[Any] | None,
-    rejected_claims: Sequence[Any] | None,
 ) -> tuple[Sequence[Any], Sequence[Any], tuple[str, ...]]:
-    evidence_values = (
-        evidence if evidence is not None else context.get("linked_evidence", ())
-    )
-    rejected_values = (
-        rejected_claims
-        if rejected_claims is not None
-        else context.get("rejected_claims", ())
-    )
+    evidence_values = context.get("linked_evidence", ())
+    rejected_values = context.get("rejected_claims", ())
     private_values: list[str] = []
     facts = context.get("confirmed_profile_facts", ())
     if isinstance(facts, Sequence) and not isinstance(facts, (str, bytes, bytearray)):
@@ -519,12 +689,13 @@ def _context_auxiliary(
     return evidence_values, rejected_values, tuple(private_values)
 
 
-def _rejected_texts(values: Sequence[Any]) -> tuple[str, ...] | None:
-    if isinstance(values, (str, bytes, bytearray)):
+def _rejected_texts(values: Iterable[Any]) -> tuple[str, ...] | None:
+    bounded = _bounded_values(values, MAX_REJECTED_CLAIMS)
+    if bounded is None:
         return None
     result: list[str] = []
     try:
-        for value in values:
+        for value in bounded:
             item = _mapping(value)
             if item is None:
                 return None
@@ -537,12 +708,13 @@ def _rejected_texts(values: Sequence[Any]) -> tuple[str, ...] | None:
     return tuple(sorted(result, key=lambda value: value.casefold()))
 
 
-def _private_texts(values: Sequence[Any]) -> tuple[str, ...] | None:
-    if isinstance(values, (str, bytes, bytearray)):
+def _private_texts(values: Iterable[Any]) -> tuple[str, ...] | None:
+    bounded = _bounded_values(values, MAX_PROFILE_FACTS)
+    if bounded is None:
         return None
     result: list[str] = []
     try:
-        for value in values:
+        for value in bounded:
             text = _safe_text(value)
             if text is None:
                 return None
@@ -558,12 +730,65 @@ def _blocked_material(
     rejected: Sequence[str],
     private_claims: Sequence[str],
 ) -> tuple[bool, bool]:
-    rejected_echo = any(_contains_claim(text, claim) for claim in rejected)
-    private_echo = any(_contains_claim(text, claim) for claim in private_claims)
+    rejected_echo = any(_material_overlap(text, claim) for claim in rejected)
+    private_echo = any(_material_overlap(text, claim) for claim in private_claims)
     private_echo = private_echo or any(
-        item.private and _contains_claim(text, item.summary) for item in evidence
+        item.private and _material_overlap(text, item.summary) for item in evidence
     )
     return rejected_echo, private_echo
+
+
+def _material_lexemes(text: str) -> tuple[str, ...] | None:
+    lexemes = _lexemes(text)
+    if lexemes is None:
+        return None
+    return tuple(token for token in lexemes if token not in _LOW_SIGNAL_LEXEMES)
+
+
+def _is_ordered_subsequence(needle: Sequence[str], haystack: Sequence[str]) -> bool:
+    if not needle:
+        return False
+    position = 0
+    for token in haystack:
+        if token == needle[position]:
+            position += 1
+            if position == len(needle):
+                return True
+    return False
+
+
+def _ordered_overlap_length(left: Sequence[str], right: Sequence[str]) -> int:
+    previous = [0] * (len(right) + 1)
+    for left_token in left:
+        current = [0]
+        for index, right_token in enumerate(right, start=1):
+            if left_token == right_token:
+                current.append(previous[index - 1] + 1)
+            else:
+                current.append(max(previous[index], current[-1]))
+        previous = current
+    return previous[-1]
+
+
+def _material_overlap(text: str, blocked: str) -> bool:
+    text_tokens = _material_lexemes(text)
+    blocked_tokens = _material_lexemes(blocked)
+    if text_tokens is None or blocked_tokens is None:
+        return True
+    if not text_tokens or not blocked_tokens:
+        return False
+    shorter, longer = (
+        (text_tokens, blocked_tokens)
+        if len(text_tokens) <= len(blocked_tokens)
+        else (blocked_tokens, text_tokens)
+    )
+    if len(shorter) == 1:
+        token = shorter[0]
+        return len(token) >= 4 and token in longer
+    if _is_ordered_subsequence(shorter, longer):
+        return True
+    overlap = _ordered_overlap_length(shorter, longer)
+    return overlap >= 2 and overlap * 2 >= len(shorter)
 
 
 def _verify_analysis(
@@ -572,13 +797,51 @@ def _verify_analysis(
     *,
     context: ContextPacket | None,
 ) -> VerificationResult:
-    context_data = _context_data(context, task_type)
     output = _validate(task_type, payload)
-    if context_data is None or output is None:
+    if context is None or output is None:
         return _result(task_type, None, [_finding("schema_invalid")])
+    context_data = _context_data(context, task_type)
+    if context_data is None:
+        return _result(task_type, None, [_finding("schema_invalid")])
+
+    output_text = _output_text(output)
+    job = _mapping(context_data.get("job_description"))
+    if output_text is None or job is None or type(job.get("text")) is not str:
+        return _result(task_type, None, [_finding("schema_invalid")])
+    applicable_sources = [job["text"]]
+    records = _evidence_records(context_data.get("linked_evidence", ()))
+    rejected = _rejected_texts(context_data.get("rejected_claims", ()))
+    if records is None or rejected is None:
+        return _result(task_type, None, [_finding("schema_invalid")])
+    if task_type == "analyze_fit":
+        applicable_sources.extend(
+            item.summary for item in records if item.publishable
+        )
+
     findings: list[VerifierFinding] = []
-    if _has_injection_echo(output, context_data):
+    injection_echo = _has_injection_echo(
+        output, _context_source_values(context_data)
+    )
+    if injection_echo is None:
+        return _result(task_type, None, [_finding("schema_invalid")])
+    if injection_echo:
         findings.append(_finding("prompt_injection_echo"))
+    rejected_echo, private_echo = _blocked_material(
+        output_text, records, rejected, ()
+    )
+    if rejected_echo:
+        findings.append(_finding("unsupported_claim"))
+    if private_echo:
+        findings.append(_finding("private_claim"))
+    findings.extend(
+        _risk_findings(
+            output_text,
+            metric_supported=_metric_supported_by_sources(
+                output_text, applicable_sources
+            ),
+            private_material=private_echo,
+        )
+    )
     return _result(task_type, output, findings)
 
 
@@ -602,39 +865,63 @@ def verify_resume_edits(
     payload: Any,
     *,
     resume_tex: str | None = None,
-    evidence: Sequence[Any] | None = None,
-    rejected_claims: Sequence[Any] | None = None,
-    private_claims: Sequence[str] = (),
+    evidence: Iterable[Any] | None = None,
+    rejected_claims: Iterable[Any] | None = None,
+    private_claims: Iterable[str] | None = None,
     context: ContextPacket | None = None,
 ) -> VerificationResult:
     task_type = "suggest_resume_edits"
-    context_data = _context_data(context, task_type)
     output = _validate(task_type, payload)
-    if context_data is None or not isinstance(output, ResumeEditsOutput):
+    if not isinstance(output, ResumeEditsOutput):
         return _result(task_type, None, [_finding("schema_invalid")])
 
-    evidence_values, rejected_values, context_private = _context_auxiliary(
-        context_data, evidence, rejected_claims
-    )
-    records = _evidence_records(evidence_values)
-    rejected = _rejected_texts(rejected_values)
-    normalized_private = _private_texts(private_claims)
-    if records is None or rejected is None or normalized_private is None:
-        return _result(task_type, None, [_finding("schema_invalid")])
-    if resume_tex is None:
+    if context is not None:
+        if any(
+            value is not None
+            for value in (resume_tex, evidence, rejected_claims, private_claims)
+        ):
+            return _result(task_type, None, [_finding("schema_invalid")])
+        context_data = _context_data(context, task_type)
+        if context_data is None:
+            return _result(task_type, None, [_finding("schema_invalid")])
+        evidence_values, rejected_values, context_private = _context_auxiliary(
+            context_data
+        )
         selected_resume = _mapping(context_data.get("selected_resume"))
         resume_tex = (
             selected_resume.get("source_text")
             if selected_resume is not None
             else None
         )
+        injection_sources = _context_source_values(context_data)
+    else:
+        context_data = {}
+        evidence_values = evidence if evidence is not None else ()
+        rejected_values = rejected_claims if rejected_claims is not None else ()
+        context_private = ()
+        injection_sources = ()
+
+    records = _evidence_records(evidence_values)
+    rejected = _rejected_texts(rejected_values)
+    normalized_private = _private_texts(
+        private_claims if private_claims is not None else ()
+    )
+    if records is None or rejected is None or normalized_private is None:
+        return _result(task_type, None, [_finding("schema_invalid")])
     if _safe_text(resume_tex) is None:
         return _result(task_type, None, [_finding("schema_invalid")])
+    if context is None:
+        injection_sources = (
+            resume_tex,
+            tuple(item.summary for item in records),
+            rejected,
+            normalized_private,
+        )
 
     findings: list[VerifierFinding] = []
     private_materials = normalized_private + context_private
     for index, suggestion in enumerate(output.suggestions):
-        if resume_tex.count(suggestion.source_text) != 1:
+        if _overlapping_occurrences(resume_tex, suggestion.source_text) != 1:
             findings.append(
                 _finding("source_span_not_unique", item_index=index)
             )
@@ -684,15 +971,33 @@ def verify_resume_edits(
             )
         )
 
-    if _has_injection_echo(output, context_data):
+    injection_echo = _has_injection_echo(output, injection_sources)
+    if injection_echo is None:
+        return _result(task_type, None, [_finding("schema_invalid")])
+    if injection_echo:
         findings.append(_finding("prompt_injection_echo"))
     return _result(task_type, output, findings)
 
 
-def _factual_sentences(text: str) -> tuple[str, ...]:
+def _overlapping_occurrences(text: str, source: str) -> int:
+    count = 0
+    start = 0
+    while True:
+        position = text.find(source, start)
+        if position < 0:
+            return count
+        count += 1
+        if count > 1:
+            return count
+        start = position + 1
+
+
+def _factual_sentences(text: str) -> tuple[str, ...] | None:
+    sentences = _sentences(text)
+    if sentences is None:
+        return None
     factual: list[str] = []
-    for match in _SENTENCE_PATTERN.finditer(text):
-        sentence = match.group(0).strip()
+    for sentence in sentences:
         normalized = " ".join(sentence.rstrip(".!?").split())
         if not sentence or any(
             pattern.fullmatch(normalized)
@@ -703,31 +1008,73 @@ def _factual_sentences(text: str) -> tuple[str, ...]:
     return tuple(factual)
 
 
+def _unsupported_reason_statement(
+    text: str,
+    evidence: Sequence[_Evidence],
+) -> bool | None:
+    sentences = _sentences(text)
+    if sentences is None:
+        return None
+    for sentence in sentences:
+        normalized = _normalized_text(sentence.rstrip(".!?"))
+        if any(pattern.fullmatch(normalized) for pattern in _NON_FACTUAL_REASON_PATTERNS):
+            continue
+        if not _statement_supported(sentence, evidence):
+            return True
+    return False
+
+
 def verify_cover_letter(
     payload: Any,
     *,
-    evidence: Sequence[Any] | None = None,
-    rejected_claims: Sequence[Any] | None = None,
-    private_claims: Sequence[str] = (),
+    evidence: Iterable[Any] | None = None,
+    rejected_claims: Iterable[Any] | None = None,
+    private_claims: Iterable[str] | None = None,
     context: ContextPacket | None = None,
 ) -> VerificationResult:
     task_type = "draft_cover_letter"
-    context_data = _context_data(context, task_type)
     output = _validate(task_type, payload)
-    if context_data is None or not isinstance(output, CoverLetterOutput):
+    if not isinstance(output, CoverLetterOutput):
         return _result(task_type, None, [_finding("schema_invalid")])
 
-    evidence_values, rejected_values, context_private = _context_auxiliary(
-        context_data, evidence, rejected_claims
-    )
+    if context is not None:
+        if any(
+            value is not None
+            for value in (evidence, rejected_claims, private_claims)
+        ):
+            return _result(task_type, None, [_finding("schema_invalid")])
+        context_data = _context_data(context, task_type)
+        if context_data is None:
+            return _result(task_type, None, [_finding("schema_invalid")])
+        evidence_values, rejected_values, context_private = _context_auxiliary(
+            context_data
+        )
+        injection_sources = _context_source_values(context_data)
+    else:
+        context_data = {}
+        evidence_values = evidence if evidence is not None else ()
+        rejected_values = rejected_claims if rejected_claims is not None else ()
+        context_private = ()
+        injection_sources = ()
+
     records = _evidence_records(evidence_values)
     rejected = _rejected_texts(rejected_values)
-    normalized_private = _private_texts(private_claims)
+    normalized_private = _private_texts(
+        private_claims if private_claims is not None else ()
+    )
     if records is None or rejected is None or normalized_private is None:
         return _result(task_type, None, [_finding("schema_invalid")])
+    if context is None:
+        injection_sources = (
+            tuple(item.summary for item in records),
+            rejected,
+            normalized_private,
+        )
 
     resolved, findings = _resolve_evidence(output.evidence_refs, records)
     factual_sentences = _factual_sentences(output.plain_text)
+    if factual_sentences is None:
+        return _result(task_type, None, [_finding("schema_invalid")])
     if any(not _statement_supported(sentence, resolved) for sentence in factual_sentences):
         findings.append(_finding("unsupported_claim"))
     metric_supported = all(
@@ -750,7 +1097,10 @@ def verify_cover_letter(
             private_material=private_echo,
         )
     )
-    if _has_injection_echo(output, context_data):
+    injection_echo = _has_injection_echo(output, injection_sources)
+    if injection_echo is None:
+        return _result(task_type, None, [_finding("schema_invalid")])
+    if injection_echo:
         findings.append(_finding("prompt_injection_echo"))
     return _result(task_type, output, findings)
 
@@ -758,36 +1108,74 @@ def verify_cover_letter(
 def verify_claim_review(
     payload: Any,
     *,
-    claims: Sequence[Any],
-    evidence: Sequence[Any] | None = None,
+    claims: Iterable[Any] | None = None,
+    evidence: Iterable[Any] | None = None,
     context: ContextPacket | None = None,
 ) -> VerificationResult:
     task_type = "review_claims"
-    context_data = _context_data(context, task_type)
     output = _validate(task_type, payload)
-    claim_records = _claim_records(claims)
+    if not isinstance(output, ClaimReviewOutput):
+        return _result(task_type, None, [_finding("schema_invalid")])
+
+    if context is not None:
+        if claims is not None or evidence is not None:
+            return _result(task_type, None, [_finding("schema_invalid")])
+        context_data = _context_data(context, task_type)
+        if context_data is None:
+            return _result(task_type, None, [_finding("schema_invalid")])
+        claim_records = _claim_records(
+            context_data.get("confirmed_profile_facts", ()), fact_shape=True
+        )
+        evidence_values, rejected_values, context_private = _context_auxiliary(
+            context_data
+        )
+        injection_sources = _context_source_values(context_data)
+    else:
+        context_data = {}
+        if claims is None:
+            return _result(task_type, None, [_finding("schema_invalid")])
+        claim_records = _claim_records(claims)
+        evidence_values = evidence if evidence is not None else ()
+        rejected_values = ()
+        context_private = ()
+        injection_sources = ()
+
+    records = _evidence_records(evidence_values)
+    rejected_context = _rejected_texts(rejected_values)
+    if claim_records is None or records is None or rejected_context is None:
+        return _result(task_type, None, [_finding("schema_invalid")])
+    if not claim_records or not output.decisions:
+        return _result(task_type, None, [_finding("schema_invalid")])
+
+    claims_by_id = {claim.id: claim for claim in claim_records}
+    decision_ids = tuple(decision.claim_id for decision in output.decisions)
     if (
-        context_data is None
-        or not isinstance(output, ClaimReviewOutput)
-        or claim_records is None
+        len(decision_ids) != len(claim_records)
+        or len(set(decision_ids)) != len(decision_ids)
+        or set(decision_ids) != set(claims_by_id)
     ):
         return _result(task_type, None, [_finding("schema_invalid")])
 
-    evidence_values, _, context_private = _context_auxiliary(
-        context_data, evidence, None
-    )
-    records = _evidence_records(evidence_values)
-    if records is None:
-        return _result(task_type, None, [_finding("schema_invalid")])
-    claims_by_id = {claim.id: claim for claim in claim_records}
-    if {decision.claim_id for decision in output.decisions} != set(claims_by_id):
-        return _result(task_type, None, [_finding("schema_invalid")])
+    rejected_claims = tuple(
+        claim.text for claim in claim_records if claim.verification_state == "rejected"
+    ) + rejected_context
+    private_claims = tuple(
+        claim.text
+        for claim in claim_records
+        if claim.privacy_level != "public"
+        or claim.verification_state == "private_do_not_publish"
+    ) + context_private
+    if context is None:
+        injection_sources = (
+            tuple(claim.text for claim in claim_records),
+            tuple(item.summary for item in records),
+            rejected_claims,
+            private_claims,
+        )
 
     findings: list[VerifierFinding] = []
     for index, decision in enumerate(output.decisions):
         claim = claims_by_id[decision.claim_id]
-        if decision.decision != "supported":
-            continue
         resolved, reference_findings = _resolve_evidence(
             decision.evidence_refs,
             records,
@@ -795,30 +1183,66 @@ def verify_claim_review(
             claim_id=claim.id,
         )
         findings.extend(reference_findings)
-        if claim.privacy_level != "public" or claim.verification_state == "private_do_not_publish":
+        if decision.decision == "supported":
+            claim_private = (
+                claim.privacy_level != "public"
+                or claim.verification_state == "private_do_not_publish"
+            )
+            if claim_private:
+                findings.append(
+                    _finding("private_claim", item_index=index, claim_id=claim.id)
+                )
+            elif claim.verification_state == "rejected" or not _statement_supported(
+                claim.text, resolved
+            ):
+                findings.append(
+                    _finding("unsupported_claim", item_index=index, claim_id=claim.id)
+                )
+            findings.extend(
+                _risk_findings(
+                    claim.text,
+                    metric_supported=_metric_supported(claim.text, resolved),
+                    private_material=claim_private,
+                    item_index=index,
+                    claim_id=claim.id,
+                )
+            )
+
+        reason_rejected, reason_private = _blocked_material(
+            decision.reason,
+            records,
+            rejected_claims,
+            private_claims,
+        )
+        if reason_rejected:
+            findings.append(
+                _finding("unsupported_claim", item_index=index, claim_id=claim.id)
+            )
+        if reason_private:
             findings.append(
                 _finding("private_claim", item_index=index, claim_id=claim.id)
             )
-        elif claim.verification_state == "rejected" or not _statement_supported(
-            claim.text, resolved
-        ):
+        unsupported_reason = _unsupported_reason_statement(decision.reason, resolved)
+        if unsupported_reason is None:
+            return _result(task_type, None, [_finding("schema_invalid")])
+        if unsupported_reason:
             findings.append(
                 _finding("unsupported_claim", item_index=index, claim_id=claim.id)
             )
         findings.extend(
             _risk_findings(
-                claim.text,
-                metric_supported=_metric_supported(claim.text, resolved),
-                private_material=(
-                    claim.privacy_level != "public"
-                    or claim.verification_state == "private_do_not_publish"
-                    or any(_contains_claim(claim.text, value) for value in context_private)
-                ),
+                decision.reason,
+                metric_supported=_metric_supported(decision.reason, resolved),
+                private_material=reason_private,
                 item_index=index,
                 claim_id=claim.id,
             )
         )
-    if _has_injection_echo(output, context_data):
+
+    injection_echo = _has_injection_echo(output, injection_sources)
+    if injection_echo is None:
+        return _result(task_type, None, [_finding("schema_invalid")])
+    if injection_echo:
         findings.append(_finding("prompt_injection_echo"))
     return _result(task_type, output, findings)
 
@@ -829,13 +1253,24 @@ def verify_task_output(
     *,
     context: ContextPacket | None = None,
     resume_tex: str | None = None,
-    evidence: Sequence[Any] | None = None,
-    rejected_claims: Sequence[Any] | None = None,
-    private_claims: Sequence[str] = (),
-    claims: Sequence[Any] = (),
+    evidence: Iterable[Any] | None = None,
+    rejected_claims: Iterable[Any] | None = None,
+    private_claims: Iterable[str] | None = None,
+    claims: Iterable[Any] | None = None,
 ) -> VerificationResult:
     if type(task_type) is not str:
         return _result("invalid", None, [_finding("schema_invalid")])
+    if context is not None and any(
+        value is not None
+        for value in (
+            resume_tex,
+            evidence,
+            rejected_claims,
+            private_claims,
+            claims,
+        )
+    ):
+        return _result(task_type, None, [_finding("schema_invalid")])
     if task_type == "analyze_jd":
         return verify_analyze_jd(payload, context=context)
     if task_type == "analyze_fit":
