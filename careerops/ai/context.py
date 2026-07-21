@@ -48,6 +48,10 @@ PRIVACY_LEVELS = frozenset({"public", "private", "sensitive"})
 
 _IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 _URL_PATTERN = re.compile(r"(?i)https?://[^\s<>\"']+")
+_REDACTION_MARKER_PATTERN = re.compile(
+    r"(\[redacted (?:credential|restricted material|url)\])",
+    re.IGNORECASE,
+)
 _PROMPT_PATHS: dict[str, str] = {
     "analyze_jd": "analyze_jd_v1.txt",
     "analyze_fit": "analyze_fit_v1.txt",
@@ -280,17 +284,32 @@ def _provider_text(
     restricted_material: Sequence[str],
 ) -> str:
     text = unicodedata.normalize("NFKC", value)
-    for restricted in sorted(set(restricted_material), key=len, reverse=True):
-        normalized = unicodedata.normalize("NFKC", restricted)
-        if normalized:
-            text = re.sub(
-                re.escape(normalized),
-                "[redacted restricted material]",
-                text,
-                flags=re.IGNORECASE,
+    normalized_values = {
+        unicodedata.normalize("NFKC", restricted)
+        for restricted in restricted_material
+        if restricted
+    }
+    ordered = sorted(
+        normalized_values,
+        key=lambda item: (-len(item), item.casefold(), item),
+    )
+    if ordered:
+        alternatives = []
+        for item in ordered:
+            escaped = re.escape(item)
+            alternatives.append(
+                rf"(?<!\w){escaped}(?!\w)" if len(item) <= 2 else escaped
             )
-    text = _URL_PATTERN.sub(_sanitize_url, text)
-    return SECRET_PATTERN.sub("[redacted credential]", text)
+        restricted_pattern = re.compile("|".join(alternatives), re.IGNORECASE)
+        parts = _REDACTION_MARKER_PATTERN.split(text)
+        text = "".join(
+            part
+            if _REDACTION_MARKER_PATTERN.fullmatch(part)
+            else restricted_pattern.sub("[redacted restricted material]", part)
+            for part in parts
+        )
+    text = SECRET_PATTERN.sub("[redacted credential]", text)
+    return _URL_PATTERN.sub(_sanitize_url, text)
 
 
 def _identifier(value: Any) -> str:

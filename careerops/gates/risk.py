@@ -28,17 +28,19 @@ class RiskReport:
 
 
 METRIC_PATTERN = re.compile(
-    r"(?<![\w.])(?:[$\u20b9\u20ac\u00a3]\s*)?\d[\d,]*(?:\.\d+)?"
-    r"(?:\s*(?:%|\+|x|regressions?|years?|months?|weeks?|days?|hours?))?",
+    r"(?<![\w.])(?P<value>(?:[$\u20b9\u20ac\u00a3]\s*)?"
+    r"\d[\d,]*(?:\.\d+)?)"
+    r"(?:\s*(?:%|\+|x|regressions?|years?|months?|weeks?|days?|hours?)|"
+    r"(?=(?:\s+[a-z-]+){0,2}\s+(?:clients?|customers?|documents?|models?|"
+    r"payments?|processes?|records?|requests?|transactions?|users?)\b))",
     re.IGNORECASE,
 )
 SECRET_PATTERN = re.compile(
-    r"(?i)(?:(?:password|secret|token)\s*[:=]\s*"
+    r"(?i)(?:(?:(?:password|secret|token)|"
+    r"a\s*p\s*i[\s_-]*k\s*e\s*y)[ \t]*[:=][ \t]*+"
     r"(?!(?:environment(?:\s+variable)?|env(?:ironment)?|redacted|variable)\b|\$)"
-    r"\S+|"
-    r"a\s*p\s*i[\s_-]*k\s*e\s*y\s*[:=]\s*"
-    r"(?!(?:environment(?:\s+variable)?|env(?:ironment)?|redacted|variable)\b|\$)"
-    r"\S+|authorization\s*:\s*bearer\s+"
+    r"(?:\"[^\"\r\n]*\"|'[^'\r\n]*'|[^\r\n,;.!?]+)|"
+    r"authorization[ \t]*[:=][ \t]*bearer[ \t]++"
     r"(?!(?:environment(?:\s+variable)?|redacted)\b|\$)\S+)"
 )
 NDA_TERMS = (

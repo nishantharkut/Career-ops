@@ -93,10 +93,12 @@ _INJECTION_PATTERN = re.compile(
     r"\b(?:output|return|respond\s+with)\b.{0,80}\binstead\b)"
 )
 _SOURCE_DIRECTIVE_PATTERN = re.compile(
-    r"(?i)(?:(?:^|[.!?]\s+)(?:claim|include|list|output|state)\s+(?=[a-z])|"
+    r"(?i)(?:(?:^|[.!?:]\s+)(?:claim|include|list|output|report|return|state)"
+    r"\s+(?=[a-z])|"
     r"\b(?:do\s+not|don't|never|please|kindly|always)\s+"
     r"(?:claim|include|list|output|report|return|say|state)\b|"
     r"\byou\s+should\s+(?:claim|include|list|output|report|return|say|state)\b|"
+    r"\bmust\s+(?:claim|include|list|output|report|return|say|state)\b|"
     r"\bmake\s+sure\s+to\s+"
     r"(?:claim|include|list|output|report|return|say|state)\b)"
 )
@@ -108,8 +110,8 @@ _NEGATION_PATTERN = re.compile(
 )
 _OPTIONAL_MODALITY_PATTERN = re.compile(
     r"(?i)\b(?:may|might|nice\s+to\s+have|optional|preferred|"
-    r"(?:would\s+be|is)\s+a\s+plus|a\s+plus|beneficial|bonus|"
-    r"if\s+available|valued)\b"
+    r"(?:would\s+be|is)\s+a\s+plus|a\s+plus|beneficial|bonus|desirable|"
+    r"if\s+available|valued|would\s+like\s+to\s+learn)\b"
 )
 _REQUIRED_MODALITY_PATTERN = re.compile(
     r"(?i)\b(?:critical|essential|mandatory|must|necessary|required|requirement)\b"
@@ -348,10 +350,13 @@ _RESTRICTED_LEXEME_EQUIVALENTS = {
 _GENERIC_ENTITY_LEXEMES = frozenset(
     {
         "ai",
+        "amazon",
+        "apache",
         "api",
         "aws",
         "azure",
         "backend",
+        "boot",
         "cloud",
         "data",
         "developer",
@@ -369,11 +374,18 @@ _GENERIC_ENTITY_LEXEMES = frozenset(
         "project",
         "python",
         "react",
+        "services",
         "software",
+        "spark",
+        "spring",
         "sql",
         "team",
         "typescript",
+        "web",
     }
+)
+_GENERIC_TECH_CONTEXT_LEXEMES = frozenset(
+    {"experience", "experienced", "use", "used", "work", "worked"}
 )
 
 
@@ -748,8 +760,15 @@ def _authoritative_claim_supported(
 ) -> bool:
     publishable = tuple(item for item in evidence if item.publishable)
     normalized = _normalized_text(statement)
+    normalized_variants = {normalized}
+    if normalized.startswith("i "):
+        normalized_variants.add(normalized[2:])
     return any(
-        normalized == _normalized_text(item.summary) for item in publishable
+        bool(normalized_variants & {
+            _normalized_text(item.summary),
+            _normalized_text(item.summary).removeprefix("i "),
+        })
+        for item in publishable
     ) or _statement_supported(statement, publishable)
 
 
@@ -764,18 +783,20 @@ def _sentences(text: str) -> tuple[str, ...] | None:
     return tuple(sentences) or (text,)
 
 
+def _metric_values(text: str) -> tuple[str, ...]:
+    return tuple(
+        match.group("value").casefold()
+        for match in METRIC_PATTERN.finditer(_normalize_text(text))
+    )
+
+
 def _metric_supported(text: str, evidence: Sequence[_Evidence]) -> bool:
-    metrics = {
-        match.casefold() for match in METRIC_PATTERN.findall(_normalize_text(text))
-    }
+    metrics = set(_metric_values(text))
     if not metrics:
         return True
     evidence_metrics: set[str] = set()
     for item in evidence:
-        evidence_metrics.update(
-            match.casefold()
-            for match in METRIC_PATTERN.findall(_normalize_text(item.summary))
-        )
+        evidence_metrics.update(_metric_values(item.summary))
     return metrics <= evidence_metrics
 
 
@@ -849,9 +870,14 @@ def _trusted_source_segments(
                 for clause in _SOURCE_CLAUSE_SPLIT_PATTERN.split(sentence)
                 if clause.strip()
             )
+            broad_list_scope = re.search(
+                r"(?i)\b(?:neither|no\s+experience\s+with)\b",
+                _normalized_text(sentence),
+            )
             clauses = (
                 split_clauses
-                if len(split_clauses) > 1
+                if broad_list_scope is None
+                and len(split_clauses) > 1
                 and all(
                     any(
                         pattern.search(_normalized_text(clause))
@@ -927,6 +953,23 @@ def _field_value_supported(
     segments = _trusted_source_segments(sources)
     if segments is None:
         return None
+    labels = {
+        "title": r"role|position|title",
+        "company": r"company|employer|organization",
+        "location": r"location",
+    }.get(field)
+    if labels is None:
+        return False
+    explicit_values = tuple(
+        _normalized_text(match.group("value")).strip(" .")
+        for segment in segments
+        for match in re.finditer(
+            rf"(?i)\b(?:{labels})\s*[:=-]\s*(?P<value>[^.;\r\n]+)",
+            segment,
+        )
+    )
+    if explicit_values:
+        return _normalized_text(value).strip(" .") in explicit_values
     literal = re.escape(_normalized_text(value)).replace(r"\ ", r"\s+")
     patterns = {
         "title": (
@@ -948,8 +991,6 @@ def _field_value_supported(
             re.compile(rf"(?i)\bat\s+.+?\s+in\s+{literal}(?:[.,]|$)"),
         ),
     }.get(field)
-    if patterns is None:
-        return False
     return any(pattern.search(_normalized_text(segment)) for pattern in patterns for segment in segments)
 
 
@@ -976,14 +1017,8 @@ def _resume_reason_supported(
 
 
 def _metric_statement_matches(statement: str, source: str) -> bool:
-    statement_metrics = tuple(
-        match.casefold()
-        for match in METRIC_PATTERN.findall(_normalize_text(statement))
-    )
-    source_metrics = tuple(
-        match.casefold()
-        for match in METRIC_PATTERN.findall(_normalize_text(source))
-    )
+    statement_metrics = _metric_values(statement)
+    source_metrics = _metric_values(source)
     if not statement_metrics:
         return _relationship_matches(statement, source)
     if statement_metrics != source_metrics:
@@ -1378,7 +1413,7 @@ def _material_metrics(text: str, cache: MaterialCache | None = None) -> frozense
     cache_key = ("metrics", text)
     if cache is not None and cache_key in cache:
         return cache[cache_key]
-    result = frozenset(METRIC_PATTERN.findall(_normalize_text(text)))
+    result = frozenset(_metric_values(text))
     if cache is not None:
         cache[cache_key] = result
     return result
@@ -1410,6 +1445,13 @@ def _material_overlap(
     blocked_counts = Counter(blocked_tokens)
     overlap = sum((text_counts & blocked_counts).values())
     blocked_size = sum(blocked_counts.values())
+    generic_context = set(blocked_tokens) - set(text_tokens)
+    if (
+        set(text_tokens) <= _GENERIC_ENTITY_LEXEMES
+        and generic_context
+        and generic_context <= _GENERIC_TECH_CONTEXT_LEXEMES
+    ):
+        return False
     if (
         overlap >= 1
         and _NEGATION_PATTERN.search(_normalized_text(blocked))
