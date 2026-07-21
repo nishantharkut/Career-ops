@@ -3,8 +3,11 @@ from __future__ import annotations
 from dataclasses import dataclass
 import hashlib
 import json
+import os
 from pathlib import Path
+import shutil
 import sqlite3
+import subprocess
 from typing import Any
 from uuid import uuid4
 
@@ -862,6 +865,182 @@ def test_selection_race_fails_closed_and_cleans_new_draft(
     assert list((repo.vault_path / "resumes").glob("res_*/source.tex")) == []
 
 
+def test_completed_authority_race_fails_closed_and_cleans_new_draft(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    repo = _make_repo(tmp_path)
+    application = _create_application(repo)
+    parent = _select_parent(repo, application.id)
+    task, findings, _evidence = _create_completed_suggestion_task(
+        repo, application.id
+    )
+    original = repo.create_and_select_resume_draft
+
+    def race(**values: Any):
+        with repo.connection() as connection:
+            version_rows = connection.execute(
+                """
+                SELECT * FROM application_versions
+                WHERE application_id = ? AND event_type = 'ai_task.completed'
+                ORDER BY version_number
+                """,
+                (application.id,),
+            ).fetchall()
+            authority_row = next(
+                row
+                for row in version_rows
+                if json.loads(row["snapshot_json"])["ai_task"]["id"] == task.id
+            )
+            next_version = connection.execute(
+                """
+                SELECT COALESCE(MAX(version_number), 0) + 1
+                FROM application_versions WHERE application_id = ?
+                """,
+                (application.id,),
+            ).fetchone()[0]
+            connection.execute(
+                """
+                INSERT INTO application_versions (
+                    id, application_id, version_number, event_type,
+                    snapshot_json, created_at
+                ) VALUES (?, ?, ?, 'ai_task.completed', ?, ?)
+                """,
+                (
+                    f"appv_{uuid4().hex}",
+                    application.id,
+                    next_version,
+                    authority_row["snapshot_json"],
+                    authority_row["created_at"],
+                ),
+            )
+        return original(**values)
+
+    monkeypatch.setattr(repo, "create_and_select_resume_draft", race)
+    before_resume_ids = {item.id for item in repo.list_resume_versions()}
+
+    with pytest.raises(ValueError, match="authority.*ambiguous"):
+        create_verified_resume_draft(
+            repo,
+            application_id=application.id,
+            task_id=task.id,
+            finding_ids=[findings[0].id],
+            name="Authority race draft",
+        )
+
+    assert {item.id for item in repo.list_resume_versions()} == before_resume_ids
+    assert repo.get_application(application.id).selected_resume_version_id == parent.id
+    assert list((repo.vault_path / "resumes").glob("res_*/source.tex")) == []
+
+
+def test_parent_substitution_cannot_write_resume_source_outside_vault(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from careerops.resumes import drafts as drafts_module
+
+    repo = _make_repo(tmp_path)
+    application = _create_application(repo)
+    parent = _select_parent(repo, application.id)
+    task, findings, _evidence = _create_completed_suggestion_task(
+        repo, application.id
+    )
+    resume_id = "res_" + ("a" * 32)
+    draft_dir = repo.vault_path / "resumes" / resume_id
+    moved_dir = repo.vault_path / "resumes" / "moved-resume-draft"
+    outside_dir = tmp_path / "outside-vault"
+    outside_dir.mkdir()
+    real_uuid4 = uuid4
+    substitution_attempted = False
+    substituted = False
+
+    def substitute_parent():
+        nonlocal substituted, substitution_attempted
+        if not substituted:
+            substitution_attempted = True
+            draft_dir.rename(moved_dir)
+            if os.name == "nt":
+                subprocess.run(
+                    [
+                        "cmd.exe",
+                        "/d",
+                        "/c",
+                        "mklink",
+                        "/J",
+                        str(draft_dir),
+                        str(outside_dir),
+                    ],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                )
+            else:
+                draft_dir.symlink_to(outside_dir, target_is_directory=True)
+            substituted = True
+        return real_uuid4()
+
+    monkeypatch.setattr(drafts_module, "new_id", lambda _prefix: resume_id)
+    monkeypatch.setattr(drafts_module, "uuid4", substitute_parent)
+    before_resume_ids = {item.id for item in repo.list_resume_versions()}
+
+    try:
+        with pytest.raises(ValueError):
+            create_verified_resume_draft(
+                repo,
+                application_id=application.id,
+                task_id=task.id,
+                finding_ids=[findings[0].id],
+                name="Substitution race draft",
+            )
+        assert substitution_attempted
+        assert list(outside_dir.iterdir()) == []
+        assert {item.id for item in repo.list_resume_versions()} == before_resume_ids
+        assert repo.get_application(application.id).selected_resume_version_id == parent.id
+    finally:
+        for path in outside_dir.iterdir():
+            if path.is_file():
+                path.unlink()
+        if draft_dir.exists() or draft_dir.is_symlink():
+            draft_dir.rmdir()
+        if moved_dir.exists():
+            shutil.rmtree(moved_dir)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows native publication path")
+def test_windows_publication_failure_cleans_owned_directory(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from careerops.resumes import drafts as drafts_module
+
+    repo = _make_repo(tmp_path)
+    application = _create_application(repo)
+    parent = _select_parent(repo, application.id)
+    task, findings, _evidence = _create_completed_suggestion_task(
+        repo, application.id
+    )
+    resume_id = "res_" + ("b" * 32)
+    draft_dir = repo.vault_path / "resumes" / resume_id
+
+    def fail_rename(*_args: Any) -> None:
+        raise OSError("simulated native rename failure")
+
+    monkeypatch.setattr(drafts_module, "new_id", lambda _prefix: resume_id)
+    monkeypatch.setattr(drafts_module, "_windows_rename_relative", fail_rename)
+
+    with pytest.raises(ValueError, match="changed during publication"):
+        create_verified_resume_draft(
+            repo,
+            application_id=application.id,
+            task_id=task.id,
+            finding_ids=[findings[0].id],
+            name="Failed publication draft",
+        )
+
+    assert not draft_dir.exists()
+    assert repo.get_application(application.id).selected_resume_version_id == parent.id
+
+
 def test_success_returns_inserted_model_without_post_commit_getter(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -894,6 +1073,48 @@ def test_success_returns_inserted_model_without_post_commit_getter(
     )
 
     assert child.parent_resume_version_id is not None
+
+
+def test_post_commit_handle_release_cannot_report_false_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from careerops.resumes import drafts as drafts_module
+
+    repo = _make_repo(tmp_path)
+    application = _create_application(repo)
+    _select_parent(repo, application.id)
+    task, findings, _evidence = _create_completed_suggestion_task(
+        repo, application.id
+    )
+    original_commit = repo.create_and_select_resume_draft
+    original_close = drafts_module._close_published_source
+
+    def commit_then_fail_release(**values: Any):
+        result = original_commit(**values)
+
+        def close_then_fail(published: Any) -> None:
+            original_close(published)
+            raise OSError("simulated post-commit handle release failure")
+
+        monkeypatch.setattr(
+            drafts_module, "_close_published_source", close_then_fail
+        )
+        return result
+
+    monkeypatch.setattr(
+        repo, "create_and_select_resume_draft", commit_then_fail_release
+    )
+
+    child = create_verified_resume_draft(
+        repo,
+        application_id=application.id,
+        task_id=task.id,
+        finding_ids=[findings[0].id],
+        name="Committed draft",
+    )
+
+    assert repo.get_application(application.id).selected_resume_version_id == child.id
 
 
 def _make_application_approved(

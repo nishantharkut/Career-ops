@@ -2759,16 +2759,40 @@ class CareerOpsRepository:
             ):
                 raise ValueError("AI task authority changed before draft creation")
 
-            version_row = connection.execute(
-                "SELECT * FROM application_versions WHERE id = ?",
-                (authority.authority_version_id,),
-            ).fetchone()
+            authority_matches: list[tuple[sqlite3.Row, dict[str, Any]]] = []
+            version_rows = connection.execute(
+                """
+                SELECT * FROM application_versions
+                WHERE application_id = ? AND event_type = 'ai_task.completed'
+                ORDER BY version_number ASC
+                """,
+                (application_id,),
+            ).fetchall()
+            for version_row in version_rows:
+                try:
+                    snapshot = json.loads(version_row["snapshot_json"])
+                except (TypeError, json.JSONDecodeError) as exc:
+                    raise ValueError("AI task authority snapshot is invalid") from exc
+                if not isinstance(snapshot, dict):
+                    raise ValueError("AI task authority snapshot is invalid")
+                task_snapshot = snapshot.get("ai_task")
+                if (
+                    isinstance(task_snapshot, dict)
+                    and task_snapshot.get("id") == authority.task.id
+                ):
+                    authority_matches.append((version_row, snapshot))
+            if len(authority_matches) != 1:
+                raise ValueError("AI task completed authority is ambiguous")
+            authority_version, authority_snapshot = authority_matches[0]
+            task_snapshot = authority_snapshot.get("ai_task")
             if (
-                version_row is None
-                or version_row["application_id"] != application_id
-                or version_row["event_type"] != "ai_task.completed"
-                or sha256_text(version_row["snapshot_json"])
+                authority_version["id"] != authority.authority_version_id
+                or sha256_text(authority_version["snapshot_json"])
                 != authority.authority_snapshot_sha256
+                or not isinstance(task_snapshot, dict)
+                or task_snapshot.get("status") != AiTaskStatus.COMPLETED.value
+                or task_snapshot.get("task_type")
+                != AiTaskType.SUGGEST_RESUME_EDITS.value
             ):
                 raise ValueError("AI task completed authority changed")
 
@@ -2794,6 +2818,68 @@ class CareerOpsRepository:
                 row["id"]: database_row_sha256(row) for row in finding_rows
             } != expected_finding_signatures:
                 raise ValueError("AI finding authority changed")
+
+            artifact_manifest = authority_snapshot.get("artifacts")
+            manifest_by_id: dict[str, dict[str, str]] = {}
+            manifest_by_type: dict[str, dict[str, str]] = {}
+            if not isinstance(artifact_manifest, list):
+                raise ValueError("AI task artifact authority changed")
+            for item in artifact_manifest:
+                if (
+                    not isinstance(item, dict)
+                    or set(item) != {"artifact_type", "id", "sha256"}
+                    or type(item.get("artifact_type")) is not str
+                    or type(item.get("id")) is not str
+                    or type(item.get("sha256")) is not str
+                    or item["id"] in manifest_by_id
+                    or item["artifact_type"] in manifest_by_type
+                ):
+                    raise ValueError("AI task artifact authority changed")
+                manifest_by_id[item["id"]] = item
+                manifest_by_type[item["artifact_type"]] = item
+            expected_manifest = {
+                row["id"]: {
+                    "artifact_type": row["artifact_type"],
+                    "id": row["id"],
+                    "sha256": row["sha256"],
+                }
+                for row in artifact_rows
+            }
+            if (
+                manifest_by_id != expected_manifest
+                or set(manifest_by_type)
+                != {"context", "raw_output", "validated_output"}
+            ):
+                raise ValueError("AI task artifact authority changed")
+
+            snapshot_finding_ids = authority_snapshot.get("finding_ids")
+            side_effect = authority_snapshot.get("side_effect")
+            suggestion_ids = (
+                side_effect.get("suggestion_finding_ids")
+                if isinstance(side_effect, dict)
+                else None
+            )
+            expected_finding_ids = set(expected_finding_signatures)
+            if (
+                not isinstance(snapshot_finding_ids, list)
+                or not isinstance(suggestion_ids, list)
+                or any(type(value) is not str for value in snapshot_finding_ids)
+                or any(type(value) is not str for value in suggestion_ids)
+                or len(set(snapshot_finding_ids)) != len(snapshot_finding_ids)
+                or snapshot_finding_ids != suggestion_ids
+                or set(snapshot_finding_ids) != expected_finding_ids
+            ):
+                raise ValueError("AI task finding authority changed")
+            provenance = authority_snapshot.get("provenance")
+            context_manifest = manifest_by_type["context"]
+            if (
+                not isinstance(provenance, dict)
+                or provenance.get("ai_task_id") != authority.task.id
+                or provenance.get("context_sha256") != context_manifest["sha256"]
+                or context_manifest["id"] != authority.context_artifact.id
+                or context_manifest["sha256"] != authority.context_artifact.sha256
+            ):
+                raise ValueError("AI task context authority changed")
             evidence_rows = connection.execute(
                 """
                 SELECT evidence_items.*
