@@ -166,7 +166,7 @@ export type EvidenceRecord = {
   id: string;
   claim_text: string;
   evidence_type: string;
-  source_url: string;
+  source_url: string | null;
   source_sha256: string | null;
   verification_state: VerificationState;
   privacy_level: PrivacyLevel;
@@ -223,27 +223,35 @@ function id(value: string): string {
   return encodeURIComponent(value);
 }
 
-async function request<T>(path: string, init?: RequestInit): Promise<T> {
-  const response = await fetch(`${API_BASE}${path}`, init);
-  if (!response.ok) {
-    const fallback = `${response.status} ${response.statusText || "Request failed"}`;
-    let message = fallback;
-    try {
-      const body: unknown = await response.json();
-      if (
-        body !== null &&
-        typeof body === "object" &&
-        "detail" in body &&
-        typeof body.detail === "string" &&
-        body.detail.trim()
-      ) {
-        message = body.detail.trim().slice(0, 500);
-      }
-    } catch {
-      message = fallback;
+async function responseError(response: Response): Promise<Error> {
+  const fallback = `${response.status} ${response.statusText || "Request failed"}`;
+  let message = fallback;
+  try {
+    const body: unknown = await response.json();
+    if (
+      body !== null &&
+      typeof body === "object" &&
+      "detail" in body &&
+      typeof body.detail === "string" &&
+      body.detail.trim()
+    ) {
+      message = body.detail.trim().slice(0, 500);
     }
-    throw new Error(message);
+  } catch {
+    message = fallback;
   }
+  return new Error(message);
+}
+
+async function requireOk(response: Response): Promise<Response> {
+  if (!response.ok) {
+    throw await responseError(response);
+  }
+  return response;
+}
+
+async function request<T>(path: string, init?: RequestInit): Promise<T> {
+  const response = await requireOk(await fetch(`${API_BASE}${path}`, init));
   return response.json() as Promise<T>;
 }
 
@@ -418,11 +426,59 @@ export function createResumeDraft(
   );
 }
 
-function artifactUrl(applicationId: string, artifact: string): string {
-  return `${API_BASE}/applications/${id(applicationId)}/artifacts/${artifact}`;
+export type DownloadedArtifact = {
+  blob: Blob;
+  filename: string;
+  contentType: string;
+};
+
+function boundedFilename(value: string, fallback: string): string {
+  const leaf = value.split(/[\\/]/).at(-1)?.replace(/[\u0000-\u001f\u007f]/g, "").trim() || fallback;
+  if (leaf.length <= 180) return leaf;
+  const extensionIndex = leaf.lastIndexOf(".");
+  const extension = extensionIndex > 0 && leaf.length - extensionIndex <= 16 ? leaf.slice(extensionIndex) : "";
+  return `${leaf.slice(0, 180 - extension.length)}${extension}`;
 }
 
-export const jdDownloadUrl = (applicationId: string) => artifactUrl(applicationId, "jd");
-export const resumePdfDownloadUrl = (applicationId: string) => artifactUrl(applicationId, "resume-pdf");
-export const reportDownloadUrl = (applicationId: string) => artifactUrl(applicationId, "report");
-export const approvalDownloadUrl = (applicationId: string) => artifactUrl(applicationId, "approval");
+function responseFilename(response: Response, fallback: string): string {
+  const disposition = response.headers.get("Content-Disposition") || "";
+  const encoded = disposition.match(/filename\*=UTF-8''([^;]+)/i)?.[1];
+  const plain = disposition.match(/filename=(?:"([^"]+)"|([^;]+))/i);
+  let reported = plain?.[1] || plain?.[2]?.trim() || fallback;
+  if (encoded) {
+    try {
+      reported = decodeURIComponent(encoded);
+    } catch {
+      reported = fallback;
+    }
+  }
+  return boundedFilename(reported, fallback);
+}
+
+async function downloadArtifact(
+  applicationId: string,
+  artifact: string,
+  fallbackFilename: string
+): Promise<DownloadedArtifact> {
+  const response = await requireOk(
+    await fetch(`${API_BASE}/applications/${id(applicationId)}/artifacts/${artifact}`)
+  );
+  const contentType = (response.headers.get("Content-Type") || "application/octet-stream")
+    .split(";", 1)[0]
+    .trim()
+    .slice(0, 120) || "application/octet-stream";
+  return {
+    blob: await response.blob(),
+    filename: responseFilename(response, fallbackFilename),
+    contentType
+  };
+}
+
+export const downloadJd = (applicationId: string) =>
+  downloadArtifact(applicationId, "jd", "job-description.txt");
+export const downloadResumePdf = (applicationId: string) =>
+  downloadArtifact(applicationId, "resume-pdf", "resume.pdf");
+export const downloadReport = (applicationId: string) =>
+  downloadArtifact(applicationId, "report", "analysis-report.json");
+export const downloadApproval = (applicationId: string) =>
+  downloadArtifact(applicationId, "approval", "approval.json");

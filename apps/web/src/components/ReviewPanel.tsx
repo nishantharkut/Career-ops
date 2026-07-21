@@ -1,13 +1,15 @@
+import { useState } from "react";
 import { Check, FileDown, ShieldCheck } from "lucide-react";
 
 import {
   ApprovalRecord,
+  DownloadedArtifact,
   ReportRecord,
   ResumeRecord,
-  approvalDownloadUrl,
-  jdDownloadUrl,
-  reportDownloadUrl,
-  resumePdfDownloadUrl
+  downloadApproval,
+  downloadJd,
+  downloadReport,
+  downloadResumePdf
 } from "../api";
 
 type ReviewPanelProps = {
@@ -22,18 +24,28 @@ type ReviewPanelProps = {
   onSubmitted: () => Promise<void> | void;
 };
 
-function ExportAction({ href, available, label }: { href: string; available: boolean; label: string }) {
-  if (!available) {
-    return (
-      <button type="button" disabled aria-label={`${label} unavailable`}>
-        <FileDown aria-hidden="true" size={16} /> {label}
-      </button>
-    );
-  }
+type DownloadClient = (applicationId: string) => Promise<DownloadedArtifact>;
+
+function ExportAction({
+  available,
+  busy,
+  label,
+  onClick
+}: {
+  available: boolean;
+  busy: boolean;
+  label: string;
+  onClick: () => void;
+}) {
   return (
-    <a href={href} download>
+    <button
+      type="button"
+      disabled={!available || busy}
+      aria-label={available ? label : `${label} unavailable`}
+      onClick={onClick}
+    >
       <FileDown aria-hidden="true" size={16} /> {label}
-    </a>
+    </button>
   );
 }
 
@@ -48,13 +60,38 @@ export default function ReviewPanel({
   onApprove,
   onSubmitted
 }: ReviewPanelProps) {
+  const [exportBusy, setExportBusy] = useState("");
+  const [exportError, setExportError] = useState("");
   const hasCleanReport = Boolean(report && report.blocking_issue_count === 0);
+
+  async function exportArtifact(label: string, download: DownloadClient) {
+    if (!applicationId || exportBusy) return;
+    setExportBusy(label);
+    setExportError("");
+    let objectUrl = "";
+    try {
+      const artifact = await download(applicationId);
+      objectUrl = URL.createObjectURL(artifact.blob);
+      const link = document.createElement("a");
+      link.href = objectUrl;
+      link.download = artifact.filename;
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+    } catch (downloadError) {
+      setExportError(downloadError instanceof Error ? downloadError.message : `${label} could not be downloaded.`);
+    } finally {
+      if (objectUrl) URL.revokeObjectURL(objectUrl);
+      setExportBusy("");
+    }
+  }
 
   return (
     <section className="panel" aria-label="Checks and approval">
       <h2>Checks</h2>
       {busy && <p className="notice" role="status">{busy}</p>}
       {error && <p className="error" role="alert">{error}</p>}
+      {exportError && <p className="error" role="alert">{exportError}</p>}
       {!applicationId && <p className="muted">Select an application to review checks.</p>}
       {applicationId && !report && <p className="muted">Run Analyze after rendering the selected resume.</p>}
       {report && (
@@ -90,24 +127,28 @@ export default function ReviewPanel({
         <h3>Exports</h3>
         <div className="actions actions--stacked">
           <ExportAction
-            href={applicationId ? jdDownloadUrl(applicationId) : ""}
             available={Boolean(applicationId)}
+            busy={exportBusy !== ""}
             label="Export JD"
+            onClick={() => void exportArtifact("Export JD", downloadJd)}
           />
           <ExportAction
-            href={applicationId ? resumePdfDownloadUrl(applicationId) : ""}
             available={Boolean(applicationId && resume?.pdf_sha256)}
+            busy={exportBusy !== ""}
             label="Export resume PDF"
+            onClick={() => void exportArtifact("Export resume PDF", downloadResumePdf)}
           />
           <ExportAction
-            href={applicationId ? reportDownloadUrl(applicationId) : ""}
             available={Boolean(applicationId && report)}
+            busy={exportBusy !== ""}
             label="Export report"
+            onClick={() => void exportArtifact("Export report", downloadReport)}
           />
           <ExportAction
-            href={applicationId ? approvalDownloadUrl(applicationId) : ""}
             available={Boolean(applicationId && approval)}
+            busy={exportBusy !== ""}
             label="Export approval"
+            onClick={() => void exportArtifact("Export approval", downloadApproval)}
           />
         </div>
       </section>

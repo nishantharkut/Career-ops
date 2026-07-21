@@ -3,7 +3,8 @@ import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, test, vi } from "vitest";
 
 import App, { statusLabel } from "./App";
-import type { ApplicationPacket, ApplicationRecord, JsonValue, RequirementsRecord } from "./api";
+import type { ApplicationPacket, ApplicationRecord, EvidenceRecord, JsonValue, RequirementsRecord } from "./api";
+import ReviewPanel from "./components/ReviewPanel";
 
 const application = (id: string, company: string): ApplicationRecord => ({
   id,
@@ -66,6 +67,7 @@ function installDefaultFetch(applications: ApplicationRecord[] = []) {
 
 describe("Application Desk UI", () => {
   beforeEach(() => {
+    vi.unstubAllGlobals();
     vi.restoreAllMocks();
   });
 
@@ -204,12 +206,15 @@ describe("Application Desk UI", () => {
     expect(screen.getByRole("button", { name: "Mark submitted manually" })).toBeDisabled();
   });
 
-  test("saves requirement corrections only in user_corrected", async () => {
+  test("uses typed requirement corrections and preserves untouched structured values", async () => {
     const record = application("app_1", "Swiggy");
     let requirements: RequirementsRecord = {
       raw_ai: { location: "unknown" },
       deterministic: { required_skills: ["Python"] },
-      user_corrected: { location: "Unknown" },
+      user_corrected: {
+        location: "Unknown",
+        compensation: { currency: "INR", bands: [10, 20] }
+      },
       uncertainty: { location: "not stated" }
     };
     let savedBody: unknown;
@@ -232,32 +237,73 @@ describe("Application Desk UI", () => {
     render(<App />);
 
     await userEvent.click(await screen.findByRole("tab", { name: "Requirements" }));
+    expect(await screen.findByRole("heading", { name: "Unknown and uncertain" })).toBeInTheDocument();
     expect(await screen.findByText("not stated")).toBeInTheDocument();
+    expect(screen.queryByText("Structured value")).not.toBeInTheDocument();
+    expect(screen.queryByRole("textbox", { name: /json/i })).not.toBeInTheDocument();
+    expect(screen.getByText("currency")).toBeInTheDocument();
+    expect(screen.getByText("INR")).toBeInTheDocument();
+    expect(screen.getByText("bands")).toBeInTheDocument();
+    await userEvent.selectOptions(screen.getByLabelText("Correction kind for location"), "number");
     const location = screen.getByLabelText("Correction value for location");
     await userEvent.clear(location);
-    await userEvent.type(location, "Remote");
+    await userEvent.click(screen.getByRole("button", { name: "Save corrections" }));
+    expect(screen.getByRole("alert")).toHaveTextContent("Enter a valid number for location.");
+    expect(savedBody).toBeUndefined();
+
+    await userEvent.type(location, "3");
+    await userEvent.click(screen.getByRole("button", { name: "Add correction" }));
+    await userEvent.type(screen.getByLabelText("Correction key 3"), "skills");
+    await userEvent.selectOptions(screen.getByLabelText("Correction kind for skills"), "list");
+    await userEvent.click(screen.getByRole("button", { name: "Save corrections" }));
+    expect(screen.getByRole("alert")).toHaveTextContent("Enter at least one list item for skills.");
+
+    await userEvent.type(screen.getByLabelText("Correction value for skills"), "Python, Rust");
     await userEvent.click(screen.getByRole("button", { name: "Save corrections" }));
 
     expect(await screen.findByText("Requirements saved.")).toBeInTheDocument();
-    expect(savedBody).toEqual({ user_corrected: { location: "Remote" } });
+    expect(savedBody).toEqual({
+      user_corrected: {
+        location: 3,
+        compensation: { currency: "INR", bands: [10, 20] },
+        skills: ["Python", "Rust"]
+      }
+    });
   });
 
   test("evidence, links, and profile facts preserve explicit privacy and verification", async () => {
     const record = application("app_1", "Swiggy");
     const posted: Array<{ url: string; body: unknown }> = [];
+    let packetLoads = 0;
+    const nullableEvidence: EvidenceRecord = {
+      id: "evd_null_source",
+      claim_text: "Public portfolio unavailable",
+      evidence_type: "project",
+      source_url: null,
+      source_sha256: null,
+      verification_state: "needs_verification",
+      privacy_level: "private",
+      publishable: false,
+      notes: "",
+      created_at: "",
+      updated_at: ""
+    };
     vi.stubGlobal(
       "fetch",
       vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
         const url = String(input);
         if (url.endsWith("/applications")) return jsonResponse([record]);
-        if (url.endsWith("/applications/app_1/packet")) return jsonResponse(packet(record));
+        if (url.endsWith("/applications/app_1/packet")) {
+          packetLoads += 1;
+          return jsonResponse(packet(record));
+        }
         if (url.endsWith("/ai/providers")) return jsonResponse([]);
         if (url.endsWith("/applications/app_1/evidence") && init?.method === "POST") {
           const body = JSON.parse(String(init.body));
           posted.push({ url, body });
           return jsonResponse({ id: body.evidence_id ?? `evd_${posted.length}`, ...body }, true, body.evidence_id ? 200 : 201);
         }
-        if (url.endsWith("/applications/app_1/evidence")) return jsonResponse([]);
+        if (url.endsWith("/applications/app_1/evidence")) return jsonResponse([nullableEvidence]);
         if (url.endsWith("/profile-facts") && init?.method === "POST") {
           const body = JSON.parse(String(init.body));
           posted.push({ url, body });
@@ -292,6 +338,79 @@ describe("Application Desk UI", () => {
         expect.objectContaining({ fact_key: "skills.python", fact_value: "Advanced", verification_state: "user_stated", privacy_level: "private" })
       ])
     );
+    expect(screen.getByText("Public portfolio unavailable")).toBeInTheDocument();
+    expect(packetLoads).toBeGreaterThanOrEqual(4);
+  });
+
+  test("downloads exports through the API client and revokes the object URL", async () => {
+    const createObjectURL = vi.fn(() => "blob:careerops-export");
+    const revokeObjectURL = vi.fn();
+    Object.defineProperty(URL, "createObjectURL", { configurable: true, value: createObjectURL });
+    Object.defineProperty(URL, "revokeObjectURL", { configurable: true, value: revokeObjectURL });
+    const clickedDownloads: string[] = [];
+    vi.spyOn(HTMLAnchorElement.prototype, "click").mockImplementation(function (this: HTMLAnchorElement) {
+      clickedDownloads.push(this.download);
+    });
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () =>
+        new Response(new Blob(["job description"]), {
+          status: 200,
+          headers: {
+            "Content-Disposition": 'attachment; filename="swiggy-jd.txt"',
+            "Content-Type": "text/plain"
+          }
+        })
+      )
+    );
+
+    render(
+      <ReviewPanel
+        applicationId="app_1"
+        resume={null}
+        report={null}
+        approval={null}
+        submitted={false}
+        busy=""
+        error=""
+        onApprove={vi.fn()}
+        onSubmitted={vi.fn()}
+      />
+    );
+    await userEvent.click(screen.getByRole("button", { name: "Export JD" }));
+
+    await waitFor(() => expect(clickedDownloads).toEqual(["swiggy-jd.txt"]));
+    expect(createObjectURL).toHaveBeenCalledWith(expect.any(Blob));
+    expect(revokeObjectURL).toHaveBeenCalledWith("blob:careerops-export");
+  });
+
+  test("shows a safe in-app error when a stale export fails", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () =>
+        new Response(JSON.stringify({ detail: "Approval artifact is stale." }), {
+          status: 409,
+          statusText: "Conflict",
+          headers: { "Content-Type": "application/json" }
+        })
+      )
+    );
+    render(
+      <ReviewPanel
+        applicationId="app_1"
+        resume={null}
+        report={null}
+        approval={null}
+        submitted={false}
+        busy=""
+        error=""
+        onApprove={vi.fn()}
+        onSubmitted={vi.fn()}
+      />
+    );
+
+    await userEvent.click(screen.getByRole("button", { name: "Export JD" }));
+    expect(await screen.findByRole("alert")).toHaveTextContent("Approval artifact is stale.");
   });
 
   test("a stale packet response cannot replace the current application", async () => {

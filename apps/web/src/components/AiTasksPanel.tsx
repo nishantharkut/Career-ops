@@ -21,11 +21,19 @@ type AiTasksPanelProps = {
 
 const TASK_OPTIONS: Array<{ value: AiTaskType; label: string }> = [
   { value: "analyze_fit", label: "Analyze fit" },
-  { value: "analyze_jd", label: "Analyze job description" },
+  { value: "analyze_jd", label: "Analyze JD" },
   { value: "suggest_resume_edits", label: "Suggest resume edits" },
   { value: "draft_cover_letter", label: "Draft cover letter" },
   { value: "review_claims", label: "Review claims" }
 ];
+
+const TASK_COMMANDS: Record<AiTaskType, string> = {
+  analyze_fit: "Run AI review",
+  analyze_jd: "Analyze JD",
+  suggest_resume_edits: "Suggest resume edits",
+  draft_cover_letter: "Draft cover letter",
+  review_claims: "Review claims"
+};
 
 const TERMINAL_STATUSES = new Set(["completed", "blocked", "failed"]);
 
@@ -116,6 +124,7 @@ export default function AiTasksPanel({ applicationId, initialTask, onPacketChang
       try {
         const updated = await getAiTask(expectedTaskId, controller.signal);
         if (disposed || requestGeneration !== taskGeneration.current) return;
+        setError("");
         setActiveTask(updated);
         if (TERMINAL_STATUSES.has(updated.status)) {
           await onPacketChanged();
@@ -125,6 +134,7 @@ export default function AiTasksPanel({ applicationId, initialTask, onPacketChang
       } catch (pollError) {
         if (!disposed && !controller.signal.aborted && requestGeneration === taskGeneration.current) {
           setError(pollError instanceof Error ? pollError.message : "Task status could not be refreshed.");
+          timer = setTimeout(() => void poll(), 1500);
         }
       }
     };
@@ -197,7 +207,13 @@ export default function AiTasksPanel({ applicationId, initialTask, onPacketChang
       </label>
       <label>
         Task
-        <select value={taskType} onChange={(event) => setTaskType(event.target.value as AiTaskType)}>
+        <select
+          value={taskType}
+          onChange={(event) => {
+            setTaskType(event.target.value as AiTaskType);
+            setAcknowledged(false);
+          }}
+        >
           {TASK_OPTIONS.map((option) => <option value={option.value} key={option.value}>{option.label}</option>)}
         </select>
       </label>
@@ -229,7 +245,7 @@ export default function AiTasksPanel({ applicationId, initialTask, onPacketChang
         ) : (
           <Play aria-hidden="true" size={16} />
         )}
-        {selectedProvider?.is_ai === false ? "Run verifier" : "Run AI review"}
+        {selectedProvider?.is_ai === false ? "Run verifier" : TASK_COMMANDS[taskType]}
       </button>
 
       {activeTask && (
@@ -241,7 +257,7 @@ export default function AiTasksPanel({ applicationId, initialTask, onPacketChang
             <div><dt>Provider</dt><dd>{taskProvider ? providerLabel(taskProvider) : activeTask.provider_config_id}</dd></div>
             <div><dt>Model</dt><dd>{taskProvider?.model || "Not reported"}</dd></div>
             <div><dt>Privacy</dt><dd>{activeTask.privacy_mode}</dd></div>
-            <div><dt>Task</dt><dd>{activeTask.task_type} · {bounded(activeTask.id)}</dd></div>
+            <div><dt>Task</dt><dd>{activeTask.task_type} / {bounded(activeTask.id)}</dd></div>
             <div><dt>Prompt</dt><dd>{activeTask.prompt_template_id || "Not reported"}</dd></div>
             <div><dt>Checksum</dt><dd>{bounded(activeTask.prompt_sha256 || "Not reported")}</dd></div>
           </dl>

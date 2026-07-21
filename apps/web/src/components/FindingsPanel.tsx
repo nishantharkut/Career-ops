@@ -16,7 +16,11 @@ type FindingsPanelProps = {
   onPacketChanged: () => Promise<void> | void;
 };
 
-function isSafeSuggestion(finding: AiFindingRecord): boolean {
+function isDecisionEligible(finding: AiFindingRecord): boolean {
+  return finding.verifier_state === "verified";
+}
+
+function isDraftEligible(finding: AiFindingRecord): boolean {
   return finding.finding_type === "resume_edit_suggestion" && finding.verifier_state === "verified";
 }
 
@@ -38,7 +42,7 @@ export default function FindingsPanel({
   const [notice, setNotice] = useState("");
 
   const acceptedFindingIds = findings
-    .filter((finding) => isSafeSuggestion(finding) && finding.decision === "accepted")
+    .filter((finding) => isDraftEligible(finding) && finding.decision === "accepted")
     .map((finding) => finding.id);
   const canCreateDraft =
     task.status === "completed" &&
@@ -94,7 +98,8 @@ export default function FindingsPanel({
       ) : (
         <ul className="issue-list">
           {findings.map((finding) => {
-            const safe = isSafeSuggestion(finding);
+            const decisionEligible = isDecisionEligible(finding);
+            const resumeSuggestion = finding.finding_type === "resume_edit_suggestion";
             return (
               <li key={finding.id}>
                 <strong>{finding.claim_text || finding.recommendation || finding.finding_type}</strong>
@@ -102,19 +107,19 @@ export default function FindingsPanel({
                 {payloadText(finding, "replacement_text") && (
                   <span>{payloadText(finding, "replacement_text")}</span>
                 )}
-                {safe ? (
-                  <span><ShieldCheck aria-hidden="true" size={16} /> Verified suggestion</span>
+                {decisionEligible ? (
+                  <span><ShieldCheck aria-hidden="true" size={16} /> {resumeSuggestion ? "Verified suggestion" : "Verified finding"}</span>
                 ) : (
                   <span>Blocked by verifier</span>
                 )}
-                {safe && finding.decision === "pending" && (
+                {decisionEligible && finding.decision === "pending" && (
                   <div className="actions">
                     <button
                       type="button"
                       disabled={busy !== ""}
                       onClick={() => void decide(finding, "accepted")}
                     >
-                      <Check aria-hidden="true" size={16} /> Accept suggestion
+                      <Check aria-hidden="true" size={16} /> {resumeSuggestion ? "Accept suggestion" : "Accept"}
                     </button>
                     <button
                       type="button"
@@ -122,11 +127,11 @@ export default function FindingsPanel({
                       disabled={busy !== ""}
                       onClick={() => void decide(finding, "rejected")}
                     >
-                      <X aria-hidden="true" size={16} /> Reject suggestion
+                      <X aria-hidden="true" size={16} /> {resumeSuggestion ? "Reject suggestion" : "Reject"}
                     </button>
                   </div>
                 )}
-                {safe && finding.decision !== "pending" && <span>Decision: {finding.decision}</span>}
+                {decisionEligible && finding.decision !== "pending" && <span>Decision: {finding.decision}</span>}
               </li>
             );
           })}

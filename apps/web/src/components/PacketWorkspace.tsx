@@ -144,7 +144,7 @@ export default function PacketWorkspace({
         <summary>History</summary>
         <p>
           Resume {resume?.id ?? "not selected"}
-          {resume?.parent_resume_version_id ? ` · Parent ${resume.parent_resume_version_id}` : " · No parent"}
+          {resume?.parent_resume_version_id ? ` / Parent ${resume.parent_resume_version_id}` : " / No parent"}
         </p>
         {packet.versions.length === 0 ? (
           <p className="muted">No packet versions recorded.</p>

@@ -186,7 +186,7 @@ export default function EvidencePanel({ applicationId, readOnly, onMutated }: Ev
           {evidence.map((item) => (
             <li key={item.id}>
               <strong>{item.claim_text}</strong>
-              <span>{item.evidence_type} · {item.verification_state} · {item.privacy_level}</span>
+              <span>{item.evidence_type} / {item.verification_state} / {item.privacy_level}</span>
               {item.publishable && <span><ShieldCheck aria-hidden="true" size={16} /> Verified public evidence</span>}
             </li>
           ))}
@@ -224,7 +224,7 @@ export default function EvidencePanel({ applicationId, readOnly, onMutated }: Ev
             {facts.map((fact) => (
               <div key={fact.id}>
                 <dt>{fact.fact_key}</dt>
-                <dd>{fact.fact_value} · {fact.verification_state} · {fact.privacy_level}</dd>
+                <dd>{fact.fact_value} / {fact.verification_state} / {fact.privacy_level}</dd>
               </div>
             ))}
           </dl>
