@@ -90,6 +90,7 @@ def create_provider_config(
     model: str = "fixture-v1",
     privacy_mode: str = "local_private",
     endpoint: str = "",
+    identity_name: str = "",
     enabled: bool = True,
 ):
     return repo.upsert_ai_provider_config(
@@ -97,6 +98,7 @@ def create_provider_config(
         display_name=f"{provider_kind} {model}",
         privacy_mode=privacy_mode,
         endpoint=endpoint,
+        identity_name=identity_name,
         model=model,
         enabled=enabled,
     )
@@ -159,6 +161,7 @@ class ScriptedProvider:
             "invocation": InvocationMetadata(
                 mode="test_fixture",
                 endpoint=self.status.endpoint,
+                identity_name=self.status.identity_name,
             ),
             **self.result_overrides,
         }
@@ -196,6 +199,7 @@ def availability(
     privacy_mode: PrivacyMode = PrivacyMode.LOCAL_PRIVATE,
     data_leaves_machine: bool = False,
     endpoint: str = "",
+    identity_name: str = "",
     available: bool = True,
 ) -> ProviderAvailability:
     return ProviderAvailability(
@@ -207,6 +211,7 @@ def availability(
         is_ai=True,
         detail="available" if available else "unavailable",
         endpoint=endpoint,
+        identity_name=identity_name,
     )
 
 
@@ -308,29 +313,37 @@ def test_exact_config_selects_second_same_kind_provider_once(tmp_path: Path):
     preferred_config = create_provider_config(
         repo,
         provider_kind="codex",
-        model="codex2-preferred",
+        model="gpt-5.6-sol",
         privacy_mode="cloud_external",
+        endpoint="codex-identity://codex2",
+        identity_name="codex2",
     )
     alternate_config = create_provider_config(
         repo,
         provider_kind="codex",
-        model="codex-alternate",
+        model="gpt-5.6-sol",
         privacy_mode="cloud_external",
+        endpoint="codex-identity://codex",
+        identity_name="codex",
     )
     preferred = ScriptedProvider(
         availability(
             provider_kind="codex",
-            model="codex2-preferred",
+            model="gpt-5.6-sol",
             privacy_mode=PrivacyMode.CLOUD_EXTERNAL,
             data_leaves_machine=True,
+            endpoint="codex-identity://codex2",
+            identity_name="codex2",
         )
     )
     alternate = ScriptedProvider(
         availability(
             provider_kind="codex",
-            model="codex-alternate",
+            model="gpt-5.6-sol",
             privacy_mode=PrivacyMode.CLOUD_EXTERNAL,
             data_leaves_machine=True,
+            endpoint="codex-identity://codex",
+            identity_name="codex",
         )
     )
     orchestrator = AiOrchestrator(
@@ -342,8 +355,43 @@ def test_exact_config_selects_second_same_kind_provider_once(tmp_path: Path):
     result = orchestrator.run(task.id)
 
     assert result.status == "completed"
+    assert preferred_config.id != alternate_config.id
     assert preferred.calls == 0
     assert alternate.calls == 1
+    version = repo.list_application_versions(application.id)[0]
+    assert version.snapshot["provenance"]["provider_identity_name"] == "codex"
+
+
+def test_codex_identity_mismatch_fails_closed_without_provider_call(tmp_path: Path):
+    from careerops.ai.orchestrator import AiOrchestrator
+
+    repo = make_repo(tmp_path)
+    application = create_application(repo)
+    config = create_provider_config(
+        repo,
+        provider_kind="codex",
+        model="gpt-5.6-sol",
+        privacy_mode="cloud_external",
+        endpoint="codex-identity://codex",
+        identity_name="codex",
+    )
+    provider = AvailabilityOnlyProvider(
+        availability(
+            provider_kind="codex",
+            model="gpt-5.6-sol",
+            privacy_mode=PrivacyMode.CLOUD_EXTERNAL,
+            data_leaves_machine=True,
+            endpoint="codex-identity://codex2",
+            identity_name="codex2",
+        )
+    )
+    orchestrator = AiOrchestrator(repo, {config.id: provider})
+
+    with pytest.raises(ValueError, match="metadata"):
+        orchestrator.enqueue(application.id, "analyze_jd", config.id)
+
+    assert provider.calls == 0
+    assert repo.list_ai_tasks(application.id) == []
 
 
 def test_provider_failure_never_falls_back_or_mutates_application(tmp_path: Path):
@@ -622,7 +670,7 @@ def test_attempt_artifacts_are_atomic_checksummed_and_never_contain_sidecar(
         assert ".tmp-" not in path.name
 
 
-def test_requeue_invalidates_stale_attempt_and_rebuilds_context(tmp_path: Path):
+def test_requeue_invalidates_stale_attempt_without_reinvoking_provider(tmp_path: Path):
     from careerops.ai.orchestrator import AiOrchestrator
 
     repo = make_repo(tmp_path)
@@ -646,19 +694,68 @@ def test_requeue_invalidates_stale_attempt_and_rebuilds_context(tmp_path: Path):
     task = orchestrator.enqueue(application.id, "analyze_fit", config.id)
 
     interrupted = orchestrator.run(task.id)
-    completed = orchestrator.run(task.id)
+    recovered = orchestrator.run(task.id)
 
     assert interrupted.status == "pending"
-    assert completed.status == "completed"
-    assert provider.calls == 2
+    assert recovered.status == "failed"
+    assert recovered.error_summary == "provider_error"
+    assert provider.calls == 1
     artifacts = repo.list_ai_artifacts(task.id)
     contexts = [item for item in artifacts if item.artifact_type == "context"]
-    assert len(contexts) == 2
-    assert contexts[0].claim_token != contexts[1].claim_token
-    assert contexts[0].sha256 != contexts[1].sha256
-    latest_context = json.loads(contexts[-1].path.read_text(encoding="utf-8"))
-    assert latest_context["confirmed_profile_facts"][0]["value"] == "SQL"
-    assert len(repo.list_application_versions(application.id)) == 1
+    assert len(contexts) == 1
+    assert repo.list_application_versions(application.id) == []
+
+
+def test_finalization_crash_recovery_never_reinvokes_or_writes_business_state(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    from careerops.ai.orchestrator import AiOrchestrator
+
+    class SimulatedCrash(BaseException):
+        pass
+
+    repo = make_repo(tmp_path)
+    application = create_application(repo)
+    select_resume(repo, application.id, "Python developer")
+    config = create_provider_config(repo)
+    provider = ScriptedProvider(availability())
+    orchestrator = AiOrchestrator(repo, {config.id: provider})
+    before = repo.get_application(application.id)
+    original_write_audit = repo._write_audit
+    crash_pending = True
+
+    def crash_during_finalization(*args: Any, **kwargs: Any) -> None:
+        nonlocal crash_pending
+        event_type = args[1] if len(args) > 1 else kwargs["event_type"]
+        if crash_pending and event_type == "application.version_recorded":
+            crash_pending = False
+            raise SimulatedCrash("simulated process crash")
+        original_write_audit(*args, **kwargs)
+
+    monkeypatch.setattr(repo, "_write_audit", crash_during_finalization)
+    task = orchestrator.enqueue(application.id, "analyze_fit", config.id)
+
+    with pytest.raises(SimulatedCrash):
+        orchestrator.run(task.id)
+
+    assert repo.get_ai_task(task.id).status == "running"
+    assert repo.get_application(application.id) == before
+    assert repo.list_application_versions(application.id) == []
+    with repo.connection() as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM reports WHERE application_id = ?",
+            (application.id,),
+        ).fetchone()[0] == 0
+    assert provider.calls == 1
+
+    assert repo.requeue_interrupted_ai_tasks() == 1
+    recovered = orchestrator.run(task.id)
+
+    assert recovered.status == "failed"
+    assert recovered.error_summary == "provider_error"
+    assert repo.get_application(application.id) == before
+    assert repo.list_application_versions(application.id) == []
+    assert provider.calls == 1
 
 
 def test_atomic_snapshot_failure_cleans_temp_and_fails_without_provider_call(
@@ -686,6 +783,85 @@ def test_atomic_snapshot_failure_cleans_temp_and_fails_without_provider_call(
     assert provider.calls == 0
     task_root = repo.vault_path / "ai-tasks" / task.id
     assert list(task_root.rglob("*.tmp-*")) == []
+
+
+def test_finalization_failure_rolls_back_report_application_and_version(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    from careerops.ai.orchestrator import AiOrchestrator
+
+    repo = make_repo(tmp_path)
+    application = create_application(repo)
+    select_resume(repo, application.id, "Python developer")
+    config = create_provider_config(repo)
+    provider = ScriptedProvider(availability())
+    orchestrator = AiOrchestrator(repo, {config.id: provider})
+    before = repo.get_application(application.id)
+    with repo.connection() as connection:
+        before_report_ids = [
+            row["id"]
+            for row in connection.execute(
+                "SELECT id FROM reports WHERE application_id = ? ORDER BY id",
+                (application.id,),
+            ).fetchall()
+        ]
+    original_write_audit = repo._write_audit
+
+    def fail_version_audit(*args: Any, **kwargs: Any) -> None:
+        event_type = args[1] if len(args) > 1 else kwargs["event_type"]
+        if event_type == "application.version_recorded":
+            raise RuntimeError("simulated finalization failure")
+        original_write_audit(*args, **kwargs)
+
+    monkeypatch.setattr(repo, "_write_audit", fail_version_audit)
+    task = orchestrator.enqueue(application.id, "analyze_fit", config.id)
+
+    result = orchestrator.run(task.id)
+
+    assert result.status == "failed"
+    assert provider.calls == 1
+    assert repo.get_application(application.id) == before
+    with repo.connection() as connection:
+        after_report_ids = [
+            row["id"]
+            for row in connection.execute(
+                "SELECT id FROM reports WHERE application_id = ? ORDER BY id",
+                (application.id,),
+            ).fetchall()
+        ]
+    assert after_report_ids == before_report_ids
+    assert repo.list_application_versions(application.id) == []
+
+
+def test_finalization_failure_rolls_back_jd_requirements_and_version(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    from careerops.ai.orchestrator import AiOrchestrator
+
+    repo = make_repo(tmp_path)
+    application = create_application(repo)
+    config = create_provider_config(repo)
+    provider = ScriptedProvider(availability())
+    orchestrator = AiOrchestrator(repo, {config.id: provider})
+    before = repo.get_jd_snapshot(application.jd_snapshot_id)
+    original_write_audit = repo._write_audit
+
+    def fail_version_audit(*args: Any, **kwargs: Any) -> None:
+        event_type = args[1] if len(args) > 1 else kwargs["event_type"]
+        if event_type == "application.version_recorded":
+            raise RuntimeError("simulated finalization failure")
+        original_write_audit(*args, **kwargs)
+
+    monkeypatch.setattr(repo, "_write_audit", fail_version_audit)
+    task = orchestrator.enqueue(application.id, "analyze_jd", config.id)
+
+    result = orchestrator.run(task.id)
+
+    assert result.status == "failed"
+    assert provider.calls == 1
+    assert repo.get_jd_snapshot(application.jd_snapshot_id) == before
+    assert repo.get_application(application.id) == application
+    assert repo.list_application_versions(application.id) == []
 
 
 def test_analyze_fit_creates_normal_report_with_complete_provenance(tmp_path: Path):
@@ -730,6 +906,7 @@ def test_analyze_fit_creates_normal_report_with_complete_provenance(tmp_path: Pa
         and json.loads(provider.requests[0].context_text())["prompt"]["sha256"],
         "prompt_template_id": "analyze_fit_v1",
         "provider_kind": "mock",
+        "provider_identity_name": "",
         "provider_model": "fixture-v1",
     }
     assert updated_application.approval_id is None

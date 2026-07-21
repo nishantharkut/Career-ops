@@ -29,6 +29,7 @@ def _add_ai_evidence_and_version_tables(connection: sqlite3.Connection) -> None:
             id TEXT PRIMARY KEY,
             provider_kind TEXT NOT NULL,
             display_name TEXT NOT NULL,
+            identity_name TEXT NOT NULL DEFAULT '',
             enabled INTEGER NOT NULL CHECK (enabled IN (0, 1)),
             privacy_mode TEXT NOT NULL CHECK (
                 privacy_mode IN (
@@ -64,6 +65,7 @@ def _add_ai_evidence_and_version_tables(connection: sqlite3.Connection) -> None:
                 )
             ),
             started_at TEXT,
+            invocation_started_at TEXT,
             completed_at TEXT,
             error_summary TEXT NOT NULL,
             claim_token TEXT,
@@ -401,6 +403,49 @@ def _canonicalize_ai_task_inputs(connection: sqlite3.Connection) -> None:
         )
 
 
+def _add_ai_invocation_fence(connection: sqlite3.Connection) -> None:
+    if "invocation_started_at" not in _column_names(connection, "ai_tasks"):
+        connection.execute("ALTER TABLE ai_tasks ADD COLUMN invocation_started_at TEXT")
+
+
+def _add_provider_identity(connection: sqlite3.Connection) -> None:
+    if "identity_name" not in _column_names(connection, "ai_provider_configs"):
+        connection.execute(
+            """
+            ALTER TABLE ai_provider_configs
+            ADD COLUMN identity_name TEXT NOT NULL DEFAULT ''
+            """
+        )
+    for operation in ("INSERT", "UPDATE"):
+        connection.execute(
+            f"""
+            CREATE TRIGGER IF NOT EXISTS validate_codex_identity_{operation.lower()}
+            BEFORE {operation} ON ai_provider_configs
+            WHEN NEW.provider_kind = 'codex'
+             AND (
+                NEW.identity_name NOT IN ('codex2', 'codex')
+                OR NEW.endpoint != ('codex-identity://' || NEW.identity_name)
+             )
+            BEGIN
+                SELECT RAISE(ABORT, 'invalid Codex identity binding');
+            END
+            """
+        )
+    connection.execute(
+        """
+        CREATE TRIGGER IF NOT EXISTS validate_provider_binding_immutable
+        BEFORE UPDATE ON ai_provider_configs
+        WHEN NEW.provider_kind != OLD.provider_kind
+          OR NEW.endpoint != OLD.endpoint
+          OR NEW.model != OLD.model
+          OR NEW.identity_name != OLD.identity_name
+        BEGIN
+            SELECT RAISE(ABORT, 'provider configuration binding is immutable');
+        END
+        """
+    )
+
+
 MIGRATIONS: tuple[tuple[int, Migration], ...] = (
     (1, _add_application_role_type),
     (2, _add_application_submitted_at),
@@ -411,6 +456,8 @@ MIGRATIONS: tuple[tuple[int, Migration], ...] = (
     (7, _add_ai_attempt_provenance),
     (8, _add_normalized_ai_task_inputs),
     (9, _canonicalize_ai_task_inputs),
+    (10, _add_ai_invocation_fence),
+    (11, _add_provider_identity),
 )
 
 LATEST_SCHEMA_VERSION = MIGRATIONS[-1][0]

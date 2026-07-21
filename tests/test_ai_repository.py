@@ -12,6 +12,7 @@ import warnings
 import pytest
 
 from careerops.core.database import connect_database, initialize_database
+from careerops.core.migrations import MIGRATIONS
 from careerops.core.repository import CareerOpsRepository
 
 
@@ -1069,6 +1070,69 @@ def test_provider_upsert_is_stable_and_updates_mutable_fields(tmp_path: Path):
     assert repo.list_ai_providers() == [second]
 
 
+def test_codex_provider_identities_with_same_model_coexist(tmp_path: Path):
+    repo = make_repo(tmp_path)
+
+    preferred = repo.upsert_ai_provider(
+        provider_kind="codex",
+        display_name="Codex account 2",
+        privacy_mode="cloud_external",
+        endpoint="codex-identity://codex2",
+        identity_name="codex2",
+        model="gpt-5.6-sol",
+        enabled=True,
+    )
+    alternate = repo.upsert_ai_provider(
+        provider_kind="codex",
+        display_name="Codex default",
+        privacy_mode="cloud_external",
+        endpoint="codex-identity://codex",
+        identity_name="codex",
+        model="gpt-5.6-sol",
+        enabled=True,
+    )
+
+    assert preferred.id != alternate.id
+    assert preferred.identity_name == "codex2"
+    assert alternate.identity_name == "codex"
+    assert [item.id for item in repo.list_ai_providers()] == [
+        preferred.id,
+        alternate.id,
+    ]
+    with repo.connection() as connection:
+        with pytest.raises(sqlite3.IntegrityError, match="immutable"):
+            connection.execute(
+                """
+                UPDATE ai_provider_configs
+                SET identity_name = ?, endpoint = ?, model = ?
+                WHERE id = ?
+                """,
+                (
+                    "codex",
+                    "codex-identity://codex",
+                    "gpt-5.6-sol-mutated",
+                    preferred.id,
+                ),
+            )
+
+
+def test_invocation_fence_survives_requeue_and_new_claim(tmp_path: Path):
+    repo = make_repo(tmp_path)
+    application = create_application(repo)
+    provider = create_provider(repo)
+    task = create_task(repo, application.id, provider.id)
+    first_claim = claim_task(repo, task.id)
+
+    assert repo.begin_ai_task_invocation(task.id, first_claim) is True
+    assert repo.begin_ai_task_invocation(task.id, first_claim) is False
+    assert repo.requeue_interrupted_ai_tasks() == 1
+    second_claim = claim_task(repo, task.id)
+
+    assert second_claim != first_claim
+    assert repo.begin_ai_task_invocation(task.id, second_claim) is False
+    assert repo.get_ai_task(task.id).invocation_started_at is not None
+
+
 def test_profile_facts_enforce_verification_states_and_write_audits(tmp_path: Path):
     repo = make_repo(tmp_path)
 
@@ -1245,6 +1309,69 @@ def test_v0_database_upgrades_without_data_loss(tmp_path: Path):
         assert connection.execute(
             "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'ai_tasks'"
         ).fetchone()
+
+
+def test_v10_database_adds_provider_identity_without_data_loss(tmp_path: Path):
+    database_path = tmp_path / "careerops.db"
+    fixture_path = Path(__file__).parent / "fixtures" / "v0_schema.sql"
+    with closing(sqlite3.connect(database_path)) as connection:
+        connection.executescript(fixture_path.read_text(encoding="utf-8"))
+        for version, migration in MIGRATIONS:
+            if version > 10:
+                break
+            migration(connection)
+            connection.execute(f"PRAGMA user_version = {version}")
+        connection.execute(
+            "ALTER TABLE ai_provider_configs DROP COLUMN identity_name"
+        )
+        provider_columns = {
+            row[1]
+            for row in connection.execute(
+                "PRAGMA table_info(ai_provider_configs)"
+            ).fetchall()
+        }
+        assert "identity_name" not in provider_columns
+        connection.execute(
+            """
+            INSERT INTO ai_provider_configs (
+                id, provider_kind, display_name, enabled, privacy_mode,
+                endpoint, model, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "aip_legacy",
+                "mock",
+                "Legacy provider",
+                1,
+                "local_private",
+                "",
+                "fixture-v1",
+                "2026-01-01T00:00:00+00:00",
+                "2026-01-01T00:00:00+00:00",
+            ),
+        )
+        connection.commit()
+
+    repo = CareerOpsRepository(database_path, tmp_path / "vault")
+    repo.initialize()
+
+    provider = repo.get_ai_provider("aip_legacy")
+    assert provider.display_name == "Legacy provider"
+    assert provider.identity_name == ""
+    with connect_database(database_path) as connection:
+        provider_columns = {
+            row[1]
+            for row in connection.execute(
+                "PRAGMA table_info(ai_provider_configs)"
+            ).fetchall()
+        }
+        task_columns = {
+            row[1]
+            for row in connection.execute("PRAGMA table_info(ai_tasks)").fetchall()
+        }
+        assert "identity_name" in provider_columns
+        assert "invocation_started_at" in task_columns
+        assert connection.execute("PRAGMA user_version").fetchone()[0] >= 11
 
 
 def test_ai_foreign_key_indexes_exist_without_redundant_version_index(tmp_path: Path):

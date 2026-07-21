@@ -110,6 +110,7 @@ class AiProviderConfig:
     id: str
     provider_kind: str
     display_name: str
+    identity_name: str
     enabled: bool
     privacy_mode: PrivacyMode
     endpoint: str
@@ -129,6 +130,7 @@ class AiTask:
     status: AiTaskStatus
     privacy_mode: PrivacyMode
     started_at: str | None
+    invocation_started_at: str | None
     completed_at: str | None
     error_summary: str
     created_at: str

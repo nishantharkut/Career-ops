@@ -33,7 +33,6 @@ from careerops.ai.providers.base import (
 from careerops.ai.verifier import BLOCKING_CODES, VerifierFinding, verify_task_output
 from careerops.core.models import (
     AiArtifact,
-    AiFinding,
     AiProviderConfig,
     AiTask,
 )
@@ -111,9 +110,13 @@ class AiOrchestrator:
             return self._repository.get_ai_task(task_id)
 
         artifacts: list[AiArtifact] = []
-        findings: list[AiFinding] = []
+        findings: list[dict[str, Any]] = []
         try:
             task = self._repository.get_ai_task(task_id)
+            if task.invocation_started_at is not None:
+                return self._fail_or_return_current(
+                    task_id, claim_token, "provider_error"
+                )
             config = self._repository.get_ai_provider_config(task.provider_config_id)
             provider = self._providers.get(task.provider_config_id)
             if (
@@ -132,6 +135,9 @@ class AiOrchestrator:
             if template.id != task.prompt_template_id:
                 raise RuntimeError("AI prompt template did not match the task")
             context = self._build_context(task.application_id, task.task_type.value)
+            expected_jd_snapshot_id, expected_resume_version_id = (
+                self._expected_selection(task, context)
+            )
             attempt_dir = self._new_attempt_directory(task.id)
             request = self._write_provider_request(
                 task,
@@ -151,6 +157,14 @@ class AiOrchestrator:
             )
 
             try:
+                # The fence intentionally consumes an attempt if the process dies
+                # before spawning the provider; the user must enqueue a new task.
+                if not self._repository.begin_ai_task_invocation(
+                    task.id, claim_token
+                ):
+                    return self._fail_or_return_current(
+                        task_id, claim_token, "provider_error"
+                    )
                 result = provider.run(request)
             except ProviderOutputError:
                 return self._block_invalid_output(
@@ -158,6 +172,8 @@ class AiOrchestrator:
                     claim_token,
                     config,
                     availability,
+                    expected_jd_snapshot_id,
+                    expected_resume_version_id,
                     artifacts,
                 )
 
@@ -196,42 +212,40 @@ class AiOrchestrator:
                     )
                 )
             for finding in verification.findings:
-                findings.append(
-                    self._save_verifier_finding(task, claim_token, finding)
-                )
+                findings.append(self._verifier_finding_spec(finding))
 
             target_status = "completed" if verification.safe else "blocked"
-            side_effect: dict[str, Any] = {}
+            success_payload: dict[str, Any] = {}
+            version_side_effect: dict[str, Any] = {}
             if verification.safe and verification.output is not None:
-                side_effect = self._apply_success_side_effect(
+                success_payload, version_side_effect = self._prepare_success_effect(
                     task,
                     claim_token,
                     config,
                     availability,
                     request.task_dir,
-                    context,
                     verification.output,
                     artifacts,
                     findings,
                 )
-            self._record_attempt_version(
+            return self._finalize_attempt(
                 task,
                 claim_token,
                 target_status,
                 config,
                 availability,
+                expected_jd_snapshot_id,
+                expected_resume_version_id,
                 artifacts,
                 findings,
-                side_effect,
+                success_payload,
+                version_side_effect,
+                "" if verification.safe else (
+                    "invalid_output"
+                    if verification.output is None
+                    else "verification_failed"
+                ),
             )
-            if verification.safe:
-                return self._repository.complete_ai_task(task.id, claim_token)
-            category = (
-                "invalid_output"
-                if verification.output is None
-                else "verification_failed"
-            )
-            return self._repository.block_ai_task(task.id, claim_token, category)
         except ProviderTimeoutError:
             return self._fail_or_return_current(task_id, claim_token, "provider_timeout")
         except ProviderUnavailableError:
@@ -259,6 +273,7 @@ class AiOrchestrator:
             and availability.model == config.model
             and availability.privacy_mode == config.privacy_mode
             and availability.endpoint == config.endpoint
+            and availability.identity_name == config.identity_name
             and (
                 expected_egress is None
                 or availability.data_leaves_machine is expected_egress
@@ -331,6 +346,31 @@ class AiOrchestrator:
             rejected_claims=rejected,
             writing_preferences=preferences,
         )
+
+    def _expected_selection(
+        self, task: AiTask, context: ContextPacket
+    ) -> tuple[str, str | None]:
+        application = self._repository.get_application(task.application_id)
+        context_data = context.to_dict()
+        context_jd = context_data.get("job_description")
+        if (
+            isinstance(context_jd, dict)
+            and context_jd.get("snapshot_id") != application.jd_snapshot_id
+        ):
+            raise ValueError("Selected job description changed during context build")
+        context_resume = context_data.get("selected_resume")
+        if (
+            isinstance(context_resume, dict)
+            and context_resume.get("version_id")
+            != application.selected_resume_version_id
+        ):
+            raise ValueError("Selected resume changed during context build")
+        expected_resume_id = (
+            application.selected_resume_version_id
+            if task.task_type.value in _RESUME_TASKS
+            else None
+        )
+        return application.jd_snapshot_id, expected_resume_id
 
     @staticmethod
     def _read_checked_utf8(path: Path, expected_sha256: str) -> str:
@@ -468,32 +508,28 @@ class AiOrchestrator:
             raise ValueError("AI provider raw output metadata did not match")
         return raw
 
-    def _save_verifier_finding(
-        self,
-        task: AiTask,
-        claim_token: str,
-        finding: VerifierFinding,
-    ) -> AiFinding:
+    @staticmethod
+    def _verifier_finding_spec(finding: VerifierFinding) -> dict[str, Any]:
         location = (
             f"output item {finding.item_index}"
             if finding.item_index is not None
             else "provider output"
         )
-        return self._repository.save_ai_finding(
-            task_id=task.id,
-            claim_token=claim_token,
-            finding_type=finding.code,
-            severity="blocking" if finding.code in BLOCKING_CODES else "warning",
-            claim_text=f"{finding.code} in {location}",
-            evidence_item_id=finding.evidence_item_id,
-            recommendation=finding.recommendation,
-            verifier_state=finding.verifier_state,
-            payload={
+        return {
+            "finding_type": finding.code,
+            "severity": (
+                "blocking" if finding.code in BLOCKING_CODES else "warning"
+            ),
+            "claim_text": f"{finding.code} in {location}",
+            "evidence_item_id": finding.evidence_item_id,
+            "recommendation": finding.recommendation,
+            "verifier_state": finding.verifier_state,
+            "payload": {
                 "claim_id": finding.claim_id,
                 "code": finding.code,
                 "item_index": finding.item_index,
             },
-        )
+        }
 
     def _block_invalid_output(
         self,
@@ -501,11 +537,11 @@ class AiOrchestrator:
         claim_token: str,
         config: AiProviderConfig,
         availability: ProviderAvailability,
+        expected_jd_snapshot_id: str,
+        expected_resume_version_id: str | None,
         artifacts: list[AiArtifact],
     ) -> AiTask:
-        finding = self._save_verifier_finding(
-            task,
-            claim_token,
+        finding = self._verifier_finding_spec(
             VerifierFinding(
                 code="schema_invalid",
                 recommendation=(
@@ -513,31 +549,36 @@ class AiOrchestrator:
                 ),
             ),
         )
-        self._record_attempt_version(
+        return self._finalize_attempt(
             task,
             claim_token,
             "blocked",
             config,
             availability,
+            expected_jd_snapshot_id,
+            expected_resume_version_id,
             artifacts,
             [finding],
             {},
-        )
-        return self._repository.block_ai_task(
-            task.id, claim_token, "invalid_output"
+            {},
+            "invalid_output",
         )
 
-    def _record_attempt_version(
+    def _finalize_attempt(
         self,
         task: AiTask,
         claim_token: str,
         status: str,
         config: AiProviderConfig,
         availability: ProviderAvailability,
+        expected_jd_snapshot_id: str,
+        expected_resume_version_id: str | None,
         artifacts: Sequence[AiArtifact],
-        findings: Sequence[AiFinding],
-        side_effect: Mapping[str, Any],
-    ) -> None:
+        findings: Sequence[Mapping[str, Any]],
+        success_payload: Mapping[str, Any],
+        version_side_effect: Mapping[str, Any],
+        error_summary: str,
+    ) -> AiTask:
         artifact_values = [
             {
                 "artifact_type": item.artifact_type,
@@ -546,27 +587,18 @@ class AiOrchestrator:
             }
             for item in artifacts
         ]
-        snapshot = {
-            "ai_task": {
-                "id": task.id,
-                "input_artifact_ids": task.input_artifact_ids,
-                "provider_config_id": task.provider_config_id,
-                "status": status,
-                "task_type": task.task_type.value,
-            },
-            "artifacts": artifact_values,
-            "finding_ids": [item.id for item in findings],
-            "provenance": self._provenance(
-                task, config, availability, artifacts
-            ),
-            "side_effect": dict(side_effect),
-        }
-        self._repository.record_application_version(
-            task.application_id,
-            f"ai_task.{status}",
-            snapshot,
-            ai_task_id=task.id,
+        return self._repository.finalize_ai_task_attempt(
+            task_id=task.id,
             claim_token=claim_token,
+            terminal_status=status,
+            error_summary=error_summary,
+            expected_jd_snapshot_id=expected_jd_snapshot_id,
+            expected_resume_version_id=expected_resume_version_id,
+            artifacts=artifact_values,
+            provenance=self._provenance(task, config, availability, artifacts),
+            findings=findings,
+            success_payload=success_payload,
+            version_side_effect=version_side_effect,
         )
 
     def _provenance(
@@ -590,37 +622,22 @@ class AiOrchestrator:
             "prompt_sha256": template.sha256,
             "prompt_template_id": template.id,
             "provider_kind": availability.provider_kind,
+            "provider_identity_name": availability.identity_name,
             "provider_model": availability.model,
         }
 
-    def _apply_success_side_effect(
+    def _prepare_success_effect(
         self,
         task: AiTask,
         claim_token: str,
         config: AiProviderConfig,
         availability: ProviderAvailability,
         attempt_dir: Path,
-        context: ContextPacket,
         output: TaskOutput,
         artifacts: list[AiArtifact],
-        findings: list[AiFinding],
-    ) -> dict[str, Any]:
+        findings: list[dict[str, Any]],
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
         provenance = self._provenance(task, config, availability, artifacts)
-        application = self._repository.get_application(task.application_id)
-        context_data = context.to_dict()
-        context_jd = context_data.get("job_description")
-        if (
-            isinstance(context_jd, dict)
-            and application.jd_snapshot_id != context_jd.get("snapshot_id")
-        ):
-            raise ValueError("Selected job description changed during AI task")
-        context_resume = context_data.get("selected_resume")
-        if (
-            isinstance(context_resume, dict)
-            and application.selected_resume_version_id
-            != context_resume.get("version_id")
-        ):
-            raise ValueError("Selected resume changed during AI task")
         if isinstance(output, AnalyzeJdOutput):
             raw_ai = {
                 "normalized_company": output.normalized_company,
@@ -632,63 +649,55 @@ class AiOrchestrator:
                 "responsibilities": list(output.responsibilities),
                 "keywords": list(output.keywords),
             }
-            self._repository.update_jd_requirements_from_ai(
-                snapshot_id=application.jd_snapshot_id,
-                task_id=task.id,
-                claim_token=claim_token,
-                raw_ai=raw_ai,
-                uncertainty={
-                    "items": list(output.uncertainties),
-                    "provenance": provenance,
+            return (
+                {
+                    "raw_ai": raw_ai,
+                    "uncertainty": {
+                        "items": list(output.uncertainties),
+                        "provenance": provenance,
+                    },
                 },
+                {},
             )
-            return {"jd_snapshot_id": application.jd_snapshot_id}
 
         if isinstance(output, AnalyzeFitOutput):
-            if application.selected_resume_version_id is None:
-                raise ValueError("A selected resume is required for this AI task")
-            report = self._repository.save_report(
-                application_id=application.id,
-                resume_version_id=application.selected_resume_version_id,
-                jd_snapshot_id=application.jd_snapshot_id,
-                fit={
-                    "gaps": list(output.gaps),
-                    "matches": list(output.matches),
-                    "provenance": provenance,
-                    "recommendations": list(output.recommendations),
-                    "score": output.score,
+            return (
+                {
+                    "fit": {
+                        "gaps": list(output.gaps),
+                        "matches": list(output.matches),
+                        "provenance": provenance,
+                        "recommendations": list(output.recommendations),
+                        "score": output.score,
+                    },
+                    "risks": {
+                        "blockers": [],
+                        "provenance": provenance,
+                        "warnings": list(output.risks),
+                    },
                 },
-                risks={
-                    "blockers": [],
-                    "provenance": provenance,
-                    "warnings": list(output.risks),
-                },
-                ai_task_id=task.id,
-                claim_token=claim_token,
+                {},
             )
-            return {"report_id": report.id}
 
         if isinstance(output, ResumeEditsOutput):
             for index, suggestion in enumerate(output.suggestions):
                 findings.append(
-                    self._repository.save_ai_finding(
-                        task_id=task.id,
-                        claim_token=claim_token,
-                        finding_type="resume_edit_suggestion",
-                        severity="info",
-                        claim_text=suggestion.replacement_text,
-                        evidence_item_id=None,
-                        recommendation=suggestion.reason,
-                        verifier_state="verified",
-                        payload={
+                    {
+                        "finding_type": "resume_edit_suggestion",
+                        "severity": "info",
+                        "claim_text": suggestion.replacement_text,
+                        "evidence_item_id": None,
+                        "recommendation": suggestion.reason,
+                        "verifier_state": "verified",
+                        "payload": {
                             "evidence_refs": list(suggestion.evidence_refs),
                             "item_index": index,
                             "replacement_text": suggestion.replacement_text,
                             "source_text": suggestion.source_text,
                         },
-                    )
+                    }
                 )
-            return {"suggestion_finding_ids": [item.id for item in findings]}
+            return {}, {}
 
         if isinstance(output, CoverLetterOutput):
             draft_bytes = output.plain_text.encode("utf-8")
@@ -703,7 +712,7 @@ class AiOrchestrator:
                 "1",
             )
             artifacts.append(draft)
-            return {
+            return {}, {
                 "draft_text_artifact_id": draft.id,
                 "draft_text_sha256": draft.sha256,
             }
@@ -715,28 +724,25 @@ class AiOrchestrator:
                 "needs_review": ("warning", "needs_evidence"),
                 "private": ("blocking", "blocked"),
             }
-            decision_ids: list[str] = []
             for decision in output.decisions:
                 severity, verifier_state = states[decision.decision]
-                finding = self._repository.save_ai_finding(
-                    task_id=task.id,
-                    claim_token=claim_token,
-                    finding_type="claim_review_decision",
-                    severity=severity,
-                    claim_text=f"{decision.claim_id}: {decision.decision}",
-                    evidence_item_id=None,
-                    recommendation=decision.reason,
-                    verifier_state=verifier_state,
-                    payload={
-                        "claim_id": decision.claim_id,
-                        "decision": decision.decision,
-                        "evidence_refs": list(decision.evidence_refs),
-                        "reason": decision.reason,
-                    },
+                findings.append(
+                    {
+                        "finding_type": "claim_review_decision",
+                        "severity": severity,
+                        "claim_text": f"{decision.claim_id}: {decision.decision}",
+                        "evidence_item_id": None,
+                        "recommendation": decision.reason,
+                        "verifier_state": verifier_state,
+                        "payload": {
+                            "claim_id": decision.claim_id,
+                            "decision": decision.decision,
+                            "evidence_refs": list(decision.evidence_refs),
+                            "reason": decision.reason,
+                        },
+                    }
                 )
-                findings.append(finding)
-                decision_ids.append(finding.id)
-            return {"decision_finding_ids": decision_ids}
+            return {}, {}
 
         raise ValueError("AI task output did not match its task type")
 

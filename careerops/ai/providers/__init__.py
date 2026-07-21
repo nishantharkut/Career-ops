@@ -6,7 +6,11 @@ from careerops.ai.providers.base import (
     ProviderTimeoutError,
     ProviderUnavailableError,
 )
-from careerops.ai.providers.codex import CodexProvider, discover_codex_providers
+from careerops.ai.providers.codex import (
+    CodexProvider,
+    codex_identity_endpoint,
+    discover_codex_providers,
+)
 from careerops.ai.providers.deterministic import DeterministicProvider
 from careerops.ai.providers.mock import MockProvider
 from careerops.ai.providers.ollama import (
@@ -30,5 +34,6 @@ __all__ = [
     "ProviderTimeoutError",
     "ProviderUnavailableError",
     "canonicalize_ollama_endpoint",
+    "codex_identity_endpoint",
     "discover_codex_providers",
 ]

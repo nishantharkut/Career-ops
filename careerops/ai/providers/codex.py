@@ -62,6 +62,13 @@ _SAFE_ENVIRONMENT_KEYS = (
     "LC_ALL",
 )
 _WRAPPER_HOME = "%USERPROFILE%\\codex-account2\\.codex"
+_CODEX_IDENTITIES = frozenset({"codex2", "codex"})
+
+
+def codex_identity_endpoint(identity_name: str) -> str:
+    if identity_name not in _CODEX_IDENTITIES:
+        raise ValueError("Unsupported Codex identity name")
+    return f"codex-identity://{identity_name}"
 
 
 @dataclass(frozen=True)
@@ -674,6 +681,7 @@ class CodexProvider:
             data_leaves_machine=True,
             is_ai=True,
             detail=detail,
+            endpoint=(codex_identity_endpoint(identity.name) if identity else ""),
             identity_name=identity.name if identity else "",
             executable=str(identity.native_executable) if identity else "",
             executable_sha256=digest,
@@ -769,6 +777,7 @@ class CodexProvider:
                 raw_output=raw_output,
                 invocation=InvocationMetadata(
                     mode="codex_exec",
+                    endpoint=codex_identity_endpoint(identity.name),
                     identity_name=identity.name,
                     executable=str(identity.native_executable),
                     executable_sha256=post_digest,

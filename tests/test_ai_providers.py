@@ -1843,6 +1843,7 @@ def test_provider_result_privacy_enum_persists_to_provider_and_task(
         display_name=result.provider_kind,
         privacy_mode=result.privacy_mode,
         endpoint=result.invocation.endpoint,
+        identity_name=result.invocation.identity_name,
         model=result.model,
         enabled=True,
     )
@@ -2004,6 +2005,11 @@ def test_hardened_codex_discovers_safe_interchangeable_identities(tmp_path: Path
     assert providers[0].codex_home == fixture["account2_home"].resolve()
     assert providers[1].codex_home == fixture["default_home"].resolve()
     assert all(Path(item.native_executable).suffix.casefold() == ".exe" for item in providers)
+    availability = [item.availability() for item in providers]
+    assert [item.endpoint for item in availability] == [
+        "codex-identity://codex2",
+        "codex-identity://codex",
+    ]
 
 
 def test_codex_single_command_override_takes_precedence(tmp_path: Path):
@@ -2291,6 +2297,7 @@ def test_hardened_codex_invokes_native_exe_with_pinned_isolated_command(
     assert result.privacy_mode is PrivacyMode.CLOUD_EXTERNAL
     assert result.model == "gpt-5.6-sol"
     assert result.invocation.identity_name == "codex2"
+    assert result.invocation.endpoint == "codex-identity://codex2"
     assert result.invocation.executable == str(fixture["native"].resolve())
     assert result.invocation.executable_sha256 == hashlib.sha256(
         fixture["native"].read_bytes()
@@ -2382,6 +2389,7 @@ def test_hardened_codex_supports_explicit_native_exe_override(tmp_path: Path):
     result = provider.run(make_request(tmp_path / "request"))
 
     assert result.invocation.identity_name == "codex"
+    assert result.invocation.endpoint == "codex-identity://codex"
     assert all(call["command"][0] == str(fixture["native"].resolve()) for call in runner.calls)
 
 
@@ -2605,7 +2613,8 @@ def test_hardened_codex_result_privacy_persists_to_repository(tmp_path: Path):
         provider_kind=result.provider_kind,
         display_name=result.invocation.identity_name,
         privacy_mode=result.privacy_mode,
-        endpoint=result.invocation.executable,
+        endpoint=result.invocation.endpoint,
+        identity_name=result.invocation.identity_name,
         model=result.model,
         enabled=True,
     )

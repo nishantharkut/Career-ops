@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 import hashlib
@@ -65,6 +65,7 @@ PROVIDER_ERROR_CATEGORIES = frozenset(
     }
 )
 SHA256_PATTERN = re.compile(r"[0-9a-fA-F]{64}\Z")
+CODEX_IDENTITIES = frozenset({"codex2", "codex"})
 MAX_PERSISTED_JSON_BYTES = 256_000
 UTC_NOW_LOCK = Lock()
 LAST_UTC_NOW: datetime | None = None
@@ -173,21 +174,31 @@ class CareerOpsRepository:
         display_name: str,
         privacy_mode: str,
         endpoint: str,
+        identity_name: str = "",
         model: str,
         enabled: bool,
     ) -> AiProviderConfig:
         privacy_mode = finite_value(PrivacyMode, privacy_mode, "privacy mode")
+        if provider_kind == "codex":
+            if identity_name not in CODEX_IDENTITIES:
+                raise ValueError("Codex identity name must be codex2 or codex")
+            expected_endpoint = f"codex-identity://{identity_name}"
+            if endpoint != expected_endpoint:
+                raise ValueError("Codex endpoint does not match its identity name")
+        elif identity_name:
+            raise ValueError("Identity names are only supported for Codex providers")
         provider_id = new_id("aip")
         now = utc_now()
         with self.connection() as connection:
             connection.execute(
                 """
                 INSERT INTO ai_provider_configs (
-                    id, provider_kind, display_name, enabled, privacy_mode, endpoint,
-                    model, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    id, provider_kind, display_name, identity_name, enabled,
+                    privacy_mode, endpoint, model, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(provider_kind, endpoint, model) DO UPDATE SET
                     display_name = excluded.display_name,
+                    identity_name = excluded.identity_name,
                     enabled = excluded.enabled,
                     privacy_mode = excluded.privacy_mode,
                     updated_at = excluded.updated_at
@@ -196,6 +207,7 @@ class CareerOpsRepository:
                     provider_id,
                     provider_kind,
                     display_name,
+                    identity_name,
                     int(enabled),
                     privacy_mode,
                     endpoint,
@@ -385,6 +397,31 @@ class CareerOpsRepository:
             raise ValueError("AI task is not pending")
         return claim_token
 
+    def begin_ai_task_invocation(self, task_id: str, claim_token: str) -> bool:
+        now = utc_now()
+        with self.connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            cursor = connection.execute(
+                """
+                UPDATE ai_tasks
+                SET invocation_started_at = ?, updated_at = ?
+                WHERE id = ? AND status = 'running' AND claim_token = ?
+                  AND invocation_started_at IS NULL
+                """,
+                (now, now, task_id, claim_token),
+            )
+            if cursor.rowcount == 1:
+                self._write_audit(
+                    connection,
+                    "ai_task.invocation_started",
+                    "ai_task",
+                    task_id,
+                    {"invocation_started_at": None},
+                    {"invocation_started_at": now},
+                )
+                return True
+        return False
+
     def complete_ai_task(self, task_id: str, claim_token: str) -> AiTask:
         before = self.get_ai_task(task_id)
         now = utc_now()
@@ -462,6 +499,341 @@ class CareerOpsRepository:
                 before.__dict__,
                 {
                     "status": "blocked",
+                    "completed_at": now,
+                    "error_summary": safe_error,
+                },
+            )
+        return self.get_ai_task(task_id)
+
+    def finalize_ai_task_attempt(
+        self,
+        *,
+        task_id: str,
+        claim_token: str,
+        terminal_status: str,
+        error_summary: str,
+        expected_jd_snapshot_id: str,
+        expected_resume_version_id: str | None,
+        artifacts: Sequence[Mapping[str, Any]],
+        provenance: Mapping[str, Any],
+        findings: Sequence[Mapping[str, Any]],
+        success_payload: Mapping[str, Any] | None = None,
+        version_side_effect: Mapping[str, Any] | None = None,
+    ) -> AiTask:
+        if terminal_status not in {
+            AiTaskStatus.COMPLETED.value,
+            AiTaskStatus.BLOCKED.value,
+        }:
+            raise ValueError("AI task final status must be completed or blocked")
+        safe_error = (
+            ""
+            if terminal_status == AiTaskStatus.COMPLETED.value
+            else provider_error_category(error_summary)
+        )
+        safe_artifacts, _ = persisted_json(list(artifacts))
+        safe_provenance, _ = persisted_json(dict(provenance))
+        safe_success, _ = persisted_json(dict(success_payload or {}))
+        safe_version_side_effect, _ = persisted_json(dict(version_side_effect or {}))
+        now = utc_now()
+
+        with self.connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            task = connection.execute(
+                "SELECT * FROM ai_tasks WHERE id = ?", (task_id,)
+            ).fetchone()
+            if (
+                task is None
+                or task["status"] != AiTaskStatus.RUNNING.value
+                or task["claim_token"] != claim_token
+            ):
+                raise ValueError("AI task claim is not active")
+            application = connection.execute(
+                "SELECT * FROM applications WHERE id = ?",
+                (task["application_id"],),
+            ).fetchone()
+            if application is None:
+                raise KeyError("No application with that ID")
+            if application["jd_snapshot_id"] != expected_jd_snapshot_id:
+                raise ValueError("Selected job description changed during AI task")
+            if (
+                expected_resume_version_id is not None
+                and application["selected_resume_version_id"]
+                != expected_resume_version_id
+            ):
+                raise ValueError("Selected resume changed during AI task")
+
+            finding_ids: list[str] = []
+            finding_types: dict[str, list[str]] = {}
+            for finding in findings:
+                severity = finite_value(
+                    FindingSeverity, str(finding["severity"]), "severity"
+                )
+                verifier_state = finite_value(
+                    VerifierState,
+                    str(finding["verifier_state"]),
+                    "verifier state",
+                )
+                decision = finite_value(
+                    FindingDecision,
+                    str(finding.get("decision", FindingDecision.PENDING.value)),
+                    "decision",
+                )
+                if decision != FindingDecision.PENDING.value:
+                    raise ValueError("AI findings must start with a pending decision")
+                _safe_payload, payload_json = persisted_json(
+                    dict(finding.get("payload", {}))
+                )
+                finding_id = new_id("aif")
+                finding_type = str(finding["finding_type"])
+                connection.execute(
+                    """
+                    INSERT INTO ai_findings (
+                        id, task_id, claim_token, finding_type, severity, claim_text,
+                        evidence_item_id, recommendation, verifier_state, decision,
+                        payload_json, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        finding_id,
+                        task_id,
+                        claim_token,
+                        finding_type,
+                        severity,
+                        str(redact(str(finding["claim_text"]))),
+                        finding.get("evidence_item_id"),
+                        str(redact(str(finding["recommendation"]))),
+                        verifier_state,
+                        decision,
+                        payload_json,
+                        now,
+                        now,
+                    ),
+                )
+                finding_ids.append(finding_id)
+                finding_types.setdefault(finding_type, []).append(finding_id)
+
+            side_effect = dict(safe_version_side_effect)
+            if terminal_status == AiTaskStatus.COMPLETED.value:
+                if task["task_type"] == AiTaskType.ANALYZE_JD.value:
+                    snapshot = connection.execute(
+                        "SELECT * FROM jd_snapshots WHERE id = ?",
+                        (expected_jd_snapshot_id,),
+                    ).fetchone()
+                    if (
+                        snapshot is None
+                        or snapshot["application_id"] != application["id"]
+                    ):
+                        raise ValueError("AI task cannot update this JD snapshot")
+                    existing = json.loads(snapshot["extracted_requirements_json"])
+                    grouped = any(
+                        key in existing
+                        for key in (
+                            "raw_ai",
+                            "deterministic",
+                            "user_corrected",
+                            "uncertainty",
+                        )
+                    )
+                    updated = {
+                        "raw_ai": safe_success["raw_ai"],
+                        "deterministic": (
+                            existing.get("deterministic", {}) if grouped else existing
+                        ),
+                        "user_corrected": existing.get("user_corrected", {}),
+                        "uncertainty": safe_success["uncertainty"],
+                    }
+                    _safe_updated, serialized = persisted_json(updated)
+                    connection.execute(
+                        """
+                        UPDATE jd_snapshots
+                        SET extracted_requirements_json = ?
+                        WHERE id = ?
+                        """,
+                        (serialized, expected_jd_snapshot_id),
+                    )
+                    self._write_audit(
+                        connection,
+                        "jd_snapshot.ai_requirements_updated",
+                        "jd_snapshot",
+                        expected_jd_snapshot_id,
+                        {
+                            "requirements_sha256": sha256_text(
+                                snapshot["extracted_requirements_json"]
+                            )
+                        },
+                        {
+                            "ai_task_id": task_id,
+                            "requirements_sha256": sha256_text(serialized),
+                            "updated_at": now,
+                        },
+                    )
+                    side_effect = {"jd_snapshot_id": expected_jd_snapshot_id}
+                elif task["task_type"] == AiTaskType.ANALYZE_FIT.value:
+                    if expected_resume_version_id is None:
+                        raise ValueError("A selected resume is required for this AI task")
+                    if (
+                        application["approval_id"] is not None
+                        or application["submission_state"]
+                        != SubmissionState.NOT_SUBMITTED.value
+                        or application["submitted_at"] is not None
+                    ):
+                        raise ValueError(
+                            "AI task cannot replace approved or submitted application state"
+                        )
+                    fit, fit_json = persisted_json(dict(safe_success["fit"]))
+                    risks, risks_json = persisted_json(dict(safe_success["risks"]))
+                    blockers = risks.get("blockers", [])
+                    warnings = risks.get("warnings", [])
+                    if not isinstance(blockers, list) or not isinstance(warnings, list):
+                        raise ValueError("AI report risk groups must be lists")
+                    report_id = new_id("rep")
+                    application_status = (
+                        ApplicationStatus.READY_FOR_REVIEW
+                        if not blockers
+                        else ApplicationStatus.NEEDS_EVIDENCE
+                    )
+                    connection.execute(
+                        """
+                        INSERT INTO reports (
+                            id, application_id, resume_version_id, jd_snapshot_id,
+                            fit_json, risks_json, blocking_issue_count, warning_count,
+                            created_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            report_id,
+                            application["id"],
+                            expected_resume_version_id,
+                            expected_jd_snapshot_id,
+                            fit_json,
+                            risks_json,
+                            len(blockers),
+                            len(warnings),
+                            now,
+                        ),
+                    )
+                    connection.execute(
+                        """
+                        UPDATE applications
+                        SET latest_report_id = ?, status = ?, updated_at = ?
+                        WHERE id = ?
+                        """,
+                        (
+                            report_id,
+                            application_status.value,
+                            now,
+                            application["id"],
+                        ),
+                    )
+                    self._write_audit(
+                        connection,
+                        "report.created",
+                        "report",
+                        report_id,
+                        None,
+                        {
+                            "application_id": application["id"],
+                            "blocking_issue_count": len(blockers),
+                            "warning_count": len(warnings),
+                        },
+                    )
+                    side_effect = {"report_id": report_id}
+                elif task["task_type"] == AiTaskType.SUGGEST_RESUME_EDITS.value:
+                    side_effect = {
+                        "suggestion_finding_ids": finding_types.get(
+                            "resume_edit_suggestion", []
+                        )
+                    }
+                elif task["task_type"] == AiTaskType.REVIEW_CLAIMS.value:
+                    side_effect = {
+                        "decision_finding_ids": finding_types.get(
+                            "claim_review_decision", []
+                        )
+                    }
+
+            snapshot = {
+                "ai_task": {
+                    "id": task_id,
+                    "input_artifact_ids": self._ai_task_input_artifact_ids(
+                        connection, task_id
+                    ),
+                    "provider_config_id": task["provider_config_id"],
+                    "status": terminal_status,
+                    "task_type": task["task_type"],
+                },
+                "artifacts": safe_artifacts,
+                "finding_ids": finding_ids,
+                "provenance": safe_provenance,
+                "side_effect": side_effect,
+            }
+            safe_snapshot, snapshot_json = persisted_json(snapshot)
+            version_id = new_id("appv")
+            version_number = connection.execute(
+                """
+                SELECT COALESCE(MAX(version_number), 0) + 1
+                FROM application_versions
+                WHERE application_id = ?
+                """,
+                (application["id"],),
+            ).fetchone()[0]
+            connection.execute(
+                """
+                INSERT INTO application_versions (
+                    id, application_id, version_number, event_type,
+                    snapshot_json, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    version_id,
+                    application["id"],
+                    version_number,
+                    f"ai_task.{terminal_status}",
+                    snapshot_json,
+                    now,
+                ),
+            )
+            self._write_audit(
+                connection,
+                "application.version_recorded",
+                "application",
+                application["id"],
+                None,
+                {
+                    "application_version_id": version_id,
+                    "version_number": version_number,
+                    "event_type": f"ai_task.{terminal_status}",
+                    "snapshot": safe_snapshot,
+                },
+            )
+            cursor = connection.execute(
+                """
+                UPDATE ai_tasks
+                SET status = ?, completed_at = ?, error_summary = ?,
+                    claim_token = NULL, updated_at = ?
+                WHERE id = ? AND status = 'running' AND claim_token = ?
+                """,
+                (
+                    terminal_status,
+                    now,
+                    safe_error,
+                    now,
+                    task_id,
+                    claim_token,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise ValueError("AI task claim is not active")
+            self._write_audit(
+                connection,
+                f"ai_task.{terminal_status}",
+                "ai_task",
+                task_id,
+                {
+                    "status": task["status"],
+                    "started_at": task["started_at"],
+                },
+                {
+                    "status": terminal_status,
                     "completed_at": now,
                     "error_summary": safe_error,
                 },
@@ -1570,6 +1942,7 @@ class CareerOpsRepository:
             id=row["id"],
             provider_kind=row["provider_kind"],
             display_name=row["display_name"],
+            identity_name=row["identity_name"],
             enabled=bool(row["enabled"]),
             privacy_mode=PrivacyMode(row["privacy_mode"]),
             endpoint=row["endpoint"],
@@ -1593,6 +1966,7 @@ class CareerOpsRepository:
             status=AiTaskStatus(row["status"]),
             privacy_mode=PrivacyMode(row["privacy_mode"]),
             started_at=row["started_at"],
+            invocation_started_at=row["invocation_started_at"],
             completed_at=row["completed_at"],
             error_summary=row["error_summary"],
             created_at=row["created_at"],
