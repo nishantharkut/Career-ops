@@ -93,16 +93,23 @@ _INJECTION_PATTERN = re.compile(
     r"\b(?:output|return|respond\s+with)\b.{0,80}\binstead\b)"
 )
 _SOURCE_DIRECTIVE_PATTERN = re.compile(
-    r"(?i)\b(?:do\s+not|don't|never)\s+"
+    r"(?i)(?:^|[.!?]\s+)(?:do\s+not|don't|never|please|always)\s+"
     r"(?:claim|include|list|output|report|return|say|state)\b"
 )
 _INSTRUCTION_PATTERNS = (_INJECTION_PATTERN, _SOURCE_DIRECTIVE_PATTERN)
 _NEGATION_PATTERN = re.compile(
     r"(?i)\b(?:cannot|can't|did\s+not|didn't|do\s+not|don't|does\s+not|"
-    r"doesn't|lacks?|lacking|never|no|not|without)\b"
+    r"doesn't|is\s+not|isn't|lacks?|lacking|never|no|not|unfamiliar|without)\b"
 )
 _OPTIONAL_MODALITY_PATTERN = re.compile(
-    r"(?i)\b(?:may|might|nice\s+to\s+have|optional|preferred)\b"
+    r"(?i)\b(?:may|might|nice\s+to\s+have|optional|preferred|"
+    r"(?:would\s+be|is)\s+a\s+plus|a\s+plus|bonus)\b"
+)
+_REQUIRED_MODALITY_PATTERN = re.compile(
+    r"(?i)\b(?:mandatory|must|required|requirement)\b"
+)
+_SOURCE_CLAUSE_SPLIT_PATTERN = re.compile(
+    r"(?i)\s*(?:[,;]|\bbut\b|\bhowever\b)\s*"
 )
 _NON_FACTUAL_SENTENCE_PATTERNS = (
     re.compile(r"(?i)^dear [a-z][a-z .'-]*,?$"),
@@ -790,13 +797,20 @@ def _trusted_source_segments(
             return None
         rejected_any = False
         for sentence in sentences:
-            normalized = _normalized_text(sentence)
-            if _contains_injection(sentence):
-                rejected_any = True
-            elif not _NEGATION_PATTERN.search(normalized) and not (
-                exclude_optional and _OPTIONAL_MODALITY_PATTERN.search(normalized)
-            ):
-                trusted.append(sentence)
+            clauses = tuple(
+                clause
+                for clause in _SOURCE_CLAUSE_SPLIT_PATTERN.split(sentence)
+                if clause.strip()
+            ) or (sentence,)
+            for clause in clauses:
+                normalized = _normalized_text(clause)
+                if _contains_injection(clause):
+                    rejected_any = True
+                elif not _NEGATION_PATTERN.search(normalized) and not (
+                    exclude_optional
+                    and _OPTIONAL_MODALITY_PATTERN.search(normalized)
+                ):
+                    trusted.append(clause)
         if _contains_injection(source) and not rejected_any:
             return ()
     return tuple(trusted)
@@ -844,6 +858,8 @@ def _analysis_statement_supported(
 def _resume_reason_supported(
     reason: str,
     sources: Sequence[str],
+    *,
+    job_sources: Sequence[str],
 ) -> tuple[bool | None, bool]:
     normalized = _normalized_text(reason).strip(" .!?")
     metric_supported = _metric_supported_by_sources(reason, sources)
@@ -851,7 +867,11 @@ def _resume_reason_supported(
         return False, metric_supported
     if any(pattern.fullmatch(normalized) for pattern in _RESUME_GENERIC_REASON_PATTERNS):
         return True, metric_supported
-    grounding = _trusted_source_lexemes(sources)
+    requires_job_authority = _REQUIRED_MODALITY_PATTERN.search(normalized) is not None
+    grounding = _trusted_source_lexemes(
+        job_sources if requires_job_authority else sources,
+        exclude_optional=requires_job_authority,
+    )
     if grounding is None:
         return None, metric_supported
     return _analysis_statement_supported(reason, grounding), metric_supported
@@ -1046,6 +1066,11 @@ def _has_injection_echo(
     return any(fragment in variant for fragment in fragments for variant in generated)
 
 
+def _has_source_injection(source_values: Sequence[Any]) -> bool | None:
+    fragments = _injection_fragments(source_values)
+    return None if fragments is None else bool(fragments)
+
+
 def _context_source_values(context: Mapping[str, Any]) -> tuple[Any, ...]:
     values: list[Any] = []
     for field in _UNTRUSTED_CONTEXT_FIELDS:
@@ -1063,7 +1088,7 @@ def _context_auxiliary(
     verification: Mapping[str, Any],
 ) -> tuple[Sequence[Any], Sequence[Any], tuple[str, ...]]:
     evidence_values = verification.get("linked_evidence", ())
-    rejected_values = list(context.get("rejected_claims", ()))
+    rejected_values = list(verification.get("rejected_claims", ()))
     private_values: list[str] = []
     facts = verification.get("confirmed_profile_facts", ())
     if isinstance(facts, Sequence) and not isinstance(facts, (str, bytes, bytearray)):
@@ -1127,6 +1152,11 @@ def _blocked_material(
 ) -> tuple[bool, bool]:
     rejected_echo = any(
         _material_overlap(text, claim, lexeme_cache) for claim in rejected
+    )
+    rejected_echo = rejected_echo or any(
+        item.verification_state == "rejected"
+        and _material_overlap(text, item.summary, lexeme_cache)
+        for item in evidence
     )
     private_echo = any(
         _material_overlap(text, claim, lexeme_cache) for claim in private_claims
@@ -1192,7 +1222,8 @@ def _distinctive_material_sequences(
         return None
     sequences: list[tuple[str, ...]] = []
     run: list[str] = []
-    for index, token in enumerate(surface):
+    folded_surface = tuple(token.casefold() for token in surface)
+    for token in surface:
         folded = token.casefold()
         has_upper = any(character.isupper() for character in token)
         has_lower = any(character.islower() for character in token)
@@ -1204,8 +1235,6 @@ def _distinctive_material_sequences(
         else:
             if len(run) >= 2:
                 sequences.append(tuple(run))
-            elif len(run) == 1 and index > 1:
-                sequences.append(tuple(run))
             run = []
         if (mixed_case or all_caps) and folded not in _GENERIC_ENTITY_LEXEMES:
             sequences.append(
@@ -1213,8 +1242,28 @@ def _distinctive_material_sequences(
             )
     if len(run) >= 2:
         sequences.append(tuple(run))
-    elif len(run) == 1 and len(surface) > 1:
-        sequences.append(tuple(run))
+    for index, folded in enumerate(folded_surface[:-1]):
+        if folded not in {"at", "client", "company", "customer", "employer", "for"}:
+            continue
+        candidate_index = index + 1
+        if folded == "for" and folded_surface[candidate_index] in {
+            "client",
+            "company",
+            "customer",
+            "employer",
+        }:
+            candidate_index += 1
+        if candidate_index >= len(folded_surface):
+            continue
+        candidate = folded_surface[candidate_index]
+        if (
+            len(candidate) >= 3
+            and candidate not in _GENERIC_ENTITY_LEXEMES
+            and candidate not in _LOW_SIGNAL_LEXEMES
+        ):
+            sequences.append(
+                (_RESTRICTED_LEXEME_EQUIVALENTS.get(candidate, candidate),)
+            )
     result = tuple(dict.fromkeys(sequences))
     if cache is not None:
         cache[cache_key] = result
@@ -1333,13 +1382,19 @@ def _verify_analysis(
     all_grounding = job_grounding + candidate_grounding
 
     findings: list[VerifierFinding] = []
-    source_injections = _injection_fragments(_context_source_values(context_data))
+    provider_source_values = _context_source_values(context_data)
+    local_authority_values = (
+        rejected_values,
+        context_private,
+        tuple(item.summary for item in records),
+    )
+    source_injections = _injection_fragments(provider_source_values)
     if source_injections is None:
         return _result(task_type, None, [_finding("schema_invalid")])
     if source_injections:
         findings.append(_finding("unsupported_claim"))
     injection_echo = _has_injection_echo(
-        output, _context_source_values(context_data)
+        output, provider_source_values + local_authority_values
     )
     if injection_echo is None:
         return _result(task_type, None, [_finding("schema_invalid")])
@@ -1496,7 +1551,8 @@ def verify_resume_edits(
             if selected_resume is not None
             else None
         )
-        injection_sources = _context_source_values(context_data)
+        source_instruction_sources = _context_source_values(context_data)
+        injection_sources = source_instruction_sources
         job = _mapping(context_data.get("job_description"))
         if job is None or type(job.get("text")) is not str:
             return _result(task_type, None, [_finding("schema_invalid")])
@@ -1512,6 +1568,7 @@ def verify_resume_edits(
             return _result(task_type, None, [_finding("schema_invalid")])
         context_private = ()
         injection_sources = ()
+        source_instruction_sources = ()
         reason_context_sources = ()
 
     records = _evidence_records(evidence_values)
@@ -1530,8 +1587,20 @@ def verify_resume_edits(
             rejected_values,
             normalized_private,
         )
+        source_instruction_sources = injection_sources
+    else:
+        injection_sources = injection_sources + (
+            tuple(item.summary for item in records),
+            rejected_values,
+            context_private,
+        )
 
     findings: list[VerifierFinding] = []
+    source_has_injection = _has_source_injection(source_instruction_sources)
+    if source_has_injection is None:
+        return _result(task_type, None, [_finding("schema_invalid")])
+    if source_has_injection:
+        findings.append(_finding("unsupported_claim"))
     material_cache: MaterialCache = {}
     ambiguous_spans: set[int] = set()
     intervals: list[tuple[int, int, int]] = []
@@ -1595,10 +1664,9 @@ def verify_resume_edits(
             suggestion.reason,
             reason_context_sources
             + (
-                suggestion.source_text,
-                suggestion.replacement_text,
                 *(item.summary for item in resolved),
             ),
+            job_sources=reason_context_sources,
         )
         if reason_supported is None:
             return _result(task_type, None, [_finding("schema_invalid")])
@@ -1666,9 +1734,18 @@ def _cover_role_reference_support(
     if match is None:
         return False, False
     descriptor = match.group("role")
-    if descriptor in _GENERIC_COVER_ROLE_DESCRIPTORS:
+    if not job_grounding and descriptor in _GENERIC_COVER_ROLE_DESCRIPTORS:
         return True, True
-    return True, _analysis_statement_supported(descriptor, job_grounding)
+    variants = {descriptor}
+    if descriptor.endswith(" engineering"):
+        variants.add(descriptor.removesuffix(" engineering") + " engineer")
+    elif descriptor == "engineering":
+        variants.add("engineer")
+    checks = tuple(
+        _analysis_statement_supported(variant, job_grounding)
+        for variant in variants
+    )
+    return True, None if any(value is None for value in checks) else any(checks)
 
 
 def _unsupported_reason_statement(
@@ -1722,7 +1799,8 @@ def verify_cover_letter(
         evidence_values, rejected_values, context_private = _context_auxiliary(
             context_data, verification_data
         )
-        injection_sources = _context_source_values(context_data)
+        source_instruction_sources = _context_source_values(context_data)
+        injection_sources = source_instruction_sources
         job = _mapping(context_data.get("job_description"))
         if job is None or type(job.get("text")) is not str:
             return _result(task_type, None, [_finding("schema_invalid")])
@@ -1740,6 +1818,7 @@ def verify_cover_letter(
             return _result(task_type, None, [_finding("schema_invalid")])
         context_private = ()
         injection_sources = ()
+        source_instruction_sources = ()
         job_grounding = ()
 
     records = _evidence_records(evidence_values)
@@ -1755,8 +1834,20 @@ def verify_cover_letter(
             rejected_values,
             normalized_private,
         )
+        source_instruction_sources = injection_sources
+    else:
+        injection_sources = injection_sources + (
+            tuple(item.summary for item in records),
+            rejected_values,
+            context_private,
+        )
 
     resolved, findings = _resolve_evidence(output.evidence_refs, records)
+    source_has_injection = _has_source_injection(source_instruction_sources)
+    if source_has_injection is None:
+        return _result(task_type, None, [_finding("schema_invalid")])
+    if source_has_injection:
+        findings.append(_finding("unsupported_claim"))
     factual_sentences = _factual_sentences(output.plain_text)
     if factual_sentences is None:
         return _result(task_type, None, [_finding("schema_invalid")])
@@ -1825,7 +1916,8 @@ def verify_claim_review(
         evidence_values, rejected_values, context_private = _context_auxiliary(
             context_data, verification_data
         )
-        injection_sources = _context_source_values(context_data)
+        source_instruction_sources = _context_source_values(context_data)
+        injection_sources = source_instruction_sources
     else:
         context_data = {}
         if claims is None:
@@ -1835,6 +1927,7 @@ def verify_claim_review(
         rejected_values = ()
         context_private = ()
         injection_sources = ()
+        source_instruction_sources = ()
 
     records = _evidence_records(evidence_values)
     rejected_context = _rejected_texts(rejected_values)
@@ -1868,8 +1961,20 @@ def verify_claim_review(
             rejected_claims,
             private_claims,
         )
+        source_instruction_sources = injection_sources
+    else:
+        injection_sources = injection_sources + (
+            tuple(item.summary for item in records),
+            rejected_claims,
+            private_claims,
+        )
 
     findings: list[VerifierFinding] = []
+    source_has_injection = _has_source_injection(source_instruction_sources)
+    if source_has_injection is None:
+        return _result(task_type, None, [_finding("schema_invalid")])
+    if source_has_injection:
+        findings.append(_finding("unsupported_claim"))
     material_cache: MaterialCache = {}
     for index, decision in enumerate(output.decisions):
         claim = claims_by_id[decision.claim_id]
@@ -1881,6 +1986,7 @@ def verify_claim_review(
         )
         findings.extend(reference_findings)
         claim_supported = _statement_supported(claim.text, resolved)
+        authoritative_claim_supported = _statement_supported(claim.text, records)
         claim_private = (
             claim.privacy_level != "public"
             or claim.verification_state == "private_do_not_publish"
@@ -1904,7 +2010,10 @@ def verify_claim_review(
             findings.append(
                 _finding("unsupported_claim", item_index=index, claim_id=claim.id)
             )
-        if decision.decision in {"unsupported", "needs_review"} and claim_supported:
+        if (
+            decision.decision in {"unsupported", "needs_review"}
+            and authoritative_claim_supported
+        ):
             findings.append(
                 _finding("unsupported_claim", item_index=index, claim_id=claim.id)
             )

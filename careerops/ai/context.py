@@ -10,7 +10,7 @@ import secrets
 import unicodedata
 from threading import Lock
 from types import MappingProxyType
-from typing import Any, Iterable, Mapping
+from typing import Any, Iterable, Mapping, NoReturn
 
 from careerops.ai.contracts import (
     ALLOWED_TASK_TYPES,
@@ -106,6 +106,15 @@ class ContextPacket:
 
     def __repr__(self) -> str:
         return f"ContextPacket(task_type={self.task_type!r}, sha256={self.sha256!r})"
+
+    def __reduce__(self) -> NoReturn:
+        raise TypeError("ContextPacket cannot be serialized")
+
+    def __reduce_ex__(self, _protocol: int) -> NoReturn:
+        raise TypeError("ContextPacket cannot be serialized")
+
+    def __getstate__(self) -> NoReturn:
+        raise TypeError("ContextPacket cannot be serialized")
 
     @property
     def task_type(self) -> TaskType:
@@ -361,6 +370,16 @@ def _profile_facts(
     ]
 
 
+def _review_profile_facts(values: Iterable[Any]) -> list[dict[str, str]]:
+    return [
+        fact
+        for fact in _profile_facts(values, include_all_states=True)
+        if fact["privacy_level"] == "public"
+        and fact["verification_state"]
+        in {"verified", "user_stated", "needs_verification"}
+    ]
+
+
 def _has_visible_text(text: str) -> bool:
     return any(
         unicodedata.category(character)[0] not in {"C", "M", "Z"}
@@ -432,7 +451,7 @@ class ContextPacketBuilder:
         rejected_claims: Iterable[Any] = (),
         writing_preferences: Mapping[str, Any] | None = None,
     ) -> ContextPacket:
-        if task_type not in ALLOWED_TASK_TYPES:
+        if type(task_type) is not str or task_type not in ALLOWED_TASK_TYPES:
             raise ContextBuildError("Task type is not supported")
 
         template = load_prompt_template(task_type)
@@ -443,12 +462,14 @@ class ContextPacketBuilder:
                 rejected_values: tuple[Any, ...] = ()
                 all_facts: list[dict[str, str]] = []
                 all_evidence: list[dict[str, str]] = []
+                all_rejected: list[dict[str, str]] = []
             else:
                 fact_values = _bounded_values(confirmed_facts, MAX_PROFILE_FACTS)
                 evidence_values = _bounded_values(evidence, MAX_EVIDENCE_ITEMS)
                 rejected_values = _bounded_values(rejected_claims, MAX_REJECTED_CLAIMS)
                 all_facts = _profile_facts(fact_values, include_all_states=True)
                 all_evidence = _evidence(evidence_values, include_all_states=True)
+                all_rejected = _rejected_claims(rejected_values)
         except Exception:
             normalization_failed = True
         else:
@@ -469,9 +490,11 @@ class ContextPacketBuilder:
 
         try:
             if task_type == "review_claims":
-                packet["confirmed_profile_facts"] = all_facts
-                packet["linked_evidence"] = all_evidence
-                packet["rejected_claims"] = _rejected_claims(rejected_values)
+                packet["confirmed_profile_facts"] = _review_profile_facts(fact_values)
+                packet["linked_evidence"] = _evidence(
+                    evidence_values, include_all_states=False
+                )
+                packet["rejected_claims"] = []
             else:
                 if job_description is None:
                     raise ContextBuildError("Selected job description is required")
@@ -487,7 +510,7 @@ class ContextPacketBuilder:
                 packet["linked_evidence"] = _evidence(
                     evidence_values, include_all_states=False
                 )
-                packet["rejected_claims"] = _rejected_claims(rejected_values)
+                packet["rejected_claims"] = []
 
             if task_type in {"suggest_resume_edits", "draft_cover_letter"}:
                 packet["writing_preferences"] = _preferences(
@@ -512,6 +535,7 @@ class ContextPacketBuilder:
                     "context_sha256": canonical_sha256,
                     "confirmed_profile_facts": all_facts,
                     "linked_evidence": all_evidence,
+                    "rejected_claims": all_rejected,
                 }
             )
         except (TypeError, ValueError, UnicodeError):
@@ -555,6 +579,8 @@ def validate_context_packet(
         or len(packet.canonical_bytes) > MAX_CONTEXT_BYTES
         or type(packet.sha256) is not str
         or hashlib.sha256(packet.canonical_bytes).hexdigest() != packet.sha256
+        or type(packet.verification_sha256) is not str
+        or not re.fullmatch(r"[0-9a-f]{64}", packet.verification_sha256)
         or type(packet.authority_seal) is not str
         or not hmac.compare_digest(
             packet.authority_seal,
@@ -636,13 +662,16 @@ def validate_context_packet(
 
     verification_facts = verification["confirmed_profile_facts"]
     verification_evidence = verification["linked_evidence"]
+    verification_rejected = verification["rejected_claims"]
     if expected_task_type == "analyze_jd":
         if verification_facts or verification_evidence:
             return None
     elif expected_task_type == "review_claims":
         if (
-            payload["confirmed_profile_facts"] != verification_facts
-            or payload["linked_evidence"] != verification_evidence
+            payload["confirmed_profile_facts"]
+            != _review_profile_facts(verification_facts)
+            or payload["linked_evidence"]
+            != _evidence(verification_evidence, include_all_states=False)
         ):
             return None
     elif (
@@ -658,9 +687,9 @@ def validate_context_packet(
             expected_task_type,
             job_description=payload.get("job_description"),
             resume=payload.get("selected_resume"),
-            confirmed_facts=payload.get("confirmed_profile_facts", ()),
-            evidence=payload.get("linked_evidence", ()),
-            rejected_claims=payload.get("rejected_claims", ()),
+            confirmed_facts=verification_facts,
+            evidence=verification_evidence,
+            rejected_claims=verification_rejected,
             writing_preferences=payload.get("writing_preferences"),
         )
     except ContextBuildError:
@@ -679,6 +708,8 @@ def validate_verification_material(
         or type(packet.verification_bytes) is not bytes
         or not packet.verification_bytes
         or len(packet.verification_bytes) > MAX_VERIFICATION_BYTES
+        or type(packet.sha256) is not str
+        or not re.fullmatch(r"[0-9a-f]{64}", packet.sha256)
         or type(packet.verification_sha256) is not str
         or hashlib.sha256(packet.verification_bytes).hexdigest()
         != packet.verification_sha256
@@ -706,6 +737,7 @@ def validate_verification_material(
                 "context_sha256",
                 "confirmed_profile_facts",
                 "linked_evidence",
+                "rejected_claims",
             }
             or payload.get("verification_version") != VERIFICATION_VERSION
             or payload.get("task_type") != expected_task_type
@@ -718,11 +750,13 @@ def validate_verification_material(
         evidence = _evidence(
             payload.get("linked_evidence", ()), include_all_states=True
         )
+        rejected = _rejected_claims(payload.get("rejected_claims", ()))
     except Exception:
         return None
     if (
         facts != payload["confirmed_profile_facts"]
         or evidence != payload["linked_evidence"]
+        or rejected != payload["rejected_claims"]
     ):
         return None
     return payload
