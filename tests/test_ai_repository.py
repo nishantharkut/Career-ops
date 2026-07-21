@@ -22,6 +22,76 @@ def make_repo(tmp_path: Path) -> CareerOpsRepository:
     return repo
 
 
+def create_legacy_ai_database(database_path: Path, version: int) -> None:
+    fixture_path = Path(__file__).parent / "fixtures" / "v0_schema.sql"
+    with closing(sqlite3.connect(database_path)) as connection:
+        connection.executescript(fixture_path.read_text(encoding="utf-8"))
+        for migration_version, migration in MIGRATIONS:
+            if migration_version > version:
+                break
+            migration(connection)
+        if version < 11:
+            provider_columns = {
+                row[1]
+                for row in connection.execute(
+                    "PRAGMA table_info(ai_provider_configs)"
+                ).fetchall()
+            }
+            if "identity_name" in provider_columns:
+                connection.execute(
+                    "ALTER TABLE ai_provider_configs DROP COLUMN identity_name"
+                )
+        if version < 10:
+            task_columns = {
+                row[1]
+                for row in connection.execute("PRAGMA table_info(ai_tasks)").fetchall()
+            }
+            if "invocation_started_at" in task_columns:
+                connection.execute(
+                    "ALTER TABLE ai_tasks DROP COLUMN invocation_started_at"
+                )
+        connection.execute(f"PRAGMA user_version = {version}")
+        connection.commit()
+
+
+def promote_to_f32e429_v11(connection: sqlite3.Connection) -> None:
+    connection.execute(
+        """
+        ALTER TABLE ai_provider_configs
+        ADD COLUMN identity_name TEXT NOT NULL DEFAULT ''
+        """
+    )
+    for operation in ("INSERT", "UPDATE"):
+        connection.execute(
+            f"""
+            CREATE TRIGGER validate_codex_identity_{operation.lower()}
+            BEFORE {operation} ON ai_provider_configs
+            WHEN NEW.provider_kind = 'codex'
+             AND (
+                NEW.identity_name NOT IN ('codex2', 'codex')
+                OR NEW.endpoint != ('codex-identity://' || NEW.identity_name)
+             )
+            BEGIN
+                SELECT RAISE(ABORT, 'invalid Codex identity binding');
+            END
+            """
+        )
+    connection.execute(
+        """
+        CREATE TRIGGER validate_provider_binding_immutable
+        BEFORE UPDATE ON ai_provider_configs
+        WHEN NEW.provider_kind != OLD.provider_kind
+          OR NEW.endpoint != OLD.endpoint
+          OR NEW.model != OLD.model
+          OR NEW.identity_name != OLD.identity_name
+        BEGIN
+            SELECT RAISE(ABORT, 'provider configuration binding is immutable');
+        END
+        """
+    )
+    connection.execute("PRAGMA user_version = 11")
+
+
 def create_application(repo: CareerOpsRepository):
     return repo.create_application(
         company="Example Corp",
@@ -1133,6 +1203,66 @@ def test_invocation_fence_survives_requeue_and_new_claim(tmp_path: Path):
     assert repo.get_ai_task(task.id).invocation_started_at is not None
 
 
+def test_v9_running_task_upgrade_consumes_invocation_fence(tmp_path: Path):
+    database_path = tmp_path / "careerops.db"
+    create_legacy_ai_database(database_path, 9)
+    with connect_database(database_path) as connection:
+        connection.execute(
+            """
+            INSERT INTO ai_provider_configs (
+                id, provider_kind, display_name, enabled, privacy_mode,
+                endpoint, model, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "aip_v9",
+                "mock",
+                "Version 9 provider",
+                1,
+                "local_private",
+                "",
+                "fixture-v1",
+                "2026-01-01T00:00:00+00:00",
+                "2026-01-01T00:00:00+00:00",
+            ),
+        )
+        connection.execute(
+            """
+            INSERT INTO ai_tasks (
+                id, application_id, task_type, provider_config_id,
+                prompt_template_id, input_artifact_ids_json, status,
+                privacy_mode, started_at, completed_at, error_summary,
+                claim_token, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "ait_v9_running",
+                "app_v0",
+                "analyze_jd",
+                "aip_v9",
+                "analyze_jd_v1",
+                "[]",
+                "running",
+                "local_private",
+                "2026-02-01T00:00:00+00:00",
+                None,
+                "",
+                "legacy-claim",
+                "2026-01-31T00:00:00+00:00",
+                "2026-02-01T00:00:01+00:00",
+            ),
+        )
+
+    repo = CareerOpsRepository(database_path, tmp_path / "vault")
+    repo.initialize()
+
+    migrated = repo.get_ai_task("ait_v9_running")
+    assert migrated.invocation_started_at == "2026-02-01T00:00:00+00:00"
+    assert repo.requeue_interrupted_ai_tasks() == 1
+    recovered_claim = claim_task(repo, migrated.id)
+    assert repo.begin_ai_task_invocation(migrated.id, recovered_claim) is False
+
+
 def test_profile_facts_enforce_verification_states_and_write_audits(tmp_path: Path):
     repo = make_repo(tmp_path)
 
@@ -1311,26 +1441,168 @@ def test_v0_database_upgrades_without_data_loss(tmp_path: Path):
         ).fetchone()
 
 
-def test_v10_database_adds_provider_identity_without_data_loss(tmp_path: Path):
+def test_v10_database_backfills_and_quarantines_codex_identities(tmp_path: Path):
     database_path = tmp_path / "careerops.db"
-    fixture_path = Path(__file__).parent / "fixtures" / "v0_schema.sql"
-    with closing(sqlite3.connect(database_path)) as connection:
-        connection.executescript(fixture_path.read_text(encoding="utf-8"))
-        for version, migration in MIGRATIONS:
-            if version > 10:
-                break
-            migration(connection)
-            connection.execute(f"PRAGMA user_version = {version}")
-        connection.execute(
-            "ALTER TABLE ai_provider_configs DROP COLUMN identity_name"
+    create_legacy_ai_database(database_path, 10)
+    with connect_database(database_path) as connection:
+        connection.executemany(
+            """
+            INSERT INTO ai_provider_configs (
+                id, provider_kind, display_name, enabled, privacy_mode,
+                endpoint, model, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                (
+                    "aip_codex2_v10",
+                    "codex",
+                    "Legacy codex2",
+                    1,
+                    "cloud_external",
+                    "codex-identity://codex2",
+                    "gpt-5.6-sol",
+                    "2026-01-01T00:00:00+00:00",
+                    "2026-01-01T00:00:00+00:00",
+                ),
+                (
+                    "aip_codex_v10",
+                    "codex",
+                    "Legacy codex",
+                    1,
+                    "cloud_external",
+                    "codex-identity://codex",
+                    "gpt-5.6-sol",
+                    "2026-01-01T00:00:01+00:00",
+                    "2026-01-01T00:00:01+00:00",
+                ),
+                (
+                    "aip_ambiguous_v10",
+                    "codex",
+                    "Legacy ambiguous Codex",
+                    1,
+                    "cloud_external",
+                    "C:\\Program Files\\Codex\\codex.exe",
+                    "gpt-5.6-sol",
+                    "2026-01-01T00:00:02+00:00",
+                    "2026-01-01T00:00:02+00:00",
+                ),
+                (
+                    "aip_mock_v10",
+                    "mock",
+                    "Legacy mock",
+                    1,
+                    "local_private",
+                    "",
+                    "fixture-v1",
+                    "2026-01-01T00:00:03+00:00",
+                    "2026-01-01T00:00:03+00:00",
+                ),
+            ],
         )
-        provider_columns = {
-            row[1]
-            for row in connection.execute(
-                "PRAGMA table_info(ai_provider_configs)"
-            ).fetchall()
-        }
-        assert "identity_name" not in provider_columns
+        connection.execute(
+            """
+            INSERT INTO ai_tasks (
+                id, application_id, task_type, provider_config_id,
+                prompt_template_id, input_artifact_ids_json, status,
+                privacy_mode, started_at, invocation_started_at, completed_at,
+                error_summary, claim_token, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "ait_ambiguous_v10",
+                "app_v0",
+                "analyze_jd",
+                "aip_ambiguous_v10",
+                "analyze_jd_v1",
+                "[]",
+                "pending",
+                "cloud_external",
+                None,
+                None,
+                None,
+                "",
+                None,
+                "2026-01-01T00:00:04+00:00",
+                "2026-01-01T00:00:04+00:00",
+            ),
+        )
+
+    repo = CareerOpsRepository(database_path, tmp_path / "vault")
+    repo.initialize()
+
+    assert repo.get_ai_provider("aip_codex2_v10").identity_name == "codex2"
+    assert repo.get_ai_provider("aip_codex_v10").identity_name == "codex"
+    ambiguous = repo.get_ai_provider("aip_ambiguous_v10")
+    assert ambiguous.enabled is False
+    assert ambiguous.identity_name == ""
+    assert ambiguous.model == "gpt-5.6-sol"
+    assert repo.get_ai_task("ait_ambiguous_v10").provider_config_id == ambiguous.id
+    assert repo.get_ai_provider("aip_mock_v10").identity_name == ""
+
+    with connect_database(database_path) as connection:
+        connection.execute(
+            """
+            UPDATE ai_provider_configs
+            SET display_name = ?, enabled = 0
+            WHERE id = ?
+            """,
+            ("Quarantined Codex", ambiguous.id),
+        )
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute(
+                "UPDATE ai_provider_configs SET enabled = 1 WHERE id = ?",
+                (ambiguous.id,),
+            )
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute(
+                """
+                UPDATE ai_provider_configs
+                SET identity_name = ?, endpoint = ?
+                WHERE id = ?
+                """,
+                ("codex", "codex-identity://codex", ambiguous.id),
+            )
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute(
+                """
+                INSERT INTO ai_provider_configs (
+                    id, provider_kind, display_name, identity_name, enabled,
+                    privacy_mode, endpoint, model, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    "aip_invalid_non_codex",
+                    "mock",
+                    "Invalid mock identity",
+                    "codex",
+                    1,
+                    "local_private",
+                    "",
+                    "fixture-v2",
+                    "2026-01-01T00:00:05+00:00",
+                    "2026-01-01T00:00:05+00:00",
+                ),
+            )
+
+    assert repo.get_ai_provider(ambiguous.id).display_name == "Quarantined Codex"
+    fresh = repo.upsert_ai_provider(
+        provider_kind="codex",
+        display_name="Fresh exact identity",
+        privacy_mode="cloud_external",
+        endpoint="codex-identity://codex2",
+        identity_name="codex2",
+        model="gpt-5.6-sol-fresh",
+        enabled=True,
+    )
+    assert fresh.enabled is True
+    assert fresh.identity_name == "codex2"
+
+
+def test_f32e429_v11_database_repairs_fences_and_legacy_codex(tmp_path: Path):
+    database_path = tmp_path / "careerops.db"
+    create_legacy_ai_database(database_path, 10)
+    with closing(sqlite3.connect(database_path)) as connection:
+        connection.execute("PRAGMA foreign_keys = ON")
         connection.execute(
             """
             INSERT INTO ai_provider_configs (
@@ -1339,39 +1611,58 @@ def test_v10_database_adds_provider_identity_without_data_loss(tmp_path: Path):
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
-                "aip_legacy",
-                "mock",
-                "Legacy provider",
+                "aip_ambiguous_v11",
+                "codex",
+                "Ambiguous version 11 Codex",
                 1,
-                "local_private",
-                "",
-                "fixture-v1",
+                "cloud_external",
+                "C:\\Tools\\codex.exe",
+                "gpt-5.6-sol",
                 "2026-01-01T00:00:00+00:00",
                 "2026-01-01T00:00:00+00:00",
             ),
         )
+        connection.execute(
+            """
+            INSERT INTO ai_tasks (
+                id, application_id, task_type, provider_config_id,
+                prompt_template_id, input_artifact_ids_json, status,
+                privacy_mode, started_at, invocation_started_at, completed_at,
+                error_summary, claim_token, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "ait_running_v11",
+                "app_v0",
+                "analyze_jd",
+                "aip_ambiguous_v11",
+                "analyze_jd_v1",
+                "[]",
+                "running",
+                "cloud_external",
+                "2026-02-02T00:00:00+00:00",
+                None,
+                None,
+                "",
+                "legacy-v11-claim",
+                "2026-02-01T00:00:00+00:00",
+                "2026-02-02T00:00:01+00:00",
+            ),
+        )
+        promote_to_f32e429_v11(connection)
         connection.commit()
 
     repo = CareerOpsRepository(database_path, tmp_path / "vault")
     repo.initialize()
 
-    provider = repo.get_ai_provider("aip_legacy")
-    assert provider.display_name == "Legacy provider"
+    provider = repo.get_ai_provider("aip_ambiguous_v11")
+    task = repo.get_ai_task("ait_running_v11")
+    assert provider.enabled is False
     assert provider.identity_name == ""
-    with connect_database(database_path) as connection:
-        provider_columns = {
-            row[1]
-            for row in connection.execute(
-                "PRAGMA table_info(ai_provider_configs)"
-            ).fetchall()
-        }
-        task_columns = {
-            row[1]
-            for row in connection.execute("PRAGMA table_info(ai_tasks)").fetchall()
-        }
-        assert "identity_name" in provider_columns
-        assert "invocation_started_at" in task_columns
-        assert connection.execute("PRAGMA user_version").fetchone()[0] >= 11
+    assert task.invocation_started_at == "2026-02-02T00:00:00+00:00"
+    assert repo.requeue_interrupted_ai_tasks() == 1
+    recovered_claim = claim_task(repo, task.id)
+    assert repo.begin_ai_task_invocation(task.id, recovered_claim) is False
 
 
 def test_ai_foreign_key_indexes_exist_without_redundant_version_index(tmp_path: Path):

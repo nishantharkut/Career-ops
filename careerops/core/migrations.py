@@ -406,9 +406,24 @@ def _canonicalize_ai_task_inputs(connection: sqlite3.Connection) -> None:
 def _add_ai_invocation_fence(connection: sqlite3.Connection) -> None:
     if "invocation_started_at" not in _column_names(connection, "ai_tasks"):
         connection.execute("ALTER TABLE ai_tasks ADD COLUMN invocation_started_at TEXT")
+    connection.execute(
+        """
+        UPDATE ai_tasks
+        SET invocation_started_at = COALESCE(started_at, updated_at, created_at)
+        WHERE status = 'running' AND invocation_started_at IS NULL
+        """
+    )
 
 
 def _add_provider_identity(connection: sqlite3.Connection) -> None:
+    for trigger_name in (
+        "validate_codex_identity_insert",
+        "validate_codex_identity_update",
+        "validate_provider_identity_insert",
+        "validate_provider_identity_update",
+        "validate_provider_binding_immutable",
+    ):
+        connection.execute(f"DROP TRIGGER IF EXISTS {trigger_name}")
     if "identity_name" not in _column_names(connection, "ai_provider_configs"):
         connection.execute(
             """
@@ -416,18 +431,69 @@ def _add_provider_identity(connection: sqlite3.Connection) -> None:
             ADD COLUMN identity_name TEXT NOT NULL DEFAULT ''
             """
         )
+    connection.execute(
+        """
+        UPDATE ai_provider_configs
+        SET identity_name = ''
+        WHERE provider_kind != 'codex'
+        """
+    )
+    connection.execute(
+        """
+        UPDATE ai_provider_configs
+        SET identity_name = 'codex2'
+        WHERE provider_kind = 'codex'
+          AND endpoint = 'codex-identity://codex2'
+        """
+    )
+    connection.execute(
+        """
+        UPDATE ai_provider_configs
+        SET identity_name = 'codex'
+        WHERE provider_kind = 'codex'
+          AND endpoint = 'codex-identity://codex'
+        """
+    )
+    connection.execute(
+        """
+        UPDATE ai_provider_configs
+        SET enabled = 0, identity_name = ''
+        WHERE provider_kind = 'codex'
+          AND endpoint NOT IN (
+              'codex-identity://codex2', 'codex-identity://codex'
+          )
+        """
+    )
     for operation in ("INSERT", "UPDATE"):
         connection.execute(
             f"""
-            CREATE TRIGGER IF NOT EXISTS validate_codex_identity_{operation.lower()}
+            CREATE TRIGGER validate_provider_identity_{operation.lower()}
             BEFORE {operation} ON ai_provider_configs
-            WHEN NEW.provider_kind = 'codex'
-             AND (
-                NEW.identity_name NOT IN ('codex2', 'codex')
-                OR NEW.endpoint != ('codex-identity://' || NEW.identity_name)
-             )
+            WHEN (
+                NEW.provider_kind != 'codex' AND NEW.identity_name != ''
+            ) OR (
+                NEW.provider_kind = 'codex'
+                AND NOT (
+                    (
+                        NEW.identity_name = 'codex2'
+                        AND NEW.endpoint = 'codex-identity://codex2'
+                    )
+                    OR (
+                        NEW.identity_name = 'codex'
+                        AND NEW.endpoint = 'codex-identity://codex'
+                    )
+                    OR (
+                        NEW.enabled = 0
+                        AND NEW.identity_name = ''
+                        AND NEW.endpoint NOT IN (
+                            'codex-identity://codex2',
+                            'codex-identity://codex'
+                        )
+                    )
+                )
+            )
             BEGIN
-                SELECT RAISE(ABORT, 'invalid Codex identity binding');
+                SELECT RAISE(ABORT, 'invalid provider identity binding');
             END
             """
         )
@@ -446,6 +512,11 @@ def _add_provider_identity(connection: sqlite3.Connection) -> None:
     )
 
 
+def _repair_ai_orchestration_migrations(connection: sqlite3.Connection) -> None:
+    _add_ai_invocation_fence(connection)
+    _add_provider_identity(connection)
+
+
 MIGRATIONS: tuple[tuple[int, Migration], ...] = (
     (1, _add_application_role_type),
     (2, _add_application_submitted_at),
@@ -458,6 +529,7 @@ MIGRATIONS: tuple[tuple[int, Migration], ...] = (
     (9, _canonicalize_ai_task_inputs),
     (10, _add_ai_invocation_fence),
     (11, _add_provider_identity),
+    (12, _repair_ai_orchestration_migrations),
 )
 
 LATEST_SCHEMA_VERSION = MIGRATIONS[-1][0]
