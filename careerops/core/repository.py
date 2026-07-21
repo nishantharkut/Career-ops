@@ -65,6 +65,7 @@ PROVIDER_ERROR_CATEGORIES = frozenset(
     }
 )
 SHA256_PATTERN = re.compile(r"[0-9a-fA-F]{64}\Z")
+MAX_PERSISTED_JSON_BYTES = 256_000
 UTC_NOW_LOCK = Lock()
 LAST_UTC_NOW: datetime | None = None
 
@@ -115,6 +116,28 @@ def redact(value: Any) -> Any:
 def provider_error_category(value: str) -> str:
     normalized = value.strip().lower()
     return normalized if normalized in PROVIDER_ERROR_CATEGORIES else "provider_error"
+
+
+def persisted_json(value: Any) -> tuple[Any, str]:
+    try:
+        safe_value = redact(value)
+    except TypeError:
+        raise
+    except Exception:
+        raise ValueError("Persisted payload was not valid JSON") from None
+    try:
+        serialized = json.dumps(
+            safe_value,
+            ensure_ascii=False,
+            allow_nan=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+    except Exception:
+        raise ValueError("Persisted payload was not valid JSON") from None
+    if len(serialized.encode("utf-8")) > MAX_PERSISTED_JSON_BYTES:
+        raise ValueError("Persisted JSON payload exceeded its size limit")
+    return safe_value, serialized
 
 
 def finite_value(enum_type: type[Any], value: str, label: str) -> str:
@@ -410,6 +433,38 @@ class CareerOpsRepository:
                 task_id,
                 before.__dict__,
                 {"status": "failed", "completed_at": now, "error_summary": safe_error},
+            )
+        return self.get_ai_task(task_id)
+
+    def block_ai_task(
+        self, task_id: str, claim_token: str, error_summary: str
+    ) -> AiTask:
+        before = self.get_ai_task(task_id)
+        now = utc_now()
+        safe_error = provider_error_category(error_summary)
+        with self.connection() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE ai_tasks
+                SET status = 'blocked', completed_at = ?, error_summary = ?,
+                    claim_token = NULL, updated_at = ?
+                WHERE id = ? AND status = 'running' AND claim_token = ?
+                """,
+                (now, safe_error, now, task_id, claim_token),
+            )
+            if cursor.rowcount != 1:
+                raise ValueError("AI task claim is not active")
+            self._write_audit(
+                connection,
+                "ai_task.blocked",
+                "ai_task",
+                task_id,
+                before.__dict__,
+                {
+                    "status": "blocked",
+                    "completed_at": now,
+                    "error_summary": safe_error,
+                },
             )
         return self.get_ai_task(task_id)
 
@@ -796,11 +851,25 @@ class CareerOpsRepository:
         application_id: str,
         event_type: str,
         snapshot: dict[str, Any],
+        *,
+        ai_task_id: str | None = None,
+        claim_token: str | None = None,
     ) -> ApplicationVersion:
+        if (ai_task_id is None) != (claim_token is None):
+            raise ValueError("AI task ID and claim token must be provided together")
+        safe_snapshot, snapshot_json = persisted_json(snapshot)
         version_id = new_id("appv")
         now = utc_now()
         with self.connection() as connection:
             connection.execute("BEGIN IMMEDIATE")
+            if ai_task_id is not None and claim_token is not None:
+                self._require_active_ai_claim(connection, ai_task_id, claim_token)
+                owner = connection.execute(
+                    "SELECT application_id FROM ai_tasks WHERE id = ?",
+                    (ai_task_id,),
+                ).fetchone()
+                if owner is None or owner["application_id"] != application_id:
+                    raise ValueError("AI task does not belong to the application")
             row = connection.execute(
                 """
                 SELECT COALESCE(MAX(version_number), 0) + 1
@@ -821,7 +890,7 @@ class CareerOpsRepository:
                     application_id,
                     version_number,
                     event_type,
-                    json.dumps(snapshot),
+                    snapshot_json,
                     now,
                 ),
             )
@@ -835,7 +904,7 @@ class CareerOpsRepository:
                     "application_version_id": version_id,
                     "version_number": version_number,
                     "event_type": event_type,
-                    "snapshot": snapshot,
+                    "snapshot": safe_snapshot,
                 },
             )
         return self.get_application_version(version_id)
@@ -855,6 +924,87 @@ class CareerOpsRepository:
                 (application_id,),
             ).fetchall()
         return [self._application_version_from_row(row) for row in rows]
+
+    def update_jd_requirements_from_ai(
+        self,
+        *,
+        snapshot_id: str,
+        task_id: str,
+        claim_token: str,
+        raw_ai: dict[str, Any],
+        uncertainty: dict[str, Any],
+    ) -> JobDescriptionSnapshot:
+        now = utc_now()
+        with self.connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            self._require_active_ai_claim(connection, task_id, claim_token)
+            task = connection.execute(
+                "SELECT application_id, task_type FROM ai_tasks WHERE id = ?",
+                (task_id,),
+            ).fetchone()
+            snapshot = connection.execute(
+                "SELECT * FROM jd_snapshots WHERE id = ?",
+                (snapshot_id,),
+            ).fetchone()
+            if snapshot is None:
+                raise KeyError("No JD snapshot with that ID")
+            if (
+                task is None
+                or task["application_id"] != snapshot["application_id"]
+                or task["task_type"] != "analyze_jd"
+            ):
+                raise ValueError("AI task cannot update this JD snapshot")
+
+            existing = json.loads(snapshot["extracted_requirements_json"])
+            grouped = any(
+                key in existing
+                for key in (
+                    "raw_ai",
+                    "deterministic",
+                    "user_corrected",
+                    "uncertainty",
+                )
+            )
+            updated = {
+                "raw_ai": raw_ai,
+                "deterministic": (
+                    existing.get("deterministic", {}) if grouped else existing
+                ),
+                "user_corrected": existing.get("user_corrected", {}),
+                "uncertainty": uncertainty,
+            }
+            serialized = json.dumps(
+                updated,
+                ensure_ascii=False,
+                allow_nan=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            )
+            connection.execute(
+                """
+                UPDATE jd_snapshots
+                SET extracted_requirements_json = ?
+                WHERE id = ?
+                """,
+                (serialized, snapshot_id),
+            )
+            self._write_audit(
+                connection,
+                "jd_snapshot.ai_requirements_updated",
+                "jd_snapshot",
+                snapshot_id,
+                {
+                    "requirements_sha256": sha256_text(
+                        snapshot["extracted_requirements_json"]
+                    )
+                },
+                {
+                    "ai_task_id": task_id,
+                    "requirements_sha256": sha256_text(serialized),
+                    "updated_at": now,
+                },
+            )
+        return self.get_jd_snapshot(snapshot_id)
 
     def create_application(
         self,
@@ -1072,13 +1222,36 @@ class CareerOpsRepository:
         jd_snapshot_id: str,
         fit: dict[str, Any],
         risks: dict[str, Any],
+        ai_task_id: str | None = None,
+        claim_token: str | None = None,
     ) -> Report:
+        if (ai_task_id is None) != (claim_token is None):
+            raise ValueError("AI task ID and claim token must be provided together")
         report_id = new_id("rep")
         now = utc_now()
         blockers = risks.get("blockers", [])
         warnings = risks.get("warnings", [])
         status = ApplicationStatus.READY_FOR_REVIEW if not blockers else ApplicationStatus.NEEDS_EVIDENCE
         with self.connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            if ai_task_id is not None and claim_token is not None:
+                self._require_active_ai_claim(connection, ai_task_id, claim_token)
+                owner = connection.execute(
+                    "SELECT application_id, task_type FROM ai_tasks WHERE id = ?",
+                    (ai_task_id,),
+                ).fetchone()
+                application = connection.execute(
+                    "SELECT * FROM applications WHERE id = ?", (application_id,)
+                ).fetchone()
+                if (
+                    owner is None
+                    or application is None
+                    or owner["application_id"] != application_id
+                    or owner["task_type"] != "analyze_fit"
+                    or application["selected_resume_version_id"] != resume_version_id
+                    or application["jd_snapshot_id"] != jd_snapshot_id
+                ):
+                    raise ValueError("AI task cannot create this report")
             connection.execute(
                 """
                 INSERT INTO reports (
@@ -1334,6 +1507,8 @@ class CareerOpsRepository:
         before: dict[str, Any] | None,
         after: dict[str, Any] | None,
     ) -> None:
+        _safe_before, before_json = persisted_json(before or {})
+        _safe_after, after_json = persisted_json(after or {})
         connection.execute(
             """
             INSERT INTO audit_events (
@@ -1345,8 +1520,8 @@ class CareerOpsRepository:
                 event_type,
                 entity_type,
                 entity_id,
-                json.dumps(redact(before or {})),
-                json.dumps(redact(after or {})),
+                before_json,
+                after_json,
                 utc_now(),
             ),
         )

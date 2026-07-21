@@ -41,9 +41,11 @@ from careerops.ai.verifier import (
     verify_resume_edits,
     verify_task_output,
 )
+from careerops.ai.orchestrator import AiOrchestrator
 
 __all__ = [
     "ALLOWED_TASK_TYPES",
+    "AiOrchestrator",
     "AnalyzeFitOutput",
     "AnalyzeJdOutput",
     "ClaimReviewOutput",
