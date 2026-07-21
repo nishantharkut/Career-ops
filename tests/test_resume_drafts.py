@@ -1112,7 +1112,8 @@ def test_posix_partial_hard_link_publication_is_fully_cleaned(
     real_rmdir = os.rmdir
     unlink_attempts = 0
     state = drafts_module._PosixPublicationState(
-        temporary_owns_inode=True
+        temporary_owns_inode=True,
+        temporary_identity=temporary_identity,
     )
 
     def link_relative(
@@ -1168,13 +1169,95 @@ def test_posix_partial_hard_link_publication_is_fully_cleaned(
             resume_id=resume_id,
             child_identity=child_identity,
             temporary_name=temporary_name,
-            temporary_identity=temporary_identity,
             state=state,
         )
 
     assert not state.destination_owns_inode
     assert not state.temporary_owns_inode
     assert not destination_path.exists()
+    assert not temporary_path.exists()
+    assert not child_dir.exists()
+
+
+def test_posix_write_failure_after_temp_creation_is_fully_cleaned(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from careerops.resumes import drafts as drafts_module
+
+    resumes_dir = tmp_path / "resumes"
+    resumes_dir.mkdir()
+    resume_id = "res_" + ("e" * 32)
+    child_dir = resumes_dir / resume_id
+    child_dir.mkdir()
+    temporary_name = ".source.tex.tmp-write-failure"
+    temporary_path = child_dir / temporary_name
+    descriptor = os.open(
+        temporary_path,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0),
+        0o600,
+    )
+    child_stat = child_dir.lstat()
+    child_identity = (child_stat.st_dev, child_stat.st_ino)
+    state = drafts_module._PosixPublicationState()
+    write_attempts = 0
+
+    def fail_first_write(_descriptor: int, _content: Any) -> int:
+        nonlocal write_attempts
+        write_attempts += 1
+        raise OSError("simulated one-shot POSIX write failure")
+
+    try:
+        with monkeypatch.context() as write_ops:
+            write_ops.setattr(drafts_module.os, "write", fail_first_write)
+            with pytest.raises(OSError, match="one-shot"):
+                drafts_module._posix_write_temporary_source(
+                    descriptor,
+                    b"owned resume source",
+                    state,
+                )
+    finally:
+        os.close(descriptor)
+
+    assert write_attempts == 1
+    assert state.temporary_owns_inode
+    assert state.temporary_identity is not None
+    real_unlink = os.unlink
+    real_stat = os.stat
+    real_rmdir = os.rmdir
+
+    def unlink_relative(name: str, *, dir_fd: int) -> None:
+        assert dir_fd == 41
+        real_unlink(child_dir / name)
+
+    def stat_relative(
+        name: str, *, dir_fd: int, follow_symlinks: bool
+    ) -> os.stat_result:
+        assert not follow_symlinks
+        if dir_fd == 41:
+            return real_stat(child_dir / name, follow_symlinks=False)
+        assert dir_fd == 43
+        return real_stat(resumes_dir / name, follow_symlinks=False)
+
+    def rmdir_relative(name: str, *, dir_fd: int) -> None:
+        assert dir_fd == 43
+        real_rmdir(resumes_dir / name)
+
+    with monkeypatch.context() as posix_ops:
+        posix_ops.setattr(drafts_module.os, "unlink", unlink_relative)
+        posix_ops.setattr(drafts_module.os, "stat", stat_relative)
+        posix_ops.setattr(drafts_module.os, "rmdir", rmdir_relative)
+        drafts_module._cleanup_posix_failed_publication(
+            child_handle=41,
+            resumes_handle=43,
+            resume_id=resume_id,
+            child_identity=child_identity,
+            temporary_name=temporary_name,
+            state=state,
+        )
+
+    assert not state.temporary_owns_inode
+    assert not (child_dir / "source.tex").exists()
     assert not temporary_path.exists()
     assert not child_dir.exists()
 

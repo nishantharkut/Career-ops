@@ -355,6 +355,7 @@ class _PublishedSource:
 class _PosixPublicationState:
     temporary_owns_inode: bool = False
     destination_owns_inode: bool = False
+    temporary_identity: tuple[int, int] | None = None
 
 
 def _publish_source(
@@ -394,7 +395,6 @@ def _publish_source_posix(
     child_created = False
     child_identity: tuple[int, int] | None = None
     temporary_name = ""
-    temporary_identity: tuple[int, int] | None = None
     publication_state = _PosixPublicationState()
     try:
         vault_handle = os.open(vault_root, directory_flags)
@@ -415,10 +415,9 @@ def _publish_source_posix(
         source_descriptor = os.open(
             temporary_name, flags, 0o600, dir_fd=child_handle
         )
-        _write_and_sync(source_descriptor, content)
-        temporary_stat = os.fstat(source_descriptor)
-        temporary_identity = (temporary_stat.st_dev, temporary_stat.st_ino)
-        publication_state.temporary_owns_inode = True
+        _posix_write_temporary_source(
+            source_descriptor, content, publication_state
+        )
         _posix_atomic_publish_no_replace(
             child_handle,
             temporary_name,
@@ -447,14 +446,16 @@ def _publish_source_posix(
         )
     except BaseException as exc:
         if source_descriptor >= 0:
-            if temporary_identity is not None and child_identity is not None:
+            if (
+                publication_state.temporary_identity is not None
+                and child_identity is not None
+            ):
                 _cleanup_posix_failed_publication(
                     child_handle=child_handle,
                     resumes_handle=resumes_handle,
                     resume_id=resume_id,
                     child_identity=child_identity,
                     temporary_name=temporary_name,
-                    temporary_identity=temporary_identity,
                     state=publication_state,
                 )
             os.close(source_descriptor)
@@ -462,7 +463,7 @@ def _publish_source_posix(
             os.close(child_handle)
         if (
             child_created
-            and temporary_identity is None
+            and publication_state.temporary_identity is None
             and child_identity is not None
         ):
             try:
@@ -617,6 +618,19 @@ def _publish_source_windows(
         raise
 
 
+def _posix_write_temporary_source(
+    descriptor: int,
+    content: bytes,
+    state: _PosixPublicationState,
+) -> None:
+    opened = os.fstat(descriptor)
+    state.temporary_identity = (opened.st_dev, opened.st_ino)
+    state.temporary_owns_inode = True
+    if not stat.S_ISREG(opened.st_mode) or opened.st_nlink != 1:
+        raise ValueError("Resume draft temporary file is invalid")
+    _write_and_sync(descriptor, content)
+
+
 def _write_and_sync(descriptor: int, content: bytes) -> None:
     view = memoryview(content)
     written = 0
@@ -687,9 +701,11 @@ def _cleanup_posix_failed_publication(
     resume_id: str,
     child_identity: tuple[int, int],
     temporary_name: str,
-    temporary_identity: tuple[int, int],
     state: _PosixPublicationState,
 ) -> None:
+    temporary_identity = state.temporary_identity
+    if temporary_identity is None:
+        return
     if state.destination_owns_inode:
         try:
             destination_removed = _posix_unlink_owned_entry(
