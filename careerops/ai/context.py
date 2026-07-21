@@ -313,11 +313,16 @@ class ContextPacketBuilder:
         }
 
         try:
-            if job_description is None:
-                raise ContextBuildError("Selected job description is required")
-            packet["job_description"] = _job_description(job_description)
+            if task_type == "review_claims":
+                packet["confirmed_profile_facts"] = _confirmed_facts(confirmed_facts)
+                packet["linked_evidence"] = _evidence(evidence)
+                packet["rejected_claims"] = _rejected_claims(rejected_claims)
+            else:
+                if job_description is None:
+                    raise ContextBuildError("Selected job description is required")
+                packet["job_description"] = _job_description(job_description)
 
-            if task_type != "analyze_jd":
+            if task_type not in {"analyze_jd", "review_claims"}:
                 if resume is None:
                     raise ContextBuildError("Selected resume is required")
                 packet["selected_resume"] = _resume(resume)

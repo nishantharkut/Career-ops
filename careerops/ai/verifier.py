@@ -76,71 +76,27 @@ _INJECTION_PATTERN = re.compile(
     r"\bapprove\s+me\b|\breport\s+(?:a\s+)?perfect\s+match\b|"
     r"\b(?:output|return|respond\s+with)\b.{0,80}\binstead\b)"
 )
-_STOP_WORDS = frozenset(
-    {
-        "a",
-        "an",
-        "and",
-        "as",
-        "at",
-        "be",
-        "by",
-        "for",
-        "from",
-        "i",
-        "in",
-        "is",
-        "it",
-        "my",
-        "of",
-        "on",
-        "or",
-        "our",
-        "that",
-        "the",
-        "their",
-        "this",
-        "to",
-        "was",
-        "we",
-        "were",
-        "with",
-        "your",
-    }
+_NON_FACTUAL_SENTENCE_PATTERNS = (
+    re.compile(r"(?i)^dear [a-z][a-z .'-]*,?$"),
+    re.compile(r"(?i)^(?:sincerely|regards|best regards),?$"),
+    re.compile(r"(?i)^thank you(?: for considering my application)?$"),
+    re.compile(
+        r"(?i)^i(?: am|'m) interested in (?:this|the) "
+        r"(?:[a-z0-9+#.-]+ ){0,8}role$"
+    ),
+    re.compile(
+        r"(?i)^i(?: am|'m) excited to apply(?: for (?:this|the) "
+        r"(?:[a-z0-9+#.-]+ ){0,8}role)?$"
+    ),
+    re.compile(r"(?i)^please consider my application$"),
 )
-_NON_FACTUAL_PREFIXES = (
-    "dear ",
-    "thank you",
-    "sincerely",
-    "regards",
-    "i am interested",
-    "i'm interested",
-    "i am excited to apply",
-    "i'm excited to apply",
-    "i would welcome",
-    "i look forward",
-    "please consider",
-)
-_FACTUAL_QUALIFIERS = frozenset(
-    {
-        "approximately",
-        "assisted",
-        "but",
-        "co-developed",
-        "coauthored",
-        "collaborated",
-        "contributed",
-        "estimated",
-        "finalist",
-        "helped",
-        "jointly",
-        "not",
-        "never",
-        "no",
-        "part",
-        "supported",
-        "team",
-    }
+_UNTRUSTED_CONTEXT_FIELDS = (
+    "job_description",
+    "selected_resume",
+    "confirmed_profile_facts",
+    "linked_evidence",
+    "rejected_claims",
+    "writing_preferences",
 )
 
 
@@ -338,16 +294,18 @@ def _claim_records(values: Sequence[Any]) -> tuple[_Claim, ...] | None:
     return tuple(sorted(records, key=lambda item: item.id))
 
 
-def _tokens(text: str) -> frozenset[str]:
-    return frozenset(
+def _ordered_statement_tokens(text: str) -> tuple[str, ...]:
+    tokens = tuple(
         token
         for token in (
             match.group(0).casefold().strip(".-")
             for match in _TOKEN_PATTERN.finditer(text)
         )
         if token
-        if token not in _STOP_WORDS
     )
+    if tokens and tokens[0] in {"i", "we"}:
+        return tokens[1:]
+    return tokens
 
 
 def _normalized_text(text: str) -> str:
@@ -364,48 +322,24 @@ def _new_content_supported(
     replacement_text: str,
     evidence: Sequence[_Evidence],
 ) -> bool:
-    novel = _tokens(replacement_text) - _tokens(source_text)
-    removed_qualifiers = {
-        token.casefold()
-        for token in _TOKEN_PATTERN.findall(source_text)
-        if token.casefold() in _FACTUAL_QUALIFIERS
-    } - {
-        token.casefold()
-        for token in _TOKEN_PATTERN.findall(replacement_text)
-        if token.casefold() in _FACTUAL_QUALIFIERS
-    }
-    if not novel and not removed_qualifiers:
+    replacement = _ordered_statement_tokens(replacement_text)
+    if replacement == _ordered_statement_tokens(source_text):
         return True
-    supported_tokens: set[str] = set()
-    for item in evidence:
-        supported_tokens.update(_tokens(item.summary))
-    replacement = _normalized_text(replacement_text)
-    exact_evidence = any(
-        replacement in _normalized_text(item.summary) for item in evidence
-    )
-    return bool(evidence) and novel <= supported_tokens and (
-        not removed_qualifiers or exact_evidence
-    )
-
-
-def _statement_supported(statement: str, evidence: Sequence[_Evidence]) -> bool:
-    required = _tokens(statement)
-    if not required:
-        return True
-    statement_qualifiers = _qualifiers(statement)
-    return any(
-        required <= _tokens(segment)
-        and statement_qualifiers == _qualifiers(segment)
+    return bool(replacement) and any(
+        replacement == _ordered_statement_tokens(segment)
         for item in evidence
         for segment in _sentences(item.summary)
     )
 
 
-def _qualifiers(text: str) -> frozenset[str]:
-    return frozenset(
-        token.casefold()
-        for token in _TOKEN_PATTERN.findall(text)
-        if token.casefold() in _FACTUAL_QUALIFIERS
+def _statement_supported(statement: str, evidence: Sequence[_Evidence]) -> bool:
+    required = _ordered_statement_tokens(statement)
+    if not required:
+        return True
+    return any(
+        required == _ordered_statement_tokens(segment)
+        for item in evidence
+        for segment in _sentences(item.summary)
     )
 
 
@@ -532,12 +466,15 @@ def _output_text(output: TaskOutput) -> str:
 
 def _injection_fragments(context: Mapping[str, Any]) -> tuple[str, ...]:
     source_texts: list[str] = []
-    job = _mapping(context.get("job_description"))
-    resume = _mapping(context.get("selected_resume"))
-    if job is not None and isinstance(job.get("text"), str):
-        source_texts.append(job["text"])
-    if resume is not None and isinstance(resume.get("source_text"), str):
-        source_texts.append(resume["source_text"])
+    stack = [context.get(field) for field in _UNTRUSTED_CONTEXT_FIELDS]
+    while stack:
+        value = stack.pop()
+        if type(value) is str:
+            source_texts.append(value)
+        elif isinstance(value, Mapping):
+            stack.extend(value.values())
+        elif isinstance(value, (tuple, list)):
+            stack.extend(value)
 
     fragments: set[str] = set()
     for source in source_texts:
@@ -756,8 +693,11 @@ def _factual_sentences(text: str) -> tuple[str, ...]:
     factual: list[str] = []
     for match in _SENTENCE_PATTERN.finditer(text):
         sentence = match.group(0).strip()
-        lowered = sentence.casefold()
-        if not sentence or lowered.startswith(_NON_FACTUAL_PREFIXES):
+        normalized = " ".join(sentence.rstrip(".!?").split())
+        if not sentence or any(
+            pattern.fullmatch(normalized)
+            for pattern in _NON_FACTUAL_SENTENCE_PATTERNS
+        ):
             continue
         factual.append(sentence)
     return tuple(factual)
