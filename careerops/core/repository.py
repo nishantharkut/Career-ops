@@ -621,36 +621,7 @@ class CareerOpsRepository:
         return cursor.rowcount == 1
 
     def complete_ai_task(self, task_id: str, claim_token: str) -> AiTask:
-        with self.connection() as connection:
-            connection.execute("BEGIN IMMEDIATE")
-            now = utc_now()
-            before = connection.execute(
-                "SELECT * FROM ai_tasks WHERE id = ?", (task_id,)
-            ).fetchone()
-            if before is None:
-                raise KeyError("No AI task with that ID")
-            cursor = connection.execute(
-                """
-                UPDATE ai_tasks
-                SET status = 'completed', completed_at = ?, error_summary = '',
-                    claim_token = NULL, claim_expires_at = NULL, updated_at = ?
-                WHERE id = ? AND status = 'running' AND claim_token = ?
-                  AND invocation_started_at IS NOT NULL
-                  AND claim_expires_at > ?
-                """,
-                (now, now, task_id, claim_token, now),
-            )
-            if cursor.rowcount != 1:
-                raise ValueError("AI task claim is not active")
-            self._write_audit(
-                connection,
-                "ai_task.completed",
-                "ai_task",
-                task_id,
-                dict(before),
-                {"status": "completed", "completed_at": now},
-            )
-        return self.get_ai_task(task_id)
+        raise ValueError("AI task success requires the aggregate finalizer")
 
     def fail_ai_task(self, task_id: str, claim_token: str, error_summary: str) -> AiTask:
         safe_error = provider_error_category(error_summary)
@@ -687,41 +658,7 @@ class CareerOpsRepository:
     def block_ai_task(
         self, task_id: str, claim_token: str, error_summary: str
     ) -> AiTask:
-        safe_error = provider_error_category(error_summary)
-        with self.connection() as connection:
-            connection.execute("BEGIN IMMEDIATE")
-            now = utc_now()
-            before = connection.execute(
-                "SELECT * FROM ai_tasks WHERE id = ?", (task_id,)
-            ).fetchone()
-            if before is None:
-                raise KeyError("No AI task with that ID")
-            cursor = connection.execute(
-                """
-                UPDATE ai_tasks
-                SET status = 'blocked', completed_at = ?, error_summary = ?,
-                    claim_token = NULL, claim_expires_at = NULL, updated_at = ?
-                WHERE id = ? AND status = 'running' AND claim_token = ?
-                  AND invocation_started_at IS NOT NULL
-                  AND claim_expires_at > ?
-                """,
-                (now, safe_error, now, task_id, claim_token, now),
-            )
-            if cursor.rowcount != 1:
-                raise ValueError("AI task claim is not active")
-            self._write_audit(
-                connection,
-                "ai_task.blocked",
-                "ai_task",
-                task_id,
-                dict(before),
-                {
-                    "status": "blocked",
-                    "completed_at": now,
-                    "error_summary": safe_error,
-                },
-            )
-        return self.get_ai_task(task_id)
+        raise ValueError("AI task blocking requires the aggregate finalizer")
 
     def finalize_ai_task_attempt(
         self,
@@ -1284,6 +1221,12 @@ class CareerOpsRepository:
                         now,
                     ),
                 )
+                inserted = connection.execute(
+                    "SELECT * FROM ai_artifacts WHERE id = ?", (artifact_id,)
+                ).fetchone()
+                if inserted is None:
+                    raise ValueError("AI artifact row was not persisted")
+                self._validate_artifact_row(inserted)
             except sqlite3.IntegrityError as exc:
                 if "ai_artifacts.path" in str(exc):
                     raise ValueError(
@@ -1703,108 +1646,7 @@ class CareerOpsRepository:
         raw_ai: dict[str, Any],
         uncertainty: dict[str, Any],
     ) -> JobDescriptionSnapshot:
-        with self.connection() as connection:
-            connection.execute("BEGIN IMMEDIATE")
-            now = utc_now()
-            self._require_active_ai_claim(connection, task_id, claim_token)
-            task = connection.execute(
-                "SELECT application_id, task_type FROM ai_tasks WHERE id = ?",
-                (task_id,),
-            ).fetchone()
-            snapshot = connection.execute(
-                "SELECT * FROM jd_snapshots WHERE id = ?",
-                (snapshot_id,),
-            ).fetchone()
-            if snapshot is None:
-                raise KeyError("No JD snapshot with that ID")
-            if (
-                task is None
-                or task["application_id"] != snapshot["application_id"]
-                or task["task_type"] != "analyze_jd"
-            ):
-                raise ValueError("AI task cannot update this JD snapshot")
-            application = connection.execute(
-                "SELECT * FROM applications WHERE id = ?",
-                (snapshot["application_id"],),
-            ).fetchone()
-            if (
-                application is None
-                or application["jd_snapshot_id"] != snapshot_id
-            ):
-                raise ValueError("Selected job description changed")
-            self._require_pristine_application_packet(application)
-
-            existing = json.loads(snapshot["extracted_requirements_json"])
-            grouped = any(
-                key in existing
-                for key in (
-                    "raw_ai",
-                    "deterministic",
-                    "user_corrected",
-                    "uncertainty",
-                )
-            )
-            updated = {
-                "raw_ai": raw_ai,
-                "deterministic": (
-                    existing.get("deterministic", {}) if grouped else existing
-                ),
-                "user_corrected": existing.get("user_corrected", {}),
-                "uncertainty": uncertainty,
-            }
-            _safe_updated, serialized = persisted_json(updated)
-            connection.execute(
-                """
-                UPDATE jd_snapshots
-                SET extracted_requirements_json = ?
-                WHERE id = ?
-                """,
-                (serialized, snapshot_id),
-            )
-            invalidated_report_id = application["latest_report_id"]
-            if invalidated_report_id is not None:
-                invalidated_status = (
-                    ApplicationStatus.NEEDS_RESUME_UPDATE.value
-                    if application["selected_resume_version_id"] is not None
-                    else ApplicationStatus.DRAFT.value
-                )
-                connection.execute(
-                    """
-                    UPDATE applications
-                    SET latest_report_id = NULL, status = ?, updated_at = ?
-                    WHERE id = ?
-                    """,
-                    (invalidated_status, now, application["id"]),
-                )
-                self._write_audit(
-                    connection,
-                    "application.report_invalidated_by_jd_analysis",
-                    "application",
-                    application["id"],
-                    {"latest_report_id": invalidated_report_id},
-                    {
-                        "ai_task_id": task_id,
-                        "latest_report_id": None,
-                        "status": invalidated_status,
-                    },
-                )
-            self._write_audit(
-                connection,
-                "jd_snapshot.ai_requirements_updated",
-                "jd_snapshot",
-                snapshot_id,
-                {
-                    "requirements_sha256": sha256_text(
-                        snapshot["extracted_requirements_json"]
-                    )
-                },
-                {
-                    "ai_task_id": task_id,
-                    "requirements_sha256": sha256_text(serialized),
-                    "updated_at": now,
-                },
-            )
-        return self.get_jd_snapshot(snapshot_id)
+        raise ValueError("AI JD updates require the aggregate finalizer")
 
     def create_application(
         self,
@@ -2067,8 +1909,8 @@ class CareerOpsRepository:
         ai_task_id: str | None = None,
         claim_token: str | None = None,
     ) -> Report:
-        if (ai_task_id is None) != (claim_token is None):
-            raise ValueError("AI task ID and claim token must be provided together")
+        if ai_task_id is not None or claim_token is not None:
+            raise ValueError("AI reports require the aggregate finalizer")
         report_id = new_id("rep")
         blockers = risks.get("blockers", [])
         warnings = risks.get("warnings", [])
@@ -2095,20 +1937,6 @@ class CareerOpsRepository:
                 or application["jd_snapshot_id"] != jd_snapshot_id
             ):
                 raise ValueError("Report does not match the selected application packet")
-            if ai_task_id is not None and claim_token is not None:
-                self._require_active_ai_claim(connection, ai_task_id, claim_token)
-                owner = connection.execute(
-                    "SELECT application_id, task_type FROM ai_tasks WHERE id = ?",
-                    (ai_task_id,),
-                ).fetchone()
-                if (
-                    owner is None
-                    or owner["application_id"] != application_id
-                    or owner["task_type"] != "analyze_fit"
-                    or application["selected_resume_version_id"] != resume_version_id
-                    or application["jd_snapshot_id"] != jd_snapshot_id
-                ):
-                    raise ValueError("AI task cannot create this report")
             connection.execute(
                 """
                 INSERT INTO reports (

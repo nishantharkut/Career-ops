@@ -176,6 +176,9 @@ class AiOrchestrator:
                     "1",
                 )
             )
+            self._require_claim_heartbeat_healthy(
+                heartbeat_errors, heartbeat_lost
+            )
 
             try:
                 # The fence intentionally consumes an attempt if the process dies
@@ -188,11 +191,8 @@ class AiOrchestrator:
                     )
                 result = provider.run(request)
             except ProviderOutputError:
-                self._finish_claim_heartbeat(
-                    heartbeat_stop,
-                    heartbeat,
-                    heartbeat_errors,
-                    heartbeat_lost,
+                self._require_claim_heartbeat_healthy(
+                    heartbeat_errors, heartbeat_lost
                 )
                 return self._block_invalid_output(
                     task,
@@ -201,14 +201,14 @@ class AiOrchestrator:
                     expected_resume_version_id,
                 )
 
-            self._finish_claim_heartbeat(
-                heartbeat_stop,
-                heartbeat,
-                heartbeat_errors,
-                heartbeat_lost,
+            self._require_claim_heartbeat_healthy(
+                heartbeat_errors, heartbeat_lost
             )
 
             self._validate_result_metadata(config, availability, result)
+            self._require_claim_heartbeat_healthy(
+                heartbeat_errors, heartbeat_lost
+            )
             raw_bytes = self._provider_raw_bytes(result)
             raw_path = attempt_dir / "raw_output.json"
             self._atomic_write(raw_path, raw_bytes)
@@ -221,6 +221,9 @@ class AiOrchestrator:
                     raw_bytes,
                     "1",
                 )
+            )
+            self._require_claim_heartbeat_healthy(
+                heartbeat_errors, heartbeat_lost
             )
 
             verification = verify_task_output(
@@ -242,6 +245,9 @@ class AiOrchestrator:
                         "1",
                     )
                 )
+            self._require_claim_heartbeat_healthy(
+                heartbeat_errors, heartbeat_lost
+            )
             for finding in verification.findings:
                 findings.append(self._verifier_finding_spec(finding))
 
@@ -256,6 +262,9 @@ class AiOrchestrator:
                     artifacts,
                     findings,
                 )
+            self._require_claim_heartbeat_healthy(
+                heartbeat_errors, heartbeat_lost
+            )
             return self._finalize_attempt(
                 task,
                 claim_token,
@@ -312,15 +321,11 @@ class AiOrchestrator:
         return stop, heartbeat, errors, lost
 
     @staticmethod
-    def _finish_claim_heartbeat(
-        stop: Event,
-        heartbeat: Thread,
+    def _require_claim_heartbeat_healthy(
         errors: Sequence[BaseException],
         lost: Event,
     ) -> None:
-        stop.set()
-        heartbeat.join()
-        if heartbeat.is_alive() or errors or lost.is_set():
+        if errors or lost.is_set():
             raise RuntimeError("AI task claim heartbeat failed")
 
     @staticmethod

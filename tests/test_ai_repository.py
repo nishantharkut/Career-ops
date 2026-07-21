@@ -607,6 +607,44 @@ def test_ai_artifact_requires_task_attempt_path_and_unique_physical_path(
         )
 
 
+def test_ai_artifact_insert_race_rolls_back_database_row(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    repo = make_repo(tmp_path)
+    application = create_application(repo)
+    provider = create_provider(repo)
+    task = create_task(repo, application.id, provider.id)
+    claim = claim_task(repo, task.id)
+    path = attempt_file(repo, task.id, "raced.json")
+    original_bytes = b"original"
+    path.write_bytes(original_bytes)
+    original_require_claim = repo._require_active_ai_claim
+
+    def mutate_after_initial_digest(connection, task_id, claim_token):
+        original_require_claim(connection, task_id, claim_token)
+        path.write_bytes(b"mutated-after-digest")
+
+    monkeypatch.setattr(
+        repo, "_require_active_ai_claim", mutate_after_initial_digest
+    )
+
+    with pytest.raises(ValueError, match="integrity"):
+        repo.save_ai_artifact(
+            task.id,
+            claim,
+            "context",
+            path,
+            hashlib.sha256(original_bytes).hexdigest(),
+            "1",
+        )
+
+    with repo.connection() as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM ai_artifacts WHERE task_id = ?",
+            (task.id,),
+        ).fetchone()[0] == 0
+
+
 @pytest.mark.parametrize(
     ("artifact_type", "schema_version"),
     [
@@ -780,14 +818,10 @@ def test_lock_delayed_renewal_and_invocation_cannot_revive_expired_claim(
             assert future.result(timeout=2) is False
 
 
-@pytest.mark.parametrize("terminal_method", ["complete", "block", "fail"])
-def test_lock_delayed_terminal_transition_rejects_expired_claim(
-    tmp_path: Path,
-    terminal_method: str,
-):
+def test_lock_delayed_failure_rejects_expired_claim(tmp_path: Path):
     repo = CareerOpsRepository(
-        tmp_path / terminal_method / "careerops.db",
-        tmp_path / terminal_method / "vault",
+        tmp_path / "careerops.db",
+        tmp_path / "vault",
         claim_lease_seconds=15,
     )
     repo.initialize()
@@ -795,20 +829,11 @@ def test_lock_delayed_terminal_transition_rejects_expired_claim(
     provider = create_provider(repo)
     task = create_task(repo, application.id, provider.id)
     claim = claim_task(repo, task.id)
-    if terminal_method != "fail":
-        assert repo.begin_ai_task_invocation(task.id, claim) is True
-    callback = {
-        "complete": lambda: repo.complete_ai_task(task.id, claim),
-        "block": lambda: repo.block_ai_task(
-            task.id, claim, "verification_failed"
-        ),
-        "fail": lambda: repo.fail_ai_task(task.id, claim, "provider_error"),
-    }[terminal_method]
     transition_started = Event()
 
     def run_transition():
         transition_started.set()
-        return callback()
+        return repo.fail_ai_task(task.id, claim, "provider_error")
 
     with repo.connection() as blocker, ThreadPoolExecutor(max_workers=1) as pool:
         blocker.execute("BEGIN IMMEDIATE")
@@ -978,7 +1003,7 @@ def test_select_resume_rejects_change_after_submission(tmp_path: Path):
     assert repo.get_application(application.id).selected_resume_version_id == resume.id
 
 
-def test_public_jd_reanalysis_invalidates_current_report(tmp_path: Path):
+def test_public_jd_reanalysis_requires_aggregate_finalizer(tmp_path: Path):
     repo = make_repo(tmp_path)
     application = create_application(repo)
     resume = repo.create_resume_version(
@@ -1012,21 +1037,21 @@ def test_public_jd_reanalysis_invalidates_current_report(tmp_path: Path):
         ),
     )
     claim = claim_task(repo, task.id)
+    before_application = repo.get_application(application.id)
+    before_jd = repo.get_jd_snapshot(application.jd_snapshot_id)
 
-    repo.update_jd_requirements_from_ai(
-        snapshot_id=application.jd_snapshot_id,
-        task_id=task.id,
-        claim_token=claim,
-        raw_ai={"required_skills": ["Python"]},
-        uncertainty={"items": []},
-    )
+    with pytest.raises(ValueError, match="aggregate finalizer"):
+        repo.update_jd_requirements_from_ai(
+            snapshot_id=application.jd_snapshot_id,
+            task_id=task.id,
+            claim_token=claim,
+            raw_ai={"required_skills": ["Python"]},
+            uncertainty={"items": []},
+        )
 
-    updated = repo.get_application(application.id)
-    assert updated.latest_report_id is None
-    assert updated.status == "needs_resume_update"
+    assert repo.get_application(application.id) == before_application
+    assert repo.get_jd_snapshot(application.jd_snapshot_id) == before_jd
     assert repo.get_report(report.id).id == report.id
-    with pytest.raises(ValueError, match="current application report"):
-        repo.approve_application(application.id, report.id, "Reviewed")
 
 
 def test_public_ai_business_writes_reject_approved_packet(tmp_path: Path):
@@ -1040,7 +1065,7 @@ def test_public_ai_business_writes_reject_approved_packet(tmp_path: Path):
     before_application = repo.get_application(application.id)
     before_jd = repo.get_jd_snapshot(application.jd_snapshot_id)
 
-    with pytest.raises(ValueError, match="approved or submitted"):
+    with pytest.raises(ValueError, match="aggregate finalizer"):
         repo.update_jd_requirements_from_ai(
             snapshot_id=application.jd_snapshot_id,
             task_id=task.id,
@@ -1236,7 +1261,9 @@ def test_only_one_worker_can_claim_pending_task(tmp_path: Path):
     assert repo.get_ai_task(task.id).status == "running"
 
 
-def test_success_terminal_transitions_require_an_invocation_fence(tmp_path: Path):
+def test_legacy_success_terminal_shortcuts_require_aggregate_finalizer(
+    tmp_path: Path,
+):
     repo = make_repo(tmp_path)
     application = create_application(repo)
     provider = create_provider(repo)
@@ -1245,10 +1272,13 @@ def test_success_terminal_transitions_require_an_invocation_fence(tmp_path: Path
     completed_claim = claim_task(repo, completed_task.id)
     blocked_claim = claim_task(repo, blocked_task.id)
 
-    with pytest.raises(ValueError, match="claim"):
+    with pytest.raises(ValueError, match="aggregate finalizer"):
         repo.complete_ai_task(completed_task.id, completed_claim)
-    with pytest.raises(ValueError, match="claim"):
+    with pytest.raises(ValueError, match="aggregate finalizer"):
         repo.block_ai_task(blocked_task.id, blocked_claim, "verification_failed")
+
+    assert repo.get_ai_task(completed_task.id).status == "running"
+    assert repo.get_ai_task(blocked_task.id).status == "running"
 
 
 def test_expired_claim_requeues_but_invocation_fence_survives(tmp_path: Path):
@@ -1275,13 +1305,40 @@ def test_expired_claim_requeues_but_invocation_fence_survives(tmp_path: Path):
 def test_task_start_complete_and_failure_are_durable_and_audited(tmp_path: Path):
     repo = make_repo(tmp_path)
     application = create_application(repo)
+    resume = repo.create_resume_version(
+        name="Current resume",
+        role_family="software",
+        tex_path=tmp_path / "resume.tex",
+        tex_sha256="a" * 64,
+    )
+    repo.select_resume(application.id, resume.id)
     provider = create_provider(repo)
     completed_task = create_task(repo, application.id, provider.id)
     failed_task = create_task(repo, application.id, provider.id)
 
     completed_token = repo.start_ai_task(completed_task.id)
     assert repo.begin_ai_task_invocation(completed_task.id, completed_token) is True
-    completed = repo.complete_ai_task(completed_task.id, completed_token)
+    for artifact_type in ("context", "raw_output", "validated_output"):
+        write_attempt_artifact(
+            repo,
+            completed_task.id,
+            completed_token,
+            artifact_type,
+            artifact_type.encode("ascii"),
+        )
+    completed = repo.finalize_ai_task_attempt(
+        task_id=completed_task.id,
+        claim_token=completed_token,
+        terminal_status="completed",
+        error_summary="",
+        expected_jd_snapshot_id=application.jd_snapshot_id,
+        expected_resume_version_id=resume.id,
+        findings=[],
+        success_payload={
+            "fit": {"score": 80},
+            "risks": {"blockers": [], "warnings": []},
+        },
+    )
     failed_token = repo.start_ai_task(failed_task.id)
     failed = repo.fail_ai_task(
         failed_task.id, failed_token, "api_key=top-secret provider unavailable"
@@ -1750,7 +1807,7 @@ def test_public_report_and_jd_json_reject_nonfinite_and_oversize(tmp_path: Path)
     task = create_bound_task(repo, application.id, provider.id, "analyze_jd")
     claim = claim_task(repo, task.id)
     before = repo.get_jd_snapshot(application.jd_snapshot_id)
-    with pytest.raises(ValueError, match="valid JSON"):
+    with pytest.raises(ValueError, match="aggregate finalizer"):
         repo.update_jd_requirements_from_ai(
             snapshot_id=application.jd_snapshot_id,
             task_id=task.id,
@@ -2046,13 +2103,16 @@ def test_requeue_invalidates_stale_worker_claim(tmp_path: Path):
     assert isinstance(current_token, str)
     assert current_token != stale_token
 
-    with pytest.raises(ValueError, match="claim"):
+    with pytest.raises(ValueError, match="aggregate finalizer"):
         worker_a.complete_ai_task(task.id, stale_token)
     with pytest.raises(ValueError, match="claim"):
         worker_a.fail_ai_task(task.id, stale_token, "provider_unavailable")
 
     assert worker_b.begin_ai_task_invocation(task.id, current_token) is True
-    assert worker_b.complete_ai_task(task.id, current_token).status == "completed"
+    assert (
+        worker_b.fail_ai_task(task.id, current_token, "provider_unavailable").status
+        == "failed"
+    )
 
 
 def test_requeue_invalidates_stale_artifact_and_finding_writes(tmp_path: Path):
@@ -2141,11 +2201,26 @@ def test_requeue_invalidates_stale_artifact_and_finding_writes(tmp_path: Path):
 def test_competing_terminal_updates_allow_only_one_claim_owner_update(tmp_path: Path):
     repo = make_repo(tmp_path)
     application = create_application(repo)
+    resume = repo.create_resume_version(
+        name="Current resume",
+        role_family="software",
+        tex_path=tmp_path / "resume.tex",
+        tex_sha256="a" * 64,
+    )
+    repo.select_resume(application.id, resume.id)
     provider = create_provider(repo)
     task = create_task(repo, application.id, provider.id)
     claim_token = repo.claim_ai_task(task.id)
     assert isinstance(claim_token, str)
     assert repo.begin_ai_task_invocation(task.id, claim_token) is True
+    for artifact_type in ("context", "raw_output", "validated_output"):
+        write_attempt_artifact(
+            repo,
+            task.id,
+            claim_token,
+            artifact_type,
+            artifact_type.encode("ascii"),
+        )
     workers = [
         CareerOpsRepository(repo.database_path, repo.vault_path),
         CareerOpsRepository(repo.database_path, repo.vault_path),
@@ -2154,7 +2229,19 @@ def test_competing_terminal_updates_allow_only_one_claim_owner_update(tmp_path: 
 
     def complete():
         barrier.wait()
-        return workers[0].complete_ai_task(task.id, claim_token)
+        return workers[0].finalize_ai_task_attempt(
+            task_id=task.id,
+            claim_token=claim_token,
+            terminal_status="completed",
+            error_summary="",
+            expected_jd_snapshot_id=application.jd_snapshot_id,
+            expected_resume_version_id=resume.id,
+            findings=[],
+            success_payload={
+                "fit": {"score": 80},
+                "risks": {"blockers": [], "warnings": []},
+            },
+        )
 
     def fail():
         barrier.wait()

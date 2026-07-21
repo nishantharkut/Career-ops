@@ -285,7 +285,9 @@ def select_resume(repo: CareerOpsRepository, application_id: str, text: str = "P
     return resume
 
 
-def test_repository_blocks_only_the_active_claim_and_audits_it(tmp_path: Path):
+def test_repository_aggregate_finalizer_blocks_active_claim_and_audits_it(
+    tmp_path: Path,
+):
     repo = make_repo(tmp_path)
     application = create_application(repo)
     config = create_provider_config(repo)
@@ -303,8 +305,30 @@ def test_repository_blocks_only_the_active_claim_and_audits_it(tmp_path: Path):
     )
     claim_token = repo.start_ai_task(task.id)
     assert repo.begin_ai_task_invocation(task.id, claim_token) is True
+    attempt = repo.vault_path / "ai-tasks" / task.id / "attempt-test"
+    attempt.mkdir(parents=True)
+    for artifact_type in ("context", "raw_output", "validated_output"):
+        content = artifact_type.encode("ascii")
+        path = attempt / f"{artifact_type}.json"
+        path.write_bytes(content)
+        repo.save_ai_artifact(
+            task.id,
+            claim_token,
+            artifact_type,
+            path,
+            hashlib.sha256(content).hexdigest(),
+            "1",
+        )
 
-    blocked = repo.block_ai_task(task.id, claim_token, "verification_failed")
+    blocked = repo.finalize_ai_task_attempt(
+        task_id=task.id,
+        claim_token=claim_token,
+        terminal_status="blocked",
+        error_summary="verification_failed",
+        expected_jd_snapshot_id=application.jd_snapshot_id,
+        expected_resume_version_id=None,
+        findings=[],
+    )
 
     assert blocked.status == "blocked"
     assert blocked.completed_at is not None
@@ -312,8 +336,72 @@ def test_repository_blocks_only_the_active_claim_and_audits_it(tmp_path: Path):
     event = repo.list_audit_events()[-1]
     assert event.event_type == "ai_task.blocked"
     assert event.after_json["status"] == "blocked"
-    with pytest.raises(ValueError, match="claim"):
+    with pytest.raises(ValueError, match="aggregate finalizer"):
         repo.complete_ai_task(task.id, claim_token)
+
+
+@pytest.mark.parametrize(
+    "shortcut", ["complete", "block", "update_jd", "save_report"]
+)
+def test_public_ai_shortcuts_cannot_bypass_aggregate_finalization(
+    tmp_path: Path, shortcut: str
+):
+    from careerops.ai.orchestrator import AiOrchestrator
+
+    repo = make_repo(tmp_path)
+    application = create_application(repo)
+    resume = select_resume(repo, application.id, "Python developer")
+    config = create_provider_config(repo)
+    provider = AvailabilityOnlyProvider(availability())
+    orchestrator = AiOrchestrator(repo, {config.id: provider})
+    task_type = "analyze_jd" if shortcut in {"block", "update_jd"} else "analyze_fit"
+    task = orchestrator.enqueue(application.id, task_type, config.id)
+    claim_token = repo.start_ai_task(task.id)
+    assert repo.begin_ai_task_invocation(task.id, claim_token) is True
+    before_application = repo.get_application(application.id)
+    before_jd = repo.get_jd_snapshot(application.jd_snapshot_id)
+
+    with pytest.raises(ValueError, match="aggregate finalizer"):
+        if shortcut == "complete":
+            repo.complete_ai_task(task.id, claim_token)
+        elif shortcut == "block":
+            repo.block_ai_task(task.id, claim_token, "verification_failed")
+        elif shortcut == "update_jd":
+            repo.update_jd_requirements_from_ai(
+                snapshot_id=application.jd_snapshot_id,
+                task_id=task.id,
+                claim_token=claim_token,
+                raw_ai={
+                    "required_skills": ["FORGED"],
+                    "provenance": {"provider_kind": "forged"},
+                },
+                uncertainty={"provenance": {"ai_task_id": "forged"}},
+            )
+        else:
+            repo.save_report(
+                application_id=application.id,
+                resume_version_id=resume.id,
+                jd_snapshot_id=application.jd_snapshot_id,
+                fit={
+                    "score": 100,
+                    "provenance": {"provider_kind": "forged"},
+                },
+                risks={"blockers": [], "warnings": []},
+                ai_task_id=task.id,
+                claim_token=claim_token,
+            )
+
+    assert provider.calls == 0
+    assert repo.get_ai_task(task.id).status == "running"
+    assert repo.list_ai_artifacts(task.id) == []
+    assert repo.list_application_versions(application.id) == []
+    assert repo.get_application(application.id) == before_application
+    assert repo.get_jd_snapshot(application.jd_snapshot_id) == before_jd
+    with repo.connection() as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM reports WHERE application_id = ?",
+            (application.id,),
+        ).fetchone()[0] == 0
 
 
 def test_enqueue_persists_pending_task_without_running_provider(tmp_path: Path):
@@ -379,7 +467,7 @@ def test_heartbeat_renewal_exception_fails_closed(tmp_path: Path, monkeypatch):
 
     assert result.status == "failed"
     assert result.error_summary == "provider_error"
-    assert provider.calls == 1
+    assert provider.calls == 0
     assert repo.list_application_versions(application.id) == []
 
 
@@ -452,8 +540,9 @@ def test_expired_contended_heartbeat_requeues_without_reinvoking_provider(
     config = create_provider_config(repo)
     provider_started = Event()
     release_provider = Event()
-    contend_renewal = Event()
     renewal_entered = Event()
+    renewal_may_proceed = Event()
+    renewal_db_started = Event()
     renewal_finished = Event()
     renewal_results: list[bool] = []
     original_renew = repo.renew_ai_task_claim
@@ -465,13 +554,14 @@ def test_expired_contended_heartbeat_requeues_without_reinvoking_provider(
     )
 
     def renew_under_contention(task_id: str, claim_token: str) -> bool:
-        contended = contend_renewal.is_set()
-        if contended:
-            renewal_entered.set()
+        if not provider_started.is_set():
+            return original_renew(task_id, claim_token)
+        renewal_entered.set()
+        assert renewal_may_proceed.wait(10)
+        renewal_db_started.set()
         renewed = original_renew(task_id, claim_token)
-        if contended:
-            renewal_results.append(renewed)
-            renewal_finished.set()
+        renewal_results.append(renewed)
+        renewal_finished.set()
         return renewed
 
     def wait_in_provider(_request: Any, _calls: int) -> None:
@@ -487,20 +577,23 @@ def test_expired_contended_heartbeat_requeues_without_reinvoking_provider(
         future = executor.submit(orchestrator.run, task.id)
         assert provider_started.wait(5)
         try:
+            assert renewal_entered.wait(5)
             with repo.connection() as blocker:
                 blocker.execute("BEGIN IMMEDIATE")
-                contend_renewal.set()
-                assert renewal_entered.wait(5)
                 blocker.execute(
                     "UPDATE ai_tasks SET claim_expires_at = ? WHERE id = ?",
                     ("1970-01-01T00:00:00+00:00", task.id),
                 )
+                renewal_may_proceed.set()
+                assert renewal_db_started.wait(5)
                 blocker.commit()
                 assert renewal_finished.wait(5)
         finally:
+            renewal_may_proceed.set()
             release_provider.set()
         interrupted = future.result(timeout=5)
 
+    monkeypatch.setattr(repo, "renew_ai_task_claim", original_renew)
     recovered = orchestrator.run(task.id)
 
     assert renewal_results == [False]
@@ -508,6 +601,157 @@ def test_expired_contended_heartbeat_requeues_without_reinvoking_provider(
     assert recovered.status == "failed"
     assert recovered.error_summary == "provider_error"
     assert provider.calls == 1
+    assert repo.list_application_versions(application.id) == []
+
+
+def test_heartbeat_renews_through_post_provider_processing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    from careerops.ai.orchestrator import AiOrchestrator
+
+    repo = CareerOpsRepository(
+        tmp_path / "careerops.db",
+        tmp_path / "vault",
+        claim_lease_seconds=15,
+    )
+    repo.initialize()
+    application = create_application(repo)
+    config = create_provider_config(repo)
+    provider_returned = Event()
+    post_provider_renewed = Event()
+    original_renew = repo.renew_ai_task_claim
+
+    monkeypatch.setattr(
+        type(repo),
+        "claim_heartbeat_interval",
+        property(lambda _repository: 0.05),
+    )
+
+    def record_post_provider_renewal(task_id: str, claim_token: str) -> bool:
+        renewed = original_renew(task_id, claim_token)
+        if renewed and provider_returned.is_set():
+            post_provider_renewed.set()
+        return renewed
+
+    def finish_provider(_request: Any, _calls: int) -> None:
+        provider_returned.set()
+
+    monkeypatch.setattr(
+        repo, "renew_ai_task_claim", record_post_provider_renewal
+    )
+    provider = ScriptedProvider(availability(), on_run=finish_provider)
+    orchestrator = AiOrchestrator(repo, {config.id: provider})
+    original_validate = orchestrator._validate_result_metadata
+
+    def wait_for_post_provider_renewal(config, availability, result) -> None:
+        assert provider_returned.is_set()
+        assert post_provider_renewed.wait(5)
+        original_validate(config, availability, result)
+
+    monkeypatch.setattr(
+        orchestrator, "_validate_result_metadata", wait_for_post_provider_renewal
+    )
+    task = orchestrator.enqueue(application.id, "analyze_jd", config.id)
+
+    completed = orchestrator.run(task.id)
+
+    assert completed.status == "completed"
+    assert provider.calls == 1
+    assert {artifact.artifact_type for artifact in repo.list_ai_artifacts(task.id)} == {
+        "context",
+        "raw_output",
+        "validated_output",
+    }
+    assert len(repo.list_application_versions(application.id)) == 1
+
+
+def test_post_provider_heartbeat_loss_requeues_and_preserves_invocation_fence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    from careerops.ai.orchestrator import AiOrchestrator
+
+    repo = CareerOpsRepository(
+        tmp_path / "careerops.db",
+        tmp_path / "vault",
+        claim_lease_seconds=15,
+    )
+    repo.initialize()
+    application = create_application(repo)
+    config = create_provider_config(repo)
+    post_processing_entered = Event()
+    release_processing = Event()
+    renewal_entered = Event()
+    renewal_may_proceed = Event()
+    renewal_db_started = Event()
+    renewal_finished = Event()
+    renewal_results: list[bool] = []
+    original_renew = repo.renew_ai_task_claim
+
+    monkeypatch.setattr(
+        type(repo),
+        "claim_heartbeat_interval",
+        property(lambda _repository: 0.05),
+    )
+
+    def renew_under_contention(task_id: str, claim_token: str) -> bool:
+        if not post_processing_entered.is_set():
+            return original_renew(task_id, claim_token)
+        renewal_entered.set()
+        assert renewal_may_proceed.wait(10)
+        renewal_db_started.set()
+        renewed = original_renew(task_id, claim_token)
+        renewal_results.append(renewed)
+        renewal_finished.set()
+        return renewed
+
+    monkeypatch.setattr(repo, "renew_ai_task_claim", renew_under_contention)
+    provider = ScriptedProvider(availability())
+    orchestrator = AiOrchestrator(repo, {config.id: provider})
+    original_validate = orchestrator._validate_result_metadata
+
+    def pause_post_provider_processing(config, availability, result) -> None:
+        post_processing_entered.set()
+        assert release_processing.wait(10)
+        original_validate(config, availability, result)
+
+    monkeypatch.setattr(
+        orchestrator,
+        "_validate_result_metadata",
+        pause_post_provider_processing,
+    )
+    task = orchestrator.enqueue(application.id, "analyze_jd", config.id)
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(orchestrator.run, task.id)
+        assert post_processing_entered.wait(5)
+        try:
+            assert renewal_entered.wait(5)
+            with repo.connection() as blocker:
+                blocker.execute("BEGIN IMMEDIATE")
+                blocker.execute(
+                    "UPDATE ai_tasks SET claim_expires_at = ? WHERE id = ?",
+                    ("1970-01-01T00:00:00+00:00", task.id),
+                )
+                renewal_may_proceed.set()
+                assert renewal_db_started.wait(5)
+                blocker.commit()
+                assert renewal_finished.wait(5)
+        finally:
+            renewal_may_proceed.set()
+            release_processing.set()
+        interrupted = future.result(timeout=5)
+
+    monkeypatch.setattr(repo, "renew_ai_task_claim", original_renew)
+    recovered = orchestrator.run(task.id)
+
+    assert renewal_results == [False]
+    assert interrupted.status == "pending"
+    assert recovered.status == "failed"
+    assert recovered.error_summary == "provider_error"
+    assert provider.calls == 1
+    assert [
+        artifact.artifact_type for artifact in repo.list_ai_artifacts(task.id)
+    ] == ["context"]
     assert repo.list_application_versions(application.id) == []
 
 
