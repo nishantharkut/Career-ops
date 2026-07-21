@@ -1,6 +1,7 @@
 from pathlib import Path
 
 from fastapi.testclient import TestClient
+import pytest
 
 from apps.api.careerops_api.main import create_app
 from careerops.core.repository import CareerOpsRepository
@@ -103,3 +104,62 @@ def test_health_endpoint(tmp_path: Path):
 
     assert response.status_code == 200
     assert response.json() == {"status": "ok", "database": "ok"}
+
+
+def test_resume_upload_ignores_traversal_filename_and_uses_fixed_owned_name(tmp_path: Path):
+    client = make_client(tmp_path)
+    application = client.post(
+        "/applications",
+        json={
+            "company": "Example Corp",
+            "role_title": "Engineer",
+            "jd_text": "Company: Example Corp\nTitle: Engineer",
+        },
+    ).json()
+    outside = tmp_path / "outside.tex"
+
+    response = client.post(
+        f"/applications/{application['id']}/resume",
+        data={"name": "Resume", "role_family": "software"},
+        files={"tex_file": ("../../outside.tex", b"valid latex", "application/x-tex")},
+    )
+
+    assert response.status_code == 201
+    assert not outside.exists()
+    uploaded = list((tmp_path / "vault" / "resumes").glob("upload_*/resume.tex"))
+    assert len(uploaded) == 1
+    assert uploaded[0].read_bytes() == b"valid latex"
+    assert "tex_path" not in response.json()
+
+
+@pytest.mark.parametrize(
+    ("content", "expected_status"),
+    [
+        (b"x" * 2_000_001, 413),
+        (b"\\documentclass{article}\n\xff", 422),
+    ],
+    ids=["oversize", "invalid-utf8"],
+)
+def test_resume_upload_rejects_oversize_or_invalid_utf8_and_cleans_partial_directory(
+    tmp_path: Path, content: bytes, expected_status: int
+):
+    client = make_client(tmp_path)
+    application = client.post(
+        "/applications",
+        json={
+            "company": "Example Corp",
+            "role_title": "Engineer",
+            "jd_text": "Company: Example Corp\nTitle: Engineer",
+        },
+    ).json()
+    resume_root = tmp_path / "vault" / "resumes"
+    before = set(resume_root.iterdir())
+
+    response = client.post(
+        f"/applications/{application['id']}/resume",
+        data={"name": "Resume", "role_family": "software"},
+        files={"tex_file": ("resume.tex", content, "application/x-tex")},
+    )
+
+    assert response.status_code == expected_status
+    assert set(resume_root.iterdir()) == before

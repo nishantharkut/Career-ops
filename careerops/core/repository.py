@@ -1990,6 +1990,130 @@ class CareerOpsRepository:
     ) -> JobDescriptionSnapshot:
         raise ValueError("AI JD updates require the aggregate finalizer")
 
+    def update_user_corrected_requirements(
+        self,
+        application_id: str,
+        user_corrected: Mapping[str, Any],
+    ) -> JobDescriptionSnapshot:
+        safe_user_corrected, _serialized_user_corrected = persisted_json(
+            dict(user_corrected)
+        )
+        if not isinstance(safe_user_corrected, dict):
+            raise ValueError("User-corrected requirements must be an object")
+        with self.connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            now = utc_now()
+            application = connection.execute(
+                "SELECT * FROM applications WHERE id = ?", (application_id,)
+            ).fetchone()
+            if application is None:
+                raise KeyError("No application with that ID")
+            self._require_pristine_application_packet(application)
+            snapshot = connection.execute(
+                "SELECT * FROM jd_snapshots WHERE id = ?",
+                (application["jd_snapshot_id"],),
+            ).fetchone()
+            if snapshot is None or snapshot["application_id"] != application_id:
+                raise ValueError("Application job description ownership is invalid")
+            try:
+                existing = json.loads(snapshot["extracted_requirements_json"])
+            except (TypeError, json.JSONDecodeError) as exc:
+                raise ValueError("Stored requirements are invalid") from exc
+            if not isinstance(existing, dict):
+                raise ValueError("Stored requirements are invalid")
+            grouped = any(
+                key in existing
+                for key in (
+                    "raw_ai",
+                    "deterministic",
+                    "user_corrected",
+                    "uncertainty",
+                )
+            )
+            authoritative_groups = {
+                "raw_ai": existing.get("raw_ai", {}) if grouped else {},
+                "deterministic": (
+                    existing.get("deterministic", {}) if grouped else existing
+                ),
+                "uncertainty": existing.get("uncertainty", {}) if grouped else {},
+            }
+            if not all(
+                isinstance(value, dict) for value in authoritative_groups.values()
+            ):
+                raise ValueError("Stored requirement groups are invalid")
+            updated = {
+                "raw_ai": authoritative_groups["raw_ai"],
+                "deterministic": authoritative_groups["deterministic"],
+                "user_corrected": safe_user_corrected,
+                "uncertainty": authoritative_groups["uncertainty"],
+            }
+            _safe_updated, serialized = persisted_json(updated)
+            connection.execute(
+                """
+                UPDATE jd_snapshots
+                SET extracted_requirements_json = ?
+                WHERE id = ? AND application_id = ?
+                """,
+                (serialized, snapshot["id"], application_id),
+            )
+            invalidated_report_id = application["latest_report_id"]
+            if invalidated_report_id is not None:
+                status = (
+                    ApplicationStatus.NEEDS_RESUME_UPDATE.value
+                    if application["selected_resume_version_id"] is not None
+                    else ApplicationStatus.DRAFT.value
+                )
+                connection.execute(
+                    """
+                    UPDATE applications
+                    SET latest_report_id = NULL, approval_id = NULL,
+                        status = ?, updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (status, now, application_id),
+                )
+                self._write_audit(
+                    connection,
+                    "application.report_invalidated_by_user_requirements",
+                    "application",
+                    application_id,
+                    {"latest_report_id": invalidated_report_id},
+                    {"latest_report_id": None, "status": status},
+                )
+            else:
+                connection.execute(
+                    "UPDATE applications SET updated_at = ? WHERE id = ?",
+                    (now, application_id),
+                )
+            version_id, version_number = self._insert_application_version(
+                connection=connection,
+                application_id=application_id,
+                event_type="requirements.user_corrected_updated",
+                snapshot={
+                    "invalidated_report_id": invalidated_report_id,
+                    "jd_snapshot_id": snapshot["id"],
+                    "user_corrected": safe_user_corrected,
+                },
+                now=now,
+            )
+            self._write_audit(
+                connection,
+                "jd_snapshot.user_requirements_updated",
+                "jd_snapshot",
+                snapshot["id"],
+                {
+                    "requirements_sha256": sha256_text(
+                        snapshot["extracted_requirements_json"]
+                    )
+                },
+                {
+                    "application_version_id": version_id,
+                    "requirements_sha256": sha256_text(serialized),
+                    "version_number": version_number,
+                },
+            )
+        return self.get_jd_snapshot(application["jd_snapshot_id"])
+
     def create_application(
         self,
         *,
