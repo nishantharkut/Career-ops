@@ -5,6 +5,7 @@ import hashlib
 import json
 from pathlib import Path
 import re
+import unicodedata
 from threading import Lock
 from types import MappingProxyType
 from typing import Any, Iterable, Mapping
@@ -283,7 +284,7 @@ def _profile_facts(
     if any(
         fact["verification_state"] not in VERIFICATION_STATES
         or fact["privacy_level"] not in PRIVACY_LEVELS
-        or not fact["value"].strip()
+        or not _has_visible_text(fact["value"])
         for fact in facts
     ):
         raise ContextBuildError("Context profile fact state was invalid")
@@ -295,6 +296,13 @@ def _profile_facts(
         if fact["privacy_level"] == "public"
         and fact["verification_state"] in {"verified", "user_stated"}
     ]
+
+
+def _has_visible_text(text: str) -> bool:
+    return any(
+        unicodedata.category(character)[0] not in {"C", "M", "Z"}
+        for character in unicodedata.normalize("NFKC", text)
+    )
 
 
 def _evidence(

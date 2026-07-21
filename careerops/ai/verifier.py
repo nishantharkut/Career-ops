@@ -80,7 +80,10 @@ _RISK_CODES = {
     "NDA-sensitive wording": "nda_sensitive_wording",
     "Unsupported title": "unsafe_title",
 }
-_SENTENCE_PATTERN = re.compile(r"[^.!?\n]+(?:[.!?]+|\n|$)")
+_SENTENCE_PATTERN = re.compile(
+    r"[^.!?\r\n\u0085\u2028\u2029]+"
+    r"(?:[.!?]+|[\r\n\u0085\u2028\u2029]+|$)"
+)
 _INJECTION_PATTERN = re.compile(
     r"(?i)(?:\b(?:ignore|disregard|override|forget)\b.{0,100}"
     r"\b(?:instruction|prompt|rule|message)s?\b|"
@@ -162,10 +165,22 @@ _DEFAULT_IGNORABLE_RANGES = (
     (0xFE00, 0xFE0F),
     (0xFEFF, 0xFEFF),
     (0xFFA0, 0xFFA0),
+    (0xFFF0, 0xFFF8),
     (0x1BCA0, 0x1BCA3),
     (0x1D173, 0x1D17A),
     (0xE0000, 0xE0FFF),
 )
+_LINE_SEPARATORS = "\r\n\x85\u2028\u2029"
+_LINE_SEPARATORS_TO_SPACE = str.maketrans(
+    {ord(character): " " for character in _LINE_SEPARATORS}
+)
+_LINE_SEPARATORS_REMOVED = str.maketrans(
+    {ord(character): None for character in _LINE_SEPARATORS}
+)
+_METRIC_LEXEME_EQUIVALENTS = {
+    "served": "serve",
+    "serving": "serve",
+}
 _METRIC_WRAPPER_LEXEMES = frozenset(
     {
         "a",
@@ -445,7 +460,7 @@ def _claim_records(
             if (
                 not claim_id
                 or text is None
-                or not text.strip()
+                or not _has_visible_text(text)
                 or state not in VERIFICATION_STATES
                 or privacy not in PRIVACY_LEVELS
             ):
@@ -465,6 +480,26 @@ def _normalize_text(text: str) -> str:
         character
         for character in normalized
         if not _is_default_ignorable(character)
+    )
+
+
+def _has_visible_text(text: str) -> bool:
+    return any(
+        unicodedata.category(character)[0] not in {"C", "M", "Z"}
+        for character in unicodedata.normalize("NFKC", text)
+    )
+
+
+def _security_text_variants(text: str) -> tuple[str, ...]:
+    normalized = _normalize_text(text)
+    return tuple(
+        dict.fromkeys(
+            (
+                normalized,
+                normalized.translate(_LINE_SEPARATORS_TO_SPACE),
+                normalized.translate(_LINE_SEPARATORS_REMOVED),
+            )
+        )
     )
 
 
@@ -606,19 +641,14 @@ def _metric_statement_matches(statement: str, source: str) -> bool:
 def _metric_relation_lexemes(text: str) -> tuple[str, ...]:
     lexemes = _lexemes(text) or ()
     return tuple(
-        _metric_stem(token)
+        _canonical_metric_lexeme(token)
         for token in lexemes
         if token not in _METRIC_WRAPPER_LEXEMES
     )
 
 
-def _metric_stem(token: str) -> str:
-    for suffix in ("ing", "ed"):
-        if token.endswith(suffix) and len(token) > len(suffix) + 2:
-            return token[: -len(suffix)]
-    if token.endswith("s") and len(token) > 4:
-        return token[:-1]
-    return token
+def _canonical_metric_lexeme(token: str) -> str:
+    return _METRIC_LEXEME_EQUIVALENTS.get(token, token)
 
 
 def _resolve_evidence(
@@ -685,26 +715,26 @@ def _risk_findings(
     item_index: int | None = None,
     claim_id: str | None = None,
 ) -> list[VerifierFinding]:
-    normalized_text = _normalize_text(text)
-    report = evaluate_risks(
-        resume_text=normalized_text,
-        claims=[
-            {
-                "text": normalized_text,
-                "verification_state": (
-                    "verified" if metric_supported else "needs_verification"
-                ),
-                "public_safe": not private_material,
-            }
-        ],
-    )
     findings: list[VerifierFinding] = []
-    for issue in report.blockers:
-        code = _RISK_CODES.get(issue.label)
-        if code is not None:
-            findings.append(
-                _finding(code, item_index=item_index, claim_id=claim_id)
-            )
+    for normalized_text in _security_text_variants(text):
+        report = evaluate_risks(
+            resume_text=normalized_text,
+            claims=[
+                {
+                    "text": normalized_text,
+                    "verification_state": (
+                        "verified" if metric_supported else "needs_verification"
+                    ),
+                    "public_safe": not private_material,
+                }
+            ],
+        )
+        for issue in report.blockers:
+            code = _RISK_CODES.get(issue.label)
+            if code is not None:
+                findings.append(
+                    _finding(code, item_index=item_index, claim_id=claim_id)
+                )
     return findings
 
 
@@ -744,6 +774,12 @@ def _injection_fragments(source_values: Sequence[Any]) -> tuple[str, ...] | None
 
     fragments: set[str] = set()
     for source in source_texts:
+        for variant in _security_text_variants(source):
+            normalized_variant = _normalized_text(variant)
+            fragments.update(
+                _normalized_text(match.group(0))
+                for match in _INJECTION_PATTERN.finditer(normalized_variant)
+            )
         sentences = _sentences(source)
         if sentences is None:
             return None
@@ -765,11 +801,13 @@ def _has_injection_echo(
     output_text = _output_text(output)
     if output_text is None:
         return None
-    generated = _normalized_text(output_text)
+    generated = tuple(
+        _normalized_text(variant) for variant in _security_text_variants(output_text)
+    )
     fragments = _injection_fragments(source_values)
     if fragments is None:
         return None
-    return any(fragment in generated for fragment in fragments)
+    return any(fragment in variant for fragment in fragments for variant in generated)
 
 
 def _context_source_values(context: Mapping[str, Any]) -> tuple[Any, ...]:
@@ -882,8 +920,7 @@ def _material_overlap(
     shorter_size = min(sum(text_counts.values()), sum(blocked_counts.values()))
     overlap = sum((text_counts & blocked_counts).values())
     if shorter_size == 1:
-        token = next(iter(text_counts & blocked_counts), "")
-        return overlap == 1 and len(token) >= 4
+        return overlap == 1
     return overlap == shorter_size or (
         overlap >= 2 and overlap * 2 >= shorter_size
     )
@@ -1327,6 +1364,11 @@ def verify_claim_review(
             claim_id=claim.id,
         )
         findings.extend(reference_findings)
+        claim_supported = _statement_supported(claim.text, resolved)
+        if decision.decision == "unsupported" and claim_supported:
+            findings.append(
+                _finding("unsupported_claim", item_index=index, claim_id=claim.id)
+            )
         if decision.decision == "supported":
             claim_private = (
                 claim.privacy_level != "public"
@@ -1336,9 +1378,7 @@ def verify_claim_review(
                 findings.append(
                     _finding("private_claim", item_index=index, claim_id=claim.id)
                 )
-            elif claim.verification_state == "rejected" or not _statement_supported(
-                claim.text, resolved
-            ):
+            elif claim.verification_state == "rejected" or not claim_supported:
                 findings.append(
                     _finding("unsupported_claim", item_index=index, claim_id=claim.id)
                 )
