@@ -268,6 +268,39 @@ def test_resume_upload_cleans_file_when_application_becomes_approved_before_tran
     assert after.selected_resume_version_id == selected.id
 
 
+def test_resume_upload_success_does_not_depend_on_post_commit_public_getter(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    repo, client = make_repo_and_client(tmp_path)
+    application = repo.create_application(
+        company="Example Corp",
+        role_title="Engineer",
+        location="Remote",
+        source_url="",
+        jd_text="Python role",
+    )
+
+    def fail_public_reload(_resume_version_id: str):
+        raise RuntimeError("post-commit resume reload must not run")
+
+    monkeypatch.setattr(repo, "get_resume_version", fail_public_reload)
+
+    response = client.post(
+        f"/applications/{application.id}/resume",
+        data={"name": "Atomic resume", "role_family": "software"},
+        files={"tex_file": ("resume.tex", b"valid latex", "application/x-tex")},
+    )
+
+    assert response.status_code == 201
+    verifier = CareerOpsRepository(repo.database_path, repo.vault_path)
+    selected_id = verifier.get_application(application.id).selected_resume_version_id
+    assert selected_id == response.json()["id"]
+    selected = verifier.get_resume_version(selected_id)
+    assert selected.tex_path.is_file()
+    assert selected.tex_path.read_bytes() == b"valid latex"
+    assert selected.tex_sha256 == hashlib.sha256(b"valid latex").hexdigest()
+
+
 @pytest.mark.parametrize(
     "claims",
     [

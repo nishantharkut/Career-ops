@@ -4412,6 +4412,32 @@ def test_atomic_evidence_create_and_link_rolls_back_item_when_link_audit_fails(
     assert repo.list_audit_events() == before_events
 
 
+def test_atomic_evidence_create_and_link_does_not_use_post_commit_public_getter(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    repo = make_repo(tmp_path)
+    application = create_application(repo)
+
+    def fail_public_reload(_evidence_item_id: str):
+        raise RuntimeError("post-commit evidence reload must not run")
+
+    monkeypatch.setattr(repo, "get_evidence_item", fail_public_reload)
+
+    evidence = repo.create_and_link_evidence_item(
+        application_id=application.id,
+        claim_text="Built a Python service",
+        evidence_type="project",
+        source_url="https://example.com/project",
+        verification_state="verified",
+        privacy_level="public",
+    )
+
+    verifier = CareerOpsRepository(repo.database_path, repo.vault_path)
+    persisted = verifier.get_evidence_item(evidence.id)
+    assert persisted == evidence
+    assert verifier.list_application_evidence(application.id) == [evidence]
+
+
 def test_application_versions_are_append_only_and_monotonic(tmp_path: Path):
     repo = make_repo(tmp_path)
     application = create_application(repo)

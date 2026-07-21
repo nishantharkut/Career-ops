@@ -1918,7 +1918,13 @@ class CareerOpsRepository:
                 None,
                 {"evidence_item_id": evidence_id},
             )
-        return self.get_evidence_item(evidence_id)
+            evidence_row = connection.execute(
+                "SELECT * FROM evidence_items WHERE id = ?", (evidence_id,)
+            ).fetchone()
+            if evidence_row is None:
+                raise RuntimeError("Created evidence item was not readable")
+            evidence = self._evidence_item_from_row(evidence_row)
+        return evidence
 
     def get_evidence_item(self, evidence_item_id: str) -> EvidenceItem:
         row = self._one("SELECT * FROM evidence_items WHERE id = ?", (evidence_item_id,))
@@ -2424,7 +2430,13 @@ class CareerOpsRepository:
                 dict(application),
                 {"selected_resume_version_id": resume_id, "status": status.value},
             )
-        return self.get_resume_version(resume_id)
+            resume_row = connection.execute(
+                "SELECT * FROM resume_versions WHERE id = ?", (resume_id,)
+            ).fetchone()
+            if resume_row is None:
+                raise RuntimeError("Created resume version was not readable")
+            resume = self._resume_from_row(resume_row)
+        return resume
 
     def update_resume_render(
         self,
