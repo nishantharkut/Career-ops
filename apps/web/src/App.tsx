@@ -1,10 +1,7 @@
-import { FormEvent, useEffect, useMemo, useState } from "react";
+import { FormEvent, useCallback, useEffect, useMemo, useState } from "react";
 
 import {
   ApplicationRecord,
-  ApprovalRecord,
-  ReportRecord,
-  ResumeRecord,
   analyzeApplication,
   approveApplication,
   createApplication,
@@ -13,6 +10,11 @@ import {
   renderResume,
   uploadResume
 } from "./api";
+import AiTasksPanel from "./components/AiTasksPanel";
+import ApplicationRail from "./components/ApplicationRail";
+import PacketWorkspace from "./components/PacketWorkspace";
+import ReviewPanel from "./components/ReviewPanel";
+import { useApplicationPacket } from "./hooks/useApplicationPacket";
 import "./styles.css";
 
 const STATUS_LABELS: Record<string, string> = {
@@ -46,6 +48,10 @@ const emptyForm: ApplicationForm = {
   jd_text: ""
 };
 
+function errorMessage(error: unknown, fallback: string): string {
+  return error instanceof Error ? error.message : fallback;
+}
+
 export default function App() {
   const [applications, setApplications] = useState<ApplicationRecord[]>([]);
   const [selectedId, setSelectedId] = useState<string | null>(null);
@@ -53,21 +59,22 @@ export default function App() {
   const [form, setForm] = useState<ApplicationForm>(emptyForm);
   const [formError, setFormError] = useState("");
   const [busy, setBusy] = useState("");
-  const [error, setError] = useState("");
-  const [resume, setResume] = useState<ResumeRecord | null>(null);
-  const [resumeFile, setResumeFile] = useState<File | null>(null);
-  const [resumeName, setResumeName] = useState("Application resume");
-  const [roleFamily, setRoleFamily] = useState("general");
-  const [report, setReport] = useState<ReportRecord | null>(null);
-  const [approval, setApproval] = useState<ApprovalRecord | null>(null);
+  const [actionError, setActionError] = useState("");
+  const [listError, setListError] = useState("");
+  const { packet, loading: packetLoading, error: packetError, reload: reloadPacket } = useApplicationPacket(selectedId);
 
   useEffect(() => {
-    listApplications()
+    const controller = new AbortController();
+    listApplications(controller.signal)
       .then((records) => {
+        if (controller.signal.aborted) return;
         setApplications(records);
         setSelectedId(records[0]?.id ?? null);
       })
-      .catch((loadError: Error) => setError(loadError.message));
+      .catch((loadError: unknown) => {
+        if (!controller.signal.aborted) setListError(errorMessage(loadError, "Applications could not be loaded."));
+      });
+    return () => controller.abort();
   }, []);
 
   const selected = useMemo(
@@ -75,24 +82,31 @@ export default function App() {
     [applications, selectedId]
   );
 
-  function clearPacketState() {
-    setResume(null);
-    setResumeFile(null);
-    setReport(null);
-    setApproval(null);
-    setError("");
-  }
+  const refreshData = useCallback(async () => {
+    const [applicationResult] = await Promise.allSettled([listApplications(), reloadPacket()]);
+    if (applicationResult.status === "fulfilled") {
+      const records = applicationResult.value;
+      setApplications(records);
+      setListError("");
+      setSelectedId((current) => {
+        if (current && records.some((application) => application.id === current)) return current;
+        return records[0]?.id ?? null;
+      });
+    } else {
+      setListError(errorMessage(applicationResult.reason, "Applications could not be refreshed."));
+    }
+  }, [reloadPacket]);
 
   function selectApplication(applicationId: string) {
     setSelectedId(applicationId);
     setShowForm(false);
-    clearPacketState();
+    setActionError("");
   }
 
   async function submitApplication(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     setFormError("");
-    setError("");
+    setActionError("");
     if (!form.company.trim() || !form.role_title.trim() || !form.jd_text.trim()) {
       setFormError("Company, role title, and JD text are required.");
       return;
@@ -100,275 +114,165 @@ export default function App() {
     setBusy("Saving application");
     try {
       const created = await createApplication({
-        ...form,
-        location: form.location.trim() || "Unknown"
+        company: form.company.trim(),
+        role_title: form.role_title.trim(),
+        location: form.location.trim() || "Unknown",
+        source_url: form.source_url.trim(),
+        jd_text: form.jd_text.trim()
       });
-      setApplications((current) => [created, ...current]);
-      selectApplication(created.id);
+      setApplications((current) => [created, ...current.filter((item) => item.id !== created.id)]);
+      setSelectedId(created.id);
       setShowForm(false);
       setForm(emptyForm);
+      const records = await listApplications();
+      setApplications(records);
     } catch (saveError) {
-      setError(saveError instanceof Error ? saveError.message : "Save application failed.");
+      setActionError(errorMessage(saveError, "Save application failed."));
     } finally {
       setBusy("");
     }
   }
 
-  async function submitResume(event: FormEvent<HTMLFormElement>) {
-    event.preventDefault();
-    if (!selected || !resumeFile) {
-      setError("Choose a LaTeX file before upload.");
-      return;
-    }
+  async function handleUpload(payload: { name: string; roleFamily: string; file: File }) {
+    if (!selectedId) return;
     setBusy("Uploading resume");
-    setError("");
+    setActionError("");
     try {
-      const uploaded = await uploadResume(selected.id, {
-        name: resumeName,
-        role_family: roleFamily,
-        file: resumeFile
+      await uploadResume(selectedId, {
+        name: payload.name,
+        role_family: payload.roleFamily,
+        file: payload.file
       });
-      setResume(uploaded);
-      setReport(null);
-      setApproval(null);
+      await refreshData();
     } catch (uploadError) {
-      setError(uploadError instanceof Error ? uploadError.message : "Resume upload failed.");
+      setActionError(errorMessage(uploadError, "Resume upload failed."));
     } finally {
       setBusy("");
     }
   }
 
   async function handleRender() {
-    if (!resume) return;
+    if (!packet?.selected_resume) return;
     setBusy("Rendering PDF");
-    setError("");
+    setActionError("");
     try {
-      const rendered = await renderResume(resume.id);
-      setResume(rendered);
-      if (rendered.render_error) setError(rendered.render_error);
+      const rendered = await renderResume(packet.selected_resume.id);
+      if (rendered.render_error) setActionError(rendered.render_error);
+      await refreshData();
     } catch (renderError) {
-      setError(renderError instanceof Error ? renderError.message : "PDF render failed. Open the render log.");
+      setActionError(errorMessage(renderError, "PDF render failed."));
     } finally {
       setBusy("");
     }
   }
 
   async function handleAnalyze() {
-    if (!selected) return;
+    if (!selectedId) return;
     setBusy("Analyzing");
-    setError("");
+    setActionError("");
     try {
-      setReport(await analyzeApplication(selected.id));
-      setApproval(null);
+      await analyzeApplication(selectedId);
+      await refreshData();
     } catch (analyzeError) {
-      setError(analyzeError instanceof Error ? analyzeError.message : "Analyze failed.");
+      setActionError(errorMessage(analyzeError, "Analyze failed."));
     } finally {
       setBusy("");
     }
   }
 
   async function handleApprove() {
-    if (!selected || !report) return;
+    if (!selectedId || !packet?.latest_report) return;
     setBusy("Approving");
-    setError("");
+    setActionError("");
     try {
-      const approved = await approveApplication(selected.id, report.id, "Reviewed PDF and report");
-      setApproval(approved);
-      setApplications((current) =>
-        current.map((application) =>
-          application.id === selected.id ? { ...application, status: "approved", approval_id: approved.id } : application
-        )
-      );
+      await approveApplication(selectedId, packet.latest_report.id, "Reviewed PDF and report");
+      await refreshData();
     } catch (approvalError) {
-      setError(approvalError instanceof Error ? approvalError.message : "Approval blocked.");
+      setActionError(errorMessage(approvalError, "Approval blocked."));
     } finally {
       setBusy("");
     }
   }
 
   async function handleSubmitted() {
-    if (!selected) return;
+    if (!selectedId || !packet?.approval) return;
     setBusy("Marking submitted");
-    setError("");
+    setActionError("");
     try {
-      const submitted = await markSubmitted(selected.id, "Submitted manually");
-      setApplications((current) => current.map((application) => (application.id === submitted.id ? submitted : application)));
-      setSelectedId(submitted.id);
+      await markSubmitted(selectedId, "Submitted manually");
+      await refreshData();
     } catch (submitError) {
-      setError(submitError instanceof Error ? submitError.message : "Manual submission record failed.");
+      setActionError(errorMessage(submitError, "Manual submission record failed."));
     } finally {
       setBusy("");
     }
   }
 
+  const reviewError = actionError || packetError || listError;
+
   return (
     <main className="app-shell" aria-busy={busy !== ""}>
-      <aside className="rail" aria-label="Applications">
-        <div className="rail__header">
-          <h1>CareerOps</h1>
-          <button type="button" onClick={() => setShowForm(true)}>
-            Add application
-          </button>
-        </div>
-        {applications.length === 0 ? (
-          <p className="empty">No applications yet. Add a JD to start a packet.</p>
-        ) : (
-          <ul className="application-list">
-            {applications.map((application) => (
-              <li key={application.id}>
-                <button
-                  type="button"
-                  className={application.id === selectedId ? "application-list__item is-selected" : "application-list__item"}
-                  onClick={() => selectApplication(application.id)}
-                >
-                  <strong>{application.company}</strong>
-                  <span>{application.role_title}</span>
-                  <small>{statusLabel(application.status)}</small>
-                </button>
-              </li>
-            ))}
-          </ul>
-        )}
-      </aside>
+      <ApplicationRail
+        applications={applications}
+        selectedId={selectedId}
+        onAdd={() => {
+          setShowForm(true);
+          setFormError("");
+        }}
+        onSelect={selectApplication}
+        statusLabel={statusLabel}
+      />
 
-      <section className="workspace" aria-label="Application detail">
+      <section className="workspace" aria-label="Application and resume">
         {showForm && (
           <form className="panel" onSubmit={submitApplication}>
             <h2>Add application</h2>
-            {formError && (
-              <p className="error" role="alert">
-                {formError}
-              </p>
-            )}
-            <label>
-              Company
-              <input aria-required="true" value={form.company} onChange={(event) => setForm({ ...form, company: event.target.value })} />
-            </label>
-            <label>
-              Role title
-              <input aria-required="true" value={form.role_title} onChange={(event) => setForm({ ...form, role_title: event.target.value })} />
-            </label>
-            <label>
-              Location
-              <input value={form.location} placeholder="Bangalore" onChange={(event) => setForm({ ...form, location: event.target.value })} />
-            </label>
-            <label>
-              Source URL
-              <input value={form.source_url} placeholder="https://example.com/role" onChange={(event) => setForm({ ...form, source_url: event.target.value })} />
-            </label>
-            <label>
-              JD text
-              <textarea aria-required="true" value={form.jd_text} onChange={(event) => setForm({ ...form, jd_text: event.target.value })} />
-            </label>
+            {formError && <p className="error" role="alert">{formError}</p>}
+            <label>Company<input aria-required="true" value={form.company} onChange={(event) => setForm({ ...form, company: event.target.value })} /></label>
+            <label>Role title<input aria-required="true" value={form.role_title} onChange={(event) => setForm({ ...form, role_title: event.target.value })} /></label>
+            <label>Location<input value={form.location} placeholder="Bangalore" onChange={(event) => setForm({ ...form, location: event.target.value })} /></label>
+            <label>Source URL<input value={form.source_url} placeholder="https://example.com/role" onChange={(event) => setForm({ ...form, source_url: event.target.value })} /></label>
+            <label>JD text<textarea aria-required="true" value={form.jd_text} onChange={(event) => setForm({ ...form, jd_text: event.target.value })} /></label>
             <div className="actions">
-              <button type="submit" disabled={busy !== ""}>
-                Save application
-              </button>
-              <button type="button" className="secondary" onClick={() => setShowForm(false)}>
-                Cancel
-              </button>
+              <button type="submit" disabled={busy !== ""}>Save application</button>
+              <button type="button" className="secondary" onClick={() => setShowForm(false)}>Cancel</button>
             </div>
           </form>
         )}
-
-        {!showForm && selected && (
-          <div className="panel">
-            <div className="detail-head">
-              <div>
-                <h2>{selected.company}</h2>
-                <p>{selected.role_title}</p>
-              </div>
-              <span className="status">{statusLabel(selected.status)}</span>
-            </div>
-            <dl className="meta">
-              <div>
-                <dt>Location</dt>
-                <dd>{selected.location || "Unknown"}</dd>
-              </div>
-              <div>
-                <dt>Resume</dt>
-                <dd>{resume?.name ?? "No resume selected"}</dd>
-              </div>
-              <div>
-                <dt>Render</dt>
-                <dd>{resume?.render_status ?? "Not rendered"}</dd>
-              </div>
-            </dl>
-
-            <form className="resume-form" onSubmit={submitResume}>
-              <h3>Resume version</h3>
-              <label>
-                Resume name
-                <input value={resumeName} onChange={(event) => setResumeName(event.target.value)} />
-              </label>
-              <label>
-                Role family
-                <input value={roleFamily} onChange={(event) => setRoleFamily(event.target.value)} />
-              </label>
-              <label>
-                LaTeX file
-                <input type="file" accept=".tex" onChange={(event) => setResumeFile(event.target.files?.[0] ?? null)} />
-              </label>
-              <div className="actions">
-                <button type="submit" disabled={busy !== ""}>
-                  Upload resume
-                </button>
-                <button type="button" disabled={!resume || busy !== ""} onClick={handleRender}>
-                  Render PDF
-                </button>
-                <button type="button" disabled={!resume?.pdf_sha256 || busy !== ""} onClick={handleAnalyze}>
-                  Analyze
-                </button>
-              </div>
-            </form>
-          </div>
+        {!showForm && packet && (
+          <PacketWorkspace
+            packet={packet}
+            busy={busy}
+            statusLabel={statusLabel}
+            onUpload={handleUpload}
+            onRender={handleRender}
+            onAnalyze={handleAnalyze}
+            onMutated={refreshData}
+          />
         )}
+        {!showForm && selected && packetLoading && <p role="status">Loading application packet</p>}
+        {!showForm && !selected && applications.length > 0 && <p className="muted">Select an application.</p>}
       </section>
 
-      <aside className="checks" aria-label="Checks and approval">
-        <section className="panel">
-          <h2>Checks</h2>
-          {busy && (
-            <p className="notice" role="status">
-              {busy}
-            </p>
-          )}
-          {error && (
-            <p className="error" role="alert">
-              {error}
-            </p>
-          )}
-          {!selected && <p className="muted">Select an application to review checks.</p>}
-          {report && (
-            <div className="report">
-              <p>
-                <strong>{report.blocking_issue_count}</strong> blockers
-              </p>
-              <p>
-                <strong>{report.warning_count}</strong> warnings
-              </p>
-              {report.risks.blockers.length > 0 && (
-                <ul className="issue-list">
-                  {report.risks.blockers.map((issue) => (
-                    <li key={`${issue.label}-${issue.source}`}>
-                      <strong>{issue.label}</strong>
-                      <span>{issue.next_action}</span>
-                    </li>
-                  ))}
-                </ul>
-              )}
-              {report.blocking_issue_count === 0 && <p className="notice">Ready to review</p>}
-            </div>
-          )}
-          <div className="actions actions--stacked">
-            <button type="button" disabled={!report || report.blocking_issue_count > 0 || busy !== ""} onClick={handleApprove}>
-              Approve packet
-            </button>
-            <button type="button" disabled={!approval || busy !== ""} onClick={handleSubmitted}>
-              Mark submitted manually
-            </button>
-          </div>
-        </section>
+      <aside className="checks" aria-label="AI review and approval">
+        {selectedId && packet && (
+          <AiTasksPanel
+            applicationId={selectedId}
+            initialTask={packet.latest_ai_task}
+            onPacketChanged={refreshData}
+          />
+        )}
+        <ReviewPanel
+          applicationId={selectedId}
+          resume={packet?.selected_resume ?? null}
+          report={packet?.latest_report ?? null}
+          approval={packet?.approval ?? null}
+          submitted={Boolean(packet && packet.application.submission_state !== "not_submitted")}
+          busy={busy}
+          error={reviewError}
+          onApprove={handleApprove}
+          onSubmitted={handleSubmitted}
+        />
       </aside>
     </main>
   );
