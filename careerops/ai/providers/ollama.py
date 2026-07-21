@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import hashlib
 import http.client
 import ipaddress
 import json
@@ -14,7 +15,9 @@ from urllib.parse import urlsplit
 from careerops.ai.contracts import (
     MAX_PROVIDER_OUTPUT_BYTES,
     InvocationMetadata,
+    OllamaIsolationEvidence,
     ProviderAvailability,
+    ProviderError,
     ProviderInvocationError,
     ProviderOutputError,
     ProviderRequest,
@@ -22,14 +25,14 @@ from careerops.ai.contracts import (
     ProviderTimeoutError,
     ProviderUnavailableError,
     parse_json_object,
-    serialize_provider_output,
     validate_provider_output,
 )
-from careerops.ai.providers.base import build_provider_result
+from careerops.ai.providers.base import build_provider_result, sanitized_provider_error
 from careerops.core.status import PrivacyMode
 
 
 _DIGEST_PATTERN = re.compile(r"^[0-9a-fA-F]{64}$")
+MAX_OLLAMA_ENVELOPE_BYTES = (6 * MAX_PROVIDER_OUTPUT_BYTES) + 64_000
 
 
 @dataclass(frozen=True)
@@ -44,6 +47,9 @@ class _Endpoint:
 class _LocalModel:
     name: str
     digest: str
+    size: int
+    tags_metadata_sha256: str
+    show_metadata_sha256: str
 
 
 def _remaining(deadline: float) -> float:
@@ -70,6 +76,7 @@ class _LoopbackTransport:
         path: str,
         body: bytes | None,
         deadline: float,
+        response_limit: int,
     ) -> tuple[int, bytes]:
         connection_type = (
             http.client.HTTPSConnection
@@ -113,9 +120,13 @@ class _LoopbackTransport:
                     raise ProviderOutputError(
                         "Ollama response Content-Length was invalid"
                     ) from error
-                if content_length < 0 or content_length > MAX_PROVIDER_OUTPUT_BYTES:
+                if content_length < 0 or content_length > response_limit:
                     raise ProviderOutputError("Ollama response exceeded the size limit")
-            return response.status, self._read_body(response, deadline)
+            return response.status, self._read_body(
+                response,
+                deadline,
+                response_limit,
+            )
         except ProviderTimeoutError:
             raise
         except (socket.timeout, TimeoutError) as error:
@@ -130,7 +141,11 @@ class _LoopbackTransport:
             connection.close()
 
     @staticmethod
-    def _read_body(response: http.client.HTTPResponse, deadline: float) -> bytes:
+    def _read_body(
+        response: http.client.HTTPResponse,
+        deadline: float,
+        response_limit: int,
+    ) -> bytes:
         chunks: list[bytes] = []
         observed = 0
         while True:
@@ -138,7 +153,7 @@ class _LoopbackTransport:
             response_socket = _response_socket(response)
             if response_socket is not None:
                 response_socket.settimeout(remaining)
-            allowance = MAX_PROVIDER_OUTPUT_BYTES + 1 - observed
+            allowance = response_limit + 1 - observed
             try:
                 chunk = response.read1(min(16 * 1024, allowance))
             except (socket.timeout, TimeoutError) as error:
@@ -147,7 +162,7 @@ class _LoopbackTransport:
                 break
             chunks.append(chunk)
             observed += len(chunk)
-            if observed > MAX_PROVIDER_OUTPUT_BYTES:
+            if observed > response_limit:
                 raise ProviderOutputError("Ollama response exceeded the size limit")
         return b"".join(chunks)
 
@@ -157,6 +172,10 @@ class OllamaProvider:
     endpoint: str = field(default="http://127.0.0.1:11434", repr=False)
     model: str = "qwen2.5:7b"
     timeout_seconds: float = 30
+    isolation_evidence: OllamaIsolationEvidence | None = field(
+        default=None,
+        repr=False,
+    )
     _parsed_endpoint: _Endpoint | None = field(
         init=False, default=None, repr=False, compare=False
     )
@@ -166,6 +185,10 @@ class OllamaProvider:
         parsed_endpoint = self._parse_endpoint(endpoint)
         if not math.isfinite(self.timeout_seconds) or self.timeout_seconds <= 0:
             raise ValueError("timeout_seconds must be finite and positive")
+        if self.isolation_evidence is not None and not isinstance(
+            self.isolation_evidence, OllamaIsolationEvidence
+        ):
+            raise ValueError("isolation_evidence must be a trusted attestation")
         object.__setattr__(self, "endpoint", endpoint)
         object.__setattr__(self, "_parsed_endpoint", parsed_endpoint)
 
@@ -201,6 +224,8 @@ class OllamaProvider:
         )
 
     def availability(self) -> ProviderAvailability:
+        if self.isolation_evidence is None:
+            return self._availability_status(False, "isolation_evidence_required")
         if self._parsed_endpoint is None:
             return self._availability_status(False, "invalid_configuration")
         try:
@@ -215,18 +240,35 @@ class OllamaProvider:
     def _availability_status(
         self, available: bool, detail: str, model_digest: str = ""
     ) -> ProviderAvailability:
+        isolated = self.isolation_evidence is not None
         return ProviderAvailability(
             available=available,
             provider_kind="ollama",
             model=self.model,
-            privacy_mode=PrivacyMode.LOCAL_PRIVATE,
-            data_leaves_machine=False,
+            privacy_mode=(
+                PrivacyMode.LOCAL_PRIVATE
+                if isolated
+                else PrivacyMode.CLOUD_EXTERNAL
+            ),
+            data_leaves_machine=not isolated,
             is_ai=True,
             detail=detail,
             model_digest=model_digest,
         )
 
     def run(self, request: ProviderRequest) -> ProviderResult:
+        failure: ProviderError | None = None
+        try:
+            return self._run(request)
+        except ProviderError as error:
+            failure = error
+        raise sanitized_provider_error(failure)
+
+    def _run(self, request: ProviderRequest) -> ProviderResult:
+        if self.isolation_evidence is None:
+            raise ProviderUnavailableError(
+                "Ollama isolation evidence is required"
+            )
         if self._parsed_endpoint is None:
             raise ProviderUnavailableError("Ollama provider configuration is invalid")
         deadline = time.monotonic() + self.timeout_seconds
@@ -245,14 +287,25 @@ class OllamaProvider:
             separators=(",", ":"),
         ).encode("utf-8")
         envelope = self._request_json("POST", "/api/chat", body, deadline)
+        chat_metadata = dict(envelope)
+        message = envelope.get("message")
+        if isinstance(message, dict):
+            chat_metadata["message"] = {
+                key: value for key, value in message.items() if key != "content"
+            }
+        if self._contains_remote_metadata(chat_metadata):
+            raise ProviderOutputError("Ollama chat reported remote model metadata")
         if envelope.get("model") != self.model or envelope.get("done") is not True:
             raise ProviderOutputError("Ollama chat response was incomplete or mismatched")
-        message = envelope.get("message")
         if not isinstance(message, dict) or not isinstance(message.get("content"), str):
             raise ProviderOutputError("Ollama response envelope was invalid")
         payload = parse_json_object(message["content"])
         output = validate_provider_output(request, payload)
-        raw_output = serialize_provider_output(output)
+        # These checks detect honest drift. A malicious server under the same OS
+        # user that swaps and perfectly restores state is outside the threat model.
+        if self._resolve_local_model(deadline) != local_model:
+            raise ProviderUnavailableError("Ollama model provenance changed during run")
+        raw_output = message["content"]
         return build_provider_result(
             provider_kind="ollama",
             model=self.model,
@@ -270,6 +323,10 @@ class OllamaProvider:
 
     def _resolve_local_model(self, deadline: float) -> _LocalModel:
         payload = self._request_json("GET", "/api/tags", None, deadline)
+        if self._contains_remote_metadata(payload):
+            raise ProviderUnavailableError(
+                "Ollama model local provenance could not be proven"
+            )
         models = payload.get("models")
         if not isinstance(models, list):
             raise ProviderUnavailableError("Ollama model metadata was invalid")
@@ -283,10 +340,36 @@ class OllamaProvider:
         if len(matches) != 1:
             raise ProviderUnavailableError("Ollama model was not uniquely installed")
         metadata = matches[0]
+        digest, size = self._validate_local_metadata(metadata)
+        show = self._request_json(
+            "POST",
+            "/api/show",
+            json.dumps(
+                {"model": self.model},
+                separators=(",", ":"),
+            ).encode("utf-8"),
+            deadline,
+        )
+        show_digest, show_size = self._validate_local_metadata(show)
+        if show_digest != digest or show_size != size:
+            raise ProviderUnavailableError(
+                "Ollama model metadata did not agree across local APIs"
+            )
+        return _LocalModel(
+            name=self.model,
+            digest=digest,
+            size=size,
+            tags_metadata_sha256=self._metadata_sha256(metadata),
+            show_metadata_sha256=self._metadata_sha256(show),
+        )
+
+    def _validate_local_metadata(self, metadata: dict[str, Any]) -> tuple[str, int]:
         digest = metadata.get("digest")
         size = metadata.get("size")
         if (
-            not isinstance(digest, str)
+            metadata.get("name") != self.model
+            or metadata.get("model") != self.model
+            or not isinstance(digest, str)
             or _DIGEST_PATTERN.fullmatch(digest) is None
             or not isinstance(size, int)
             or isinstance(size, bool)
@@ -296,7 +379,18 @@ class OllamaProvider:
             raise ProviderUnavailableError(
                 "Ollama model local provenance could not be proven"
             )
-        return _LocalModel(name=self.model, digest=digest.lower())
+        return digest.lower(), size
+
+    @staticmethod
+    def _metadata_sha256(metadata: dict[str, Any]) -> str:
+        raw = json.dumps(
+            metadata,
+            ensure_ascii=False,
+            allow_nan=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+        return hashlib.sha256(raw).hexdigest()
 
     @classmethod
     def _contains_remote_metadata(cls, value: Any, key: str = "") -> bool:
@@ -341,16 +435,18 @@ class OllamaProvider:
         if self._parsed_endpoint is None:
             raise ProviderUnavailableError("Ollama provider configuration is invalid")
         status, raw = _LoopbackTransport(self._parsed_endpoint).request(
-            method, path, body, deadline
+            method,
+            path,
+            body,
+            deadline,
+            MAX_OLLAMA_ENVELOPE_BYTES,
         )
         if not 200 <= status < 300:
             raise ProviderInvocationError(
                 f"Ollama returned HTTP status {status}"
             )
-        try:
-            payload = json.loads(raw)
-        except (UnicodeError, ValueError) as error:
-            raise ProviderOutputError("Ollama response was not valid JSON") from error
-        if not isinstance(payload, dict):
-            raise ProviderOutputError("Ollama response must be a JSON object")
-        return payload
+        payload = parse_json_object(
+            raw,
+            size_limit=MAX_OLLAMA_ENVELOPE_BYTES,
+        )
+        return dict(payload)

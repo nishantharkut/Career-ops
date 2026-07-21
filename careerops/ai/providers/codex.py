@@ -10,6 +10,7 @@ from pathlib import Path
 import re
 import shutil
 import stat
+import sys
 import tempfile
 import time
 from types import MappingProxyType
@@ -19,17 +20,18 @@ from careerops.ai.contracts import (
     MAX_PROVIDER_OUTPUT_BYTES,
     InvocationMetadata,
     ProviderAvailability,
+    ProviderError,
     ProviderInvocationError,
     ProviderOutputError,
     ProviderRequest,
     ProviderResult,
     ProviderTimeoutError,
     ProviderUnavailableError,
+    bounded_utf8_text,
     parse_json_object,
-    serialize_provider_output,
     validate_provider_output,
 )
-from careerops.ai.providers.base import build_provider_result
+from careerops.ai.providers.base import build_provider_result, sanitized_provider_error
 from careerops.ai.providers.process import (
     ProcessDeadlineExceeded,
     ProcessRunner,
@@ -69,6 +71,13 @@ class _CodexIdentity:
     native_executable: Path
     native_sha256: str
     codex_home: Path
+
+
+@dataclass(frozen=True)
+class _AttemptDirectory:
+    path: Path
+    device: int
+    inode: int
 
 
 def _remaining(deadline: float) -> float:
@@ -130,14 +139,21 @@ def _read_single_link_file(path: Path, size_limit: int) -> tuple[bytes, os.stat_
     return b"".join(chunks), after
 
 
-def _stream_sha256(descriptor: int, *, size_limit: int) -> tuple[str, int]:
+def _stream_sha256(
+    descriptor: int,
+    *,
+    size_limit: int,
+    deadline: float,
+) -> tuple[str, int]:
     digest = hashlib.sha256()
     observed = 0
     while True:
+        _remaining(deadline)
         chunk = os.read(
             descriptor,
             min(_CODEX_HASH_CHUNK_BYTES, size_limit + 1 - observed),
         )
+        _remaining(deadline)
         if not chunk:
             return digest.hexdigest(), observed
         observed += len(chunk)
@@ -156,8 +172,24 @@ def _file_identity(value: os.stat_result) -> tuple[int, int, int, int, int]:
     )
 
 
-def _hash_single_link_file(path: Path, size_limit: int) -> tuple[Path, str]:
+def _windows_drive_type(path: Path) -> int:
+    import ctypes
+
+    root = path.expanduser().absolute().anchor
+    return int(ctypes.windll.kernel32.GetDriveTypeW(str(root)))
+
+
+def _hash_single_link_file(
+    path: Path,
+    size_limit: int,
+    deadline: float,
+) -> tuple[Path, str]:
     candidate = path.expanduser().absolute()
+    _remaining(deadline)
+    if sys.platform == "win32" and _windows_drive_type(candidate) != 3:
+        raise ProviderUnavailableError(
+            "Native Codex executable must be on a fixed local drive"
+        )
     try:
         before = candidate.lstat()
     except OSError as error:
@@ -182,7 +214,11 @@ def _hash_single_link_file(path: Path, size_limit: int) -> tuple[Path, str]:
             or _file_identity(opened) != _file_identity(before)
         ):
             raise ProviderUnavailableError("Codex identity file was unsafe")
-        digest, observed = _stream_sha256(descriptor, size_limit=size_limit)
+        digest, observed = _stream_sha256(
+            descriptor,
+            size_limit=size_limit,
+            deadline=deadline,
+        )
         after = os.fstat(descriptor)
     except OSError as error:
         raise ProviderUnavailableError("Codex identity file was unavailable") from error
@@ -208,11 +244,19 @@ def _hash_single_link_file(path: Path, size_limit: int) -> tuple[Path, str]:
     return resolved, digest
 
 
-def _validate_codex_native(path: str | Path) -> tuple[Path, str]:
+def _validate_codex_native(
+    path: str | Path,
+    *,
+    deadline: float,
+) -> tuple[Path, str]:
     candidate = Path(path).expanduser().absolute()
     if candidate.name.casefold() != "codex.exe":
         raise ProviderUnavailableError("Native Codex executable must be codex.exe")
-    return _hash_single_link_file(candidate, MAX_CODEX_EXECUTABLE_BYTES)
+    return _hash_single_link_file(
+        candidate,
+        MAX_CODEX_EXECUTABLE_BYTES,
+        deadline,
+    )
 
 
 def _validate_codex_home(path: Path) -> Path:
@@ -284,6 +328,68 @@ def _write_exclusive(path: Path, value: bytes) -> None:
     finally:
         if descriptor >= 0:
             os.close(descriptor)
+
+
+def _create_attempt_directory(task_dir: Path) -> _AttemptDirectory:
+    failure = False
+    try:
+        created = Path(
+            tempfile.mkdtemp(prefix=".careerops-attempt-", dir=task_dir)
+        ).absolute()
+        before = created.lstat()
+        resolved = created.resolve(strict=True)
+        resolved.relative_to(task_dir)
+        after = resolved.lstat()
+        if (
+            stat.S_ISLNK(before.st_mode)
+            or not stat.S_ISDIR(before.st_mode)
+            or stat.S_ISLNK(after.st_mode)
+            or not stat.S_ISDIR(after.st_mode)
+            or (before.st_dev, before.st_ino) != (after.st_dev, after.st_ino)
+        ):
+            failure = True
+    except (OSError, ValueError):
+        failure = True
+    if failure:
+        raise ProviderInvocationError("Could not isolate Codex attempt")
+    return _AttemptDirectory(resolved, after.st_dev, after.st_ino)
+
+
+def _cleanup_attempt_directory(
+    attempt: _AttemptDirectory,
+    known_files: tuple[Path, ...],
+) -> None:
+    failed = False
+    try:
+        before = attempt.path.lstat()
+        if (
+            stat.S_ISLNK(before.st_mode)
+            or not stat.S_ISDIR(before.st_mode)
+            or (before.st_dev, before.st_ino) != (attempt.device, attempt.inode)
+        ):
+            raise OSError("attempt identity changed")
+        for candidate in known_files:
+            if candidate.parent != attempt.path:
+                raise OSError("unexpected cleanup path")
+            try:
+                value = candidate.lstat()
+            except FileNotFoundError:
+                continue
+            if stat.S_ISDIR(value.st_mode):
+                raise OSError("known output became a directory")
+            os.unlink(candidate)
+        after = attempt.path.lstat()
+        if (
+            stat.S_ISLNK(after.st_mode)
+            or not stat.S_ISDIR(after.st_mode)
+            or (after.st_dev, after.st_ino) != (attempt.device, attempt.inode)
+        ):
+            raise OSError("attempt identity changed")
+        os.rmdir(attempt.path)
+    except OSError:
+        failed = True
+    if failed:
+        raise ProviderInvocationError("Could not clean isolated Codex attempt")
 
 
 def _read_codex_output(path: Path, attempt_dir: Path) -> bytes:
@@ -385,17 +491,20 @@ class CodexProvider:
 
     @property
     def identity_name(self) -> str:
-        return self._resolved_identity().name
+        return self._resolved_identity(self._identity_deadline()).name
 
     @property
     def native_executable(self) -> Path:
-        return self._resolved_identity().native_executable
+        return self._resolved_identity(self._identity_deadline()).native_executable
 
     @property
     def codex_home(self) -> Path:
-        return self._resolved_identity().codex_home
+        return self._resolved_identity(self._identity_deadline()).codex_home
 
-    def _resolved_identity(self) -> _CodexIdentity:
+    def _identity_deadline(self) -> float:
+        return time.monotonic() + min(self.timeout_seconds, 20)
+
+    def _resolved_identity(self, deadline: float) -> _CodexIdentity:
         if self._identity is not None:
             return self._identity
         environment = self.environment or {}
@@ -406,7 +515,10 @@ class CodexProvider:
         if explicit_native:
             if configured_path.suffix.casefold() != ".exe":
                 raise ProviderUnavailableError("Only native Codex .exe overrides are allowed")
-            native, digest = _validate_codex_native(configured_path)
+            native, digest = _validate_codex_native(
+                configured_path,
+                deadline=deadline,
+            )
             name = self.executable_name or "codex"
             descriptor = native
             codex_home = _default_codex_home(environment)
@@ -437,9 +549,15 @@ class CodexProvider:
                     raise ProviderUnavailableError(
                         "Native Codex executable was unavailable for codex2"
                     )
-                native, digest = _validate_codex_native(native_value)
+                native, digest = _validate_codex_native(
+                    native_value,
+                    deadline=deadline,
+                )
             else:
-                native, digest = _validate_codex_native(descriptor)
+                native, digest = _validate_codex_native(
+                    descriptor,
+                    deadline=deadline,
+                )
                 codex_home = _default_codex_home(environment)
         identity = _CodexIdentity(name, descriptor, native, digest, codex_home)
         object.__setattr__(self, "_identity", identity)
@@ -484,9 +602,8 @@ class CodexProvider:
     def _probe_identity(
         self, identity: _CodexIdentity, deadline: float
     ) -> tuple[str, str]:
-        native, digest = _validate_codex_native(identity.native_executable)
-        if native != identity.native_executable or digest != identity.native_sha256:
-            raise ProviderUnavailableError("Native Codex executable identity changed")
+        digest = self._verify_identity_unchanged(identity, deadline)
+        native = identity.native_executable
         version_result = self._run_boundary(
             identity,
             [str(native), "--version"],
@@ -523,12 +640,24 @@ class CodexProvider:
             raise ProviderUnavailableError("Codex ChatGPT login was not available")
         return version, digest
 
+    @staticmethod
+    def _verify_identity_unchanged(
+        identity: _CodexIdentity,
+        deadline: float,
+    ) -> str:
+        native, digest = _validate_codex_native(
+            identity.native_executable,
+            deadline=deadline,
+        )
+        if native != identity.native_executable or digest != identity.native_sha256:
+            raise ProviderUnavailableError("Native Codex executable identity changed")
+        return digest
+
     def availability(self) -> ProviderAvailability:
+        deadline = self._identity_deadline()
         try:
-            identity = self._resolved_identity()
-            version, digest = self._probe_identity(
-                identity, time.monotonic() + min(self.timeout_seconds, 20)
-            )
+            identity = self._resolved_identity(deadline)
+            version, digest = self._probe_identity(identity, deadline)
             available = True
             detail = "available"
         except Exception:
@@ -585,62 +714,72 @@ class CodexProvider:
         ]
 
     def run(self, request: ProviderRequest) -> ProviderResult:
-        deadline = time.monotonic() + self.timeout_seconds
-        identity = self._resolved_identity()
-        version, digest = self._probe_identity(identity, deadline)
+        failure: ProviderError | None = None
         try:
-            attempt_dir = Path(
-                tempfile.mkdtemp(prefix=".careerops-attempt-", dir=request.task_dir)
-            ).resolve(strict=True)
-            attempt_dir.relative_to(request.task_dir)
-        except (OSError, ValueError) as error:
-            raise ProviderInvocationError("Could not isolate Codex attempt") from error
-        schema_path = attempt_dir / "schema.json"
-        output_path = attempt_dir / "output.json"
-        _write_exclusive(schema_path, request.schema_snapshot)
-        command = self.build_command(
-            identity, attempt_dir, schema_path, output_path
-        )
-        stdin = (
-            request.prompt_snapshot
-            + b"\n\n<careerops_context>\n"
-            + request.context_snapshot
-            + b"\n</careerops_context>"
-        )
-        completed = self._run_boundary(
-            identity,
-            command,
-            input_bytes=stdin,
-            deadline=deadline,
-            capture_limit=0,
-        )
-        if completed.returncode != 0:
-            raise ProviderInvocationError(
-                f"Codex provider failed with exit code {completed.returncode}"
+            return self._run(request)
+        except ProviderError as error:
+            failure = error
+        raise sanitized_provider_error(failure)
+
+    def _run(self, request: ProviderRequest) -> ProviderResult:
+        deadline = time.monotonic() + self.timeout_seconds
+        identity = self._resolved_identity(deadline)
+        version, digest = self._probe_identity(identity, deadline)
+        attempt = _create_attempt_directory(request.task_dir)
+        schema_path = attempt.path / "schema.json"
+        output_path = attempt.path / "output.json"
+        try:
+            _write_exclusive(schema_path, request.schema_snapshot)
+            command = self.build_command(
+                identity, attempt.path, schema_path, output_path
             )
-        raw = _read_codex_output(output_path, attempt_dir)
-        payload = parse_json_object(raw)
-        output = validate_provider_output(request, payload)
-        raw_output = serialize_provider_output(output)
-        return build_provider_result(
-            provider_kind="codex",
-            model=self.model,
-            privacy_mode=PrivacyMode.CLOUD_EXTERNAL,
-            data_leaves_machine=True,
-            is_ai=True,
-            structured_output=output,
-            raw_output=raw_output,
-            invocation=InvocationMetadata(
-                mode="codex_exec",
-                identity_name=identity.name,
-                executable=str(identity.native_executable),
-                executable_sha256=digest,
-                executable_version=version,
-                codex_home=str(identity.codex_home),
-                reasoning_effort=self.reasoning_effort,
-                command=tuple(command),
-            ),
-        )
+            stdin = (
+                request.prompt_snapshot
+                + b"\n\n<careerops_context>\n"
+                + request.context_snapshot
+                + b"\n</careerops_context>"
+            )
+            self._verify_identity_unchanged(identity, deadline)
+            completed = self._run_boundary(
+                identity,
+                command,
+                input_bytes=stdin,
+                deadline=deadline,
+                capture_limit=0,
+            )
+            if completed.returncode != 0:
+                self._verify_identity_unchanged(identity, deadline)
+                raise ProviderInvocationError(
+                    f"Codex provider failed with exit code {completed.returncode}"
+                )
+            raw = _read_codex_output(output_path, attempt.path)
+            # A same-user process that swaps and perfectly restores the executable
+            # between checks remains outside the app's local-user threat model.
+            post_digest = self._verify_identity_unchanged(identity, deadline)
+            payload = parse_json_object(raw)
+            output = validate_provider_output(request, payload)
+            raw_output, _raw_bytes = bounded_utf8_text(raw)
+            return build_provider_result(
+                provider_kind="codex",
+                model=self.model,
+                privacy_mode=PrivacyMode.CLOUD_EXTERNAL,
+                data_leaves_machine=True,
+                is_ai=True,
+                structured_output=output,
+                raw_output=raw_output,
+                invocation=InvocationMetadata(
+                    mode="codex_exec",
+                    identity_name=identity.name,
+                    executable=str(identity.native_executable),
+                    executable_sha256=post_digest,
+                    executable_version=version,
+                    codex_home=str(identity.codex_home),
+                    reasoning_effort=self.reasoning_effort,
+                    command=tuple(command),
+                ),
+            )
+        finally:
+            _cleanup_attempt_directory(attempt, (schema_path, output_path))
 
 
 def _configured_commands(environment: Mapping[str, str]) -> list[str]:
@@ -690,7 +829,7 @@ def discover_codex_providers(
             process_runner=process_runner or ProcessRunner(),
         )
         try:
-            provider._resolved_identity()
+            provider._resolved_identity(provider._identity_deadline())
         except ProviderUnavailableError:
             continue
         providers.append(provider)

@@ -36,13 +36,18 @@ class MockProvider:
     def run(self, request: ProviderRequest) -> ProviderResult:
         if isinstance(self.raw_output, str):
             payload = parse_json_object(self.raw_output)
+            raw_output = self.raw_output
         else:
+            conversion_failed = False
             try:
                 payload = dict(self.raw_output)
             except Exception:
-                raise ProviderOutputError("Mock provider output was invalid") from None
+                conversion_failed = True
+            if conversion_failed:
+                raise ProviderOutputError("Mock provider output was invalid")
         output = validate_provider_output(request, payload)
-        raw_output = serialize_provider_output(output)
+        if not isinstance(self.raw_output, str):
+            raw_output = serialize_provider_output(output)
         return build_provider_result(
             provider_kind="mock",
             model=self.model,

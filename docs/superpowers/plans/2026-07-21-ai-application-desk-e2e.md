@@ -4,9 +4,9 @@
 
 **Goal:** Deliver a private AI-assisted CareerOps workflow that can take a real JD and LaTeX resume through persisted AI review, verified draft creation, approval, export, backup, and manual submission from a clean browser UI.
 
-**Architecture:** Extend the existing FastAPI, SQLite, file-vault, and React workbench instead of replacing it. AI work is represented by durable tasks and artifacts, executed through bounded provider adapters (local-private Ollama or ChatGPT-authenticated/cloud-external Codex), validated against typed schemas, and checked by the existing deterministic safety layer before any suggestion can create a new resume version. The browser polls task state and always shows provider, privacy, verification, and provenance.
+**Architecture:** Extend the existing FastAPI, SQLite, file-vault, and React workbench instead of replacing it. AI work is represented by durable tasks and artifacts, executed through bounded provider adapters (managed no-egress/local-private Ollama or ChatGPT-authenticated/cloud-external Codex), validated against typed schemas, and checked by the existing deterministic safety layer before any suggestion can create a new resume version. The browser polls task state and always shows provider, privacy, verification, and provenance.
 
-**Tech Stack:** Python 3.14, FastAPI, Pydantic, SQLite WAL, pytest, React 19, TypeScript, Vite, Vitest, Playwright, local Ollama HTTP API, local `codex exec`, Docker Compose.
+**Tech Stack:** Python 3.14, FastAPI, Pydantic, SQLite WAL, pytest, React 19, TypeScript, Vite, Vitest, Playwright, managed no-egress Ollama HTTP API, ChatGPT-authenticated/cloud-external Codex CLI `exec`, Docker Compose.
 
 ---
 
@@ -21,7 +21,7 @@
 - `careerops/ai/providers/base.py`: provider protocol and availability/result records.
 - `careerops/ai/providers/deterministic.py`: explicit verifier-only fallback, never labelled as AI.
 - `careerops/ai/providers/mock.py`: deterministic CI provider.
-- `careerops/ai/providers/ollama.py`: local Ollama availability probe and structured generation.
+- `careerops/ai/providers/ollama.py`: fail-closed Ollama adapter with managed-runtime isolation evidence, local-model provenance checks, and structured generation.
 - `careerops/ai/providers/codex.py`: interchangeable constrained Codex CLI workers (`codex2` preferred, `codex` optional) using a bounded task folder and output schema.
 - `careerops/ai/prompts/analyze_jd_v1.txt`: versioned semantic JD extraction prompt.
 - `careerops/ai/prompts/analyze_fit_v1.txt`: versioned semantic fit and risk prompt.
@@ -272,7 +272,7 @@ def test_ollama_probe_reports_unavailable_without_throwing(http_server):
     provider = OllamaProvider(endpoint=http_server.unused_url, model="qwen2.5:7b", timeout_seconds=1)
     status = provider.availability()
     assert status.available is False
-    assert status.privacy_mode == "local_private"
+    assert status.detail == "isolation_evidence_required"
 
 
 def test_codex_command_is_read_only_and_bounded(tmp_path):
@@ -341,9 +341,9 @@ class AiProvider(Protocol):
 
 Use a discriminated `TaskOutput` union with `AnalyzeJdOutput`, `AnalyzeFitOutput`, `ResumeEditsOutput`, `CoverLetterOutput`, and `ClaimReviewOutput`. The only allowed task names are `analyze_jd`, `analyze_fit`, `suggest_resume_edits`, `draft_cover_letter`, and `review_claims`. JD output validates normalized fields plus uncertainty; fit output validates matches, gaps, risks, and recommendations; resume suggestions require `source_text`, `replacement_text`, `reason`, and `evidence_refs`; cover letters contain bounded plain text plus evidence references; claim review returns one decision per supplied claim. All string and list fields are length-limited.
 
-Ollama uses a direct, proxy-free loopback HTTP transport for `POST /api/chat` with `stream: false`, `format` set to the JSON Schema, a single finite deadline, and locally installed model provenance verified before inference. Codex discovery reads `CAREEROPS_CODEX_COMMANDS` in order (`codex2,codex` for the current machine) or a single `CAREEROPS_CODEX_COMMAND` override. Each resolved identity is registered as a separate provider; `codex2` is preferred, and a running task never falls back to another identity. A `.cmd` wrapper is an identity descriptor only: CareerOps validates the approved wrapper shape, resolves its `CODEX_HOME`, resolves and hashes the native `codex.exe`, and invokes that native executable directly. Codex uses a managed `Popen` process tree with an argument list, bounded stdin/output, an overall deadline, `--ignore-user-config`, `--ignore-rules`, `--strict-config`, an explicit model and reasoning effort, `--cd <attempt_dir>`, `--sandbox read-only`, `--skip-git-repo-check`, `--ephemeral`, `--output-schema <schema>`, and `--output-last-message <output>`; shell interpolation is forbidden. The deterministic provider returns verifier-only output and has `is_ai=False`.
+Unmanaged Ollama is fail-closed because a generic localhost daemon can offload cloud models. The adapter accepts only a frozen deployment attestation supplied by trusted CareerOps wiring that identifies an app-owned runtime with cloud features disabled and OS/container egress blocked; a loose environment boolean is not proof. With that attestation, Ollama uses direct proxy-free loopback HTTP, verifies the exact installed model through both `/api/tags` and `POST /api/show` before sending task content, calls `POST /api/chat` with `stream: false` and `format` set to the JSON Schema, rejects cloud/remote metadata, then repeats both provenance checks and requires an unchanged digest. All calls share one finite deadline. Task 10 owns creation of the attestation from its internal no-egress container or OS-firewall launcher. Codex discovery reads `CAREEROPS_CODEX_COMMANDS` in order (`codex2,codex` for the current machine) or a single `CAREEROPS_CODEX_COMMAND` override. Each resolved identity is registered as a separate provider; `codex2` is preferred, and a running task never falls back to another identity. A `.cmd` wrapper is an identity descriptor only: CareerOps validates the approved wrapper shape, resolves its `CODEX_HOME`, resolves and hashes the native `codex.exe`, and invokes that native executable directly. Codex uses a managed `Popen` process tree with an argument list, bounded stdin/output, an overall deadline, `--ignore-user-config`, `--ignore-rules`, `--strict-config`, an explicit model and reasoning effort, `--cd <attempt_dir>`, `--sandbox read-only`, `--skip-git-repo-check`, `--ephemeral`, `--output-schema <schema>`, and `--output-last-message <output>`; shell interpolation is forbidden. The deterministic provider returns verifier-only output and has `is_ai=False`.
 
-Codex provider metadata sets `data_leaves_machine=True` for ChatGPT-authenticated runs and exposes the exact command/version. The UI must require per-task acknowledgement before sending private context through that provider. Local Ollama sets `data_leaves_machine=False`.
+Codex provider metadata sets `data_leaves_machine=True` for ChatGPT-authenticated runs and exposes the exact command/version. The UI must require per-task acknowledgement before sending private context through that provider. Only an attested managed no-egress Ollama runtime sets `privacy_mode=local_private` and `data_leaves_machine=False`; unmanaged Ollama remains unavailable.
 
 - [ ] **Step 4: Run provider tests**
 
@@ -570,7 +570,7 @@ GET    /applications/{id}/artifacts/report
 GET    /applications/{id}/artifacts/approval
 ```
 
-`create_app()` accepts an injected provider registry for tests. Production startup registers deterministic fallback, Ollama from `CAREEROPS_OLLAMA_URL`/`CAREEROPS_OLLAMA_MODEL`, and Codex when `CAREEROPS_CODEX_ENABLED=true`. Cloud AI remains absent. FastAPI `BackgroundTasks` runs the persisted task after the 202 response; startup requeues interrupted tasks. Artifact routes resolve repository-owned paths and require `candidate.is_relative_to(repo.vault_path.resolve())`.
+`create_app()` accepts an injected provider registry for tests. Production startup registers deterministic fallback, an unavailable-by-default Ollama adapter from `CAREEROPS_OLLAMA_URL`/`CAREEROPS_OLLAMA_MODEL`, and Codex when `CAREEROPS_CODEX_ENABLED=true`. Ollama becomes local-private only when Task 10 trusted deployment wiring supplies its no-egress isolation attestation; endpoint/model environment values alone never do so. Optional API-key cloud AI remains absent. FastAPI `BackgroundTasks` runs the persisted task after the 202 response; startup requeues interrupted tasks. Artifact routes resolve repository-owned paths and require `candidate.is_relative_to(repo.vault_path.resolve())`.
 
 Requirements responses preserve `raw_ai`, `deterministic`, and `user_corrected` groups plus uncertainty instead of merging away provenance. Profile facts use the five approved verification states. Evidence can be linked to an application only through repository-owned IDs; rejected or `private_do_not_publish` records are included in verifier context but never treated as publishable support.
 
@@ -920,7 +920,7 @@ Document:
 
 ```text
 1. Codex mode: `CAREEROPS_CODEX_COMMANDS=codex2,codex`, `codex2` preferred, exact selected identity shown, and bounded task data sent through that signed-in account only after acknowledgement.
-2. Local Ollama mode: endpoint, model, health check, and no cloud transfer.
+2. Managed Ollama mode: app-owned endpoint, model, health check, cloud-disabled runtime, enforced no-egress boundary, deployment attestation, and fail-closed behavior when any evidence is absent.
 3. Verifier-only mode: clearly useful for safety, clearly not AI.
 4. Hosted mode: AI runs only where the configured provider is reachable.
 5. Day-one workflow: task launch, polling, finding decisions, draft render, rerun, approval, export, submission.

@@ -11,6 +11,9 @@ import time
 from typing import BinaryIO, Mapping, Sequence
 
 
+_CREATE_SUSPENDED = 0x00000004
+
+
 @dataclass(frozen=True)
 class ProcessOutcome:
     returncode: int
@@ -29,6 +32,7 @@ class ProcessStartError(RuntimeError):
 class _WindowsJob:
     def __init__(self, process: subprocess.Popen[bytes]):
         self._handle = None
+        self._process = process
         if sys.platform != "win32":
             return
         try:
@@ -83,7 +87,11 @@ class _WindowsJob:
                 wintypes.HANDLE,
             ]
             kernel32.AssignProcessToJobObject.restype = wintypes.BOOL
+            ntdll = ctypes.WinDLL("ntdll", use_last_error=True)
+            ntdll.NtResumeProcess.argtypes = [wintypes.HANDLE]
+            ntdll.NtResumeProcess.restype = ctypes.c_long
             self._kernel32 = kernel32
+            self._ntdll = ntdll
             handle = kernel32.CreateJobObjectW(None, None)
             if not handle:
                 raise OSError(ctypes.get_last_error(), "CreateJobObjectW failed")
@@ -106,6 +114,17 @@ class _WindowsJob:
             process.kill()
             process.wait()
             raise ProcessStartError("Could not isolate subprocess tree") from error
+
+    def resume(self) -> None:
+        if self._handle is None:
+            return
+        status = int(self._ntdll.NtResumeProcess(self._process._handle))
+        if status == 0:
+            return
+        self.terminate()
+        self._process.kill()
+        self._process.wait()
+        raise ProcessStartError("Could not resume isolated subprocess")
 
     def terminate(self) -> None:
         if self._handle is not None:
@@ -167,7 +186,9 @@ def run_process(
     started = time.monotonic()
     platform_values: dict[str, object] = {}
     if sys.platform == "win32":
-        platform_values["creationflags"] = subprocess.CREATE_NO_WINDOW
+        platform_values["creationflags"] = (
+            subprocess.CREATE_NO_WINDOW | _CREATE_SUSPENDED
+        )
     else:
         platform_values["start_new_session"] = True
     capture_output = capture_limit > 0
@@ -191,6 +212,7 @@ def run_process(
     threads: list[threading.Thread] = []
     try:
         job = _WindowsJob(process)
+        job.resume()
         if process.stdin is None:
             raise ProcessStartError("Subprocess stdin was unavailable")
         writer = threading.Thread(

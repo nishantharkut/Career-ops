@@ -142,7 +142,7 @@ The app should use a provider adapter layer.
 
 Recommended order:
 
-1. **Local OSS provider**: Ollama first when installed, with LM Studio or another OpenAI-compatible local runtime later. Best for private drafts, semantic analysis, and low/no recurring cost.
+1. **Local OSS provider**: managed no-egress Ollama first, with LM Studio or another OpenAI-compatible local runtime later under an equivalent isolation contract. An arbitrary localhost daemon is not sufficient because it can offload cloud models. Best for private drafts, semantic analysis, and low/no recurring cost.
 2. **Codex worker provider**: invokes a configured Codex CLI identity for deep repo/session reasoning. On this machine, `codex2` is the preferred identity and `codex` is also available. Best for evidence reconstruction and codebase inspection.
 3. **Optional OpenAI API provider**: only when explicitly configured and approved. Best for higher quality generation when the user accepts cloud processing.
 4. **Deterministic fallback provider**: existing rule-based parser/analyzer. This is fallback and verifier, not the full product.
@@ -156,7 +156,7 @@ CareerOps must make privacy mode explicit.
 ### Local Private Mode
 
 - Resume text, profile facts, evidence, and generated drafts stay on the user's machine.
-- Uses local model runtime when available.
+- Uses only a CareerOps-managed model runtime with cloud features disabled, OS/container egress blocked, and a frozen deployment attestation supplied by trusted launcher wiring. An unmanaged Ollama endpoint is fail-closed and unavailable rather than labelled local-private.
 - Does not include ChatGPT-authenticated Codex; that provider is cloud-external and requires explicit enablement.
 - Best default for day-to-day work.
 
@@ -194,7 +194,7 @@ Recommended shape:
 - `restart: unless-stopped` for VM/container restarts;
 - scheduled backup of `data/` and `vault/`;
 - AI tasks stored as resumable records before provider execution;
-- local OSS AI worker on the user's machine or trusted host;
+- managed no-egress local OSS AI worker on the user's machine or trusted host;
 - Codex worker only for explicit deep-review tasks;
 - cloud AI disabled by default;
 - hosted mode labels whether private processing is local, trusted-host, cloud AI, or verifier-only fallback.
@@ -389,11 +389,11 @@ Mock providers must be used for normal CI. Live provider tests should be opt-in.
 
 These are the best default choices for the first AI implementation:
 
-1. First live local runtime: Ollama, because it is headless and fits a background app better than a desktop-first runtime. LM Studio can be added later through an OpenAI-compatible adapter.
+1. First live local runtime: CareerOps-managed no-egress Ollama, because it is headless and fits a background app better than a desktop-first runtime. The launcher must own the runtime, disable cloud features, enforce an OS/container egress block, and supply the provider's deployment attestation. LM Studio can be added later only through an equivalent fail-closed isolation contract.
 2. First implementation task: AI JD analysis plus semantic fit review, because resume tailoring and cover letters depend on understanding the role correctly.
 3. Codex worker mode: implement after the local provider path is stable, then use it for evidence and repository deep review.
 4. OpenAI API mode: keep documented but disabled and unimplemented in the first AI build unless explicitly approved later.
-5. Secret storage for v1: do not store cloud AI secrets in SQLite. Use environment variables for optional providers. Local Ollama needs no API secret. The ChatGPT-authenticated Codex provider uses the selected CLI identity's explicit `CODEX_HOME` rather than app-managed credentials.
+5. Secret storage for v1: do not store cloud AI secrets in SQLite. Use environment variables for optional providers. Managed Ollama needs no API secret, but endpoint/model environment values are not isolation evidence. The ChatGPT-authenticated Codex provider uses the selected CLI identity's explicit `CODEX_HOME` rather than app-managed credentials.
 6. Normal CI: use mock providers only. Live local model and Codex tests are opt-in.
 7. UI: add an `AI tasks` panel to the existing application desk, not a chatbot-first interface.
 
@@ -402,7 +402,7 @@ These are the best default choices for the first AI implementation:
 These can remain open without blocking the first implementation:
 
 1. Exact local model choice and size after Ollama is installed.
-2. Whether the hosted VM should also run Ollama or only the web/API container.
+2. Whether the hosted VM should also run a CareerOps-managed no-egress Ollama runtime or only the web/API container.
 3. Whether Windows Credential Manager should replace environment variables for future cloud provider secrets.
 4. Which historical application artifacts should be migrated first after AI review works.
 

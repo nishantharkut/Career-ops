@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -13,7 +14,6 @@ from pydantic import (
     PrivateAttr,
     StringConstraints,
     TypeAdapter,
-    ValidationError,
     model_validator,
 )
 
@@ -58,6 +58,36 @@ MetadataText = Annotated[str, StringConstraints(max_length=2_048)]
 RawOutputText = Annotated[
     str, StringConstraints(max_length=MAX_PROVIDER_OUTPUT_BYTES)
 ]
+Sha256Text = Annotated[
+    str,
+    StringConstraints(pattern=r"^[0-9a-f]{64}$"),
+]
+
+
+class _DuplicateJsonMember(ValueError):
+    pass
+
+
+def _reject_duplicate_json_members(
+    pairs: list[tuple[str, Any]],
+) -> dict[str, Any]:
+    value: dict[str, Any] = {}
+    for key, item in pairs:
+        if key in value:
+            raise _DuplicateJsonMember()
+        value[key] = item
+    return value
+
+
+def _strict_json_loads(raw: str | bytes) -> Any:
+    def reject_nonstandard_constant(_value: str) -> Any:
+        raise ValueError("non-standard JSON constant")
+
+    return json.loads(
+        raw,
+        object_pairs_hook=_reject_duplicate_json_members,
+        parse_constant=reject_nonstandard_constant,
+    )
 
 
 class ProviderError(RuntimeError):
@@ -95,6 +125,18 @@ class StrictModel(BaseModel):
             ):
                 converted[name] = tuple(converted[name])
         return converted
+
+
+class OllamaIsolationEvidence(StrictModel):
+    attestation_version: Literal["ollama_isolation_v1"]
+    runtime_owner: Literal["careerops"]
+    cloud_disabled: Literal[True]
+    egress_enforced: Literal[True]
+    egress_policy: Literal[
+        "container_internal_no_egress",
+        "os_firewall_block",
+    ]
+    runtime_instance_id: Identifier
 
 
 class AnalyzeJdOutput(StrictModel):
@@ -170,19 +212,23 @@ _OUTPUT_ADAPTER = TypeAdapter(TaskOutput)
 
 
 def _output_model(task_type: str) -> type[StrictModel]:
-    try:
-        return _OUTPUT_MODELS[task_type]
-    except KeyError as error:
-        raise ProviderOutputError(f"Unsupported task type: {task_type}") from error
+    model = _OUTPUT_MODELS.get(task_type)
+    if model is None:
+        raise ProviderOutputError(f"Unsupported task type: {task_type}")
+    return model
 
 
 def validate_task_output(task_type: str, payload: Any) -> TaskOutput:
     model = _output_model(task_type)
+    failed = False
     try:
         output = model.model_validate(payload)
-        return _OUTPUT_ADAPTER.validate_python(output)
-    except (TypeError, ValidationError) as error:
-        raise ProviderOutputError("Provider output failed the task schema") from error
+        validated = _OUTPUT_ADAPTER.validate_python(output)
+    except (Exception,):
+        failed = True
+    if failed:
+        raise ProviderOutputError("Provider output failed the task schema")
+    return validated
 
 
 def output_schema_for_task(task_type: str) -> dict[str, Any]:
@@ -321,7 +367,7 @@ class ProviderRequest(StrictModel):
         try:
             prompt.decode("utf-8")
             context.decode("utf-8")
-            parsed_schema = json.loads(schema.decode("utf-8"))
+            parsed_schema = _strict_json_loads(schema.decode("utf-8"))
         except (UnicodeError, ValueError) as error:
             raise ValueError("Provider input snapshot was not valid UTF-8 JSON/text") from error
         if parsed_schema != output_schema_for_task(self.task_type):
@@ -355,7 +401,7 @@ class ProviderRequest(StrictModel):
         return self._context_snapshot.decode("utf-8")
 
     def schema_object(self) -> dict[str, Any]:
-        value = json.loads(self._schema_snapshot)
+        value = _strict_json_loads(self._schema_snapshot)
         if not isinstance(value, dict):
             raise ProviderOutputError("Provider schema snapshot was invalid")
         return value
@@ -374,6 +420,7 @@ def validate_provider_output(request: ProviderRequest, payload: Any) -> TaskOutp
 
 
 def serialize_provider_output_bytes(output: TaskOutput) -> bytes:
+    failed = False
     try:
         raw = json.dumps(
             output.model_dump(mode="json"),
@@ -382,8 +429,10 @@ def serialize_provider_output_bytes(output: TaskOutput) -> bytes:
             separators=(",", ":"),
             sort_keys=True,
         ).encode("utf-8")
-    except (TypeError, ValueError, UnicodeError) as error:
-        raise ProviderOutputError("Provider output could not be serialized") from error
+    except (TypeError, ValueError, UnicodeError):
+        failed = True
+    if failed:
+        raise ProviderOutputError("Provider output could not be serialized")
     if len(raw) > MAX_PROVIDER_OUTPUT_BYTES:
         raise ProviderOutputError("Provider output exceeded the size limit")
     return raw
@@ -403,6 +452,7 @@ class InvocationMetadata(StrictModel):
     codex_home: MetadataText = ""
     model_digest: MetadataText = ""
     reasoning_effort: MetadataText = ""
+    raw_output_sha256: Sha256Text | Literal[""] = ""
     command: tuple[MetadataText, ...] = Field(default=(), max_length=40)
 
 
@@ -431,20 +481,60 @@ class ProviderResult(StrictModel):
     is_ai: bool
     structured_output: TaskOutput
     raw_output: RawOutputText
+    raw_output_sha256: Sha256Text
     invocation: InvocationMetadata
 
+    @model_validator(mode="after")
+    def validate_raw_output_provenance(self) -> ProviderResult:
+        try:
+            raw = self.raw_output.encode("utf-8")
+        except UnicodeError as error:
+            raise ValueError("raw_output must be valid UTF-8") from error
+        digest = hashlib.sha256(raw).hexdigest()
+        if (
+            len(raw) > MAX_PROVIDER_OUTPUT_BYTES
+            or self.raw_output_sha256 != digest
+            or self.invocation.raw_output_sha256 != digest
+        ):
+            raise ValueError("raw_output provenance did not match")
+        return self
 
-def parse_json_object(raw_output: str | bytes) -> Mapping[str, Any]:
+
+def bounded_utf8_text(
+    raw_output: str | bytes,
+    *,
+    size_limit: int = MAX_PROVIDER_OUTPUT_BYTES,
+) -> tuple[str, bytes]:
+    failed = False
     try:
-        raw = raw_output if isinstance(raw_output, bytes) else raw_output.encode("utf-8")
-    except UnicodeError as error:
-        raise ProviderOutputError("Provider output was not valid UTF-8") from error
-    if len(raw) > MAX_PROVIDER_OUTPUT_BYTES:
+        if isinstance(raw_output, bytes):
+            raw = raw_output
+            text = raw.decode("utf-8")
+        else:
+            text = raw_output
+            raw = text.encode("utf-8")
+    except (TypeError, UnicodeError):
+        failed = True
+    if failed:
+        raise ProviderOutputError("Provider output was not valid UTF-8")
+    if len(raw) > size_limit:
         raise ProviderOutputError("Provider output exceeded the size limit")
+    return text, raw
+
+
+def parse_json_object(
+    raw_output: str | bytes,
+    *,
+    size_limit: int = MAX_PROVIDER_OUTPUT_BYTES,
+) -> Mapping[str, Any]:
+    text, _raw = bounded_utf8_text(raw_output, size_limit=size_limit)
+    failed = False
     try:
-        value = json.loads(raw)
-    except (TypeError, ValueError, UnicodeError) as error:
-        raise ProviderOutputError("Provider output was not valid JSON") from error
+        value = _strict_json_loads(text)
+    except (TypeError, ValueError, UnicodeError):
+        failed = True
+    if failed:
+        raise ProviderOutputError("Provider output was not valid JSON")
     if not isinstance(value, dict):
         raise ProviderOutputError("Provider output must be a JSON object")
     return value

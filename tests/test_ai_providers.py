@@ -5,6 +5,7 @@ from contextlib import contextmanager
 import hashlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import importlib
+import io
 import json
 import os
 from pathlib import Path
@@ -12,11 +13,13 @@ import re
 import sys
 import threading
 import time
+import traceback
 from types import SimpleNamespace
 from typing import Any
 
 import careerops.ai.contracts as ai_contracts
 import careerops.ai.providers.codex as codex_provider_module
+import careerops.ai.providers.ollama as ollama_provider_module
 from pydantic import ValidationError
 import pytest
 
@@ -26,6 +29,7 @@ from careerops.ai.contracts import (
     AnalyzeJdOutput,
     ClaimReviewOutput,
     CoverLetterOutput,
+    InvocationMetadata,
     ProviderRequest,
     ResumeEditsOutput,
     output_schema_for_task,
@@ -36,6 +40,7 @@ from careerops.ai.providers.base import (
     ProviderOutputError,
     ProviderTimeoutError,
     ProviderUnavailableError,
+    build_provider_result,
 )
 from careerops.ai.providers.codex import CodexProvider, discover_codex_providers
 from careerops.ai.providers.deterministic import DeterministicProvider
@@ -149,6 +154,13 @@ def assert_all_collections_are_bounded(schema: dict[str, Any]) -> None:
     visit(schema)
 
 
+def assert_public_error_is_sanitized(error: Exception, marker: str) -> None:
+    assert marker not in str(error)
+    assert marker not in "".join(traceback.format_exception(error))
+    assert error.__cause__ is None
+    assert error.__context__ is None
+
+
 @pytest.mark.parametrize("task_type", sorted(VALID_OUTPUTS))
 def test_all_five_task_outputs_validate_and_match_checked_in_schema(task_type: str):
     output = validate_task_output(task_type, VALID_OUTPUTS[task_type])
@@ -197,6 +209,48 @@ def test_task_output_requires_matching_discriminator():
     payload = {**VALID_OUTPUTS["analyze_fit"], "task_type": "review_claims"}
     with pytest.raises(ProviderOutputError, match="schema"):
         validate_task_output("analyze_fit", payload)
+
+
+def test_strict_json_rejects_duplicate_member_names_recursively():
+    raw = '{"outer":{"claim":"first","claim":"second"}}'
+
+    with pytest.raises(ProviderOutputError, match="JSON"):
+        ai_contracts.parse_json_object(raw)
+
+
+@pytest.mark.parametrize("constant", ["NaN", "Infinity", "-Infinity"])
+def test_strict_json_rejects_nonstandard_numeric_constants(constant: str):
+    with pytest.raises(ProviderOutputError, match="JSON"):
+        ai_contracts.parse_json_object(f'{{"value":{constant}}}')
+
+
+def test_untrusted_contract_and_result_errors_have_no_secret_chain():
+    marker = "PRIVATE_CONTRACT_MARKER_7e91"
+    invalid_output = {
+        **VALID_OUTPUTS["analyze_fit"],
+        "matches": [marker * 100],
+    }
+    with pytest.raises(ProviderOutputError) as validation_error:
+        validate_task_output("analyze_fit", invalid_output)
+    assert_public_error_is_sanitized(validation_error.value, marker)
+
+    with pytest.raises(ProviderOutputError) as json_error:
+        ai_contracts.parse_json_object(f'{{"value":"{marker}"')
+    assert_public_error_is_sanitized(json_error.value, marker)
+
+    output = validate_task_output("analyze_fit", VALID_OUTPUTS["analyze_fit"])
+    with pytest.raises(ProviderOutputError) as result_error:
+        build_provider_result(
+            provider_kind="mock",
+            model=marker * 100,
+            privacy_mode=PrivacyMode.LOCAL_PRIVATE,
+            data_leaves_machine=False,
+            is_ai=True,
+            structured_output=output,
+            raw_output=json.dumps(VALID_OUTPUTS["analyze_fit"]),
+            invocation=InvocationMetadata(mode="fixture"),
+        )
+    assert_public_error_is_sanitized(result_error.value, marker)
 
 
 def test_only_the_five_documented_task_types_are_allowed():
@@ -257,6 +311,21 @@ def test_mock_provider_returns_validated_result_and_local_privacy(tmp_path: Path
     assert result.is_ai is True
 
 
+def test_mock_string_preserves_exact_raw_output_and_sha256(tmp_path: Path):
+    raw = json.dumps(
+        VALID_OUTPUTS["analyze_fit"],
+        indent=2,
+        sort_keys=False,
+    ) + "\n"
+
+    result = MockProvider(raw_output=raw).run(make_request(tmp_path))
+    expected_hash = hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+    assert result.raw_output == raw
+    assert result.raw_output_sha256 == expected_hash
+    assert result.invocation.raw_output_sha256 == expected_hash
+
+
 def test_mock_provider_rejects_oversized_raw_output_with_typed_error(tmp_path: Path):
     request = make_request(tmp_path)
     raw_output = json.dumps(VALID_OUTPUTS["analyze_fit"]) + (" " * 2_000_001)
@@ -285,6 +354,18 @@ def test_deterministic_provider_is_verifier_only_and_never_marked_as_ai(
 
 OLLAMA_MODEL = "qwen2.5:7b"
 OLLAMA_DIGEST = "a" * 64
+OLLAMA_ISOLATION = ai_contracts.OllamaIsolationEvidence(
+    attestation_version="ollama_isolation_v1",
+    runtime_owner="careerops",
+    cloud_disabled=True,
+    egress_enforced=True,
+    egress_policy="container_internal_no_egress",
+    runtime_instance_id="careerops_ollama_test",
+)
+
+
+def isolated_ollama(**values: Any) -> OllamaProvider:
+    return OllamaProvider(isolation_evidence=OLLAMA_ISOLATION, **values)
 
 
 class _OllamaTestServer(ThreadingHTTPServer):
@@ -357,9 +438,11 @@ def successful_ollama_responder(
     observed: dict[str, Any],
     *,
     model_metadata: dict[str, Any] | None = None,
+    show_metadata: dict[str, Any] | None = None,
     chat_payload: Any | None = None,
 ) -> Callable[[BaseHTTPRequestHandler], None]:
     metadata = model_metadata or local_model_metadata()
+    shown = show_metadata or metadata
     envelope = chat_payload or {
         "model": OLLAMA_MODEL,
         "done": True,
@@ -371,6 +454,12 @@ def successful_ollama_responder(
         if handler.path == "/api/tags":
             send_http_json(handler, 200, {"models": [metadata]})
             return
+        if handler.path == "/api/show":
+            length = int(handler.headers.get("Content-Length", "0"))
+            body = json.loads(handler.rfile.read(length))
+            observed.setdefault("show", []).append(body)
+            send_http_json(handler, 200, shown)
+            return
         if handler.path == "/api/chat":
             length = int(handler.headers.get("Content-Length", "0"))
             body = handler.rfile.read(length)
@@ -380,6 +469,45 @@ def successful_ollama_responder(
         send_http_json(handler, 404, {"error": "missing"})
 
     return respond
+
+
+def test_ollama_isolation_evidence_is_strict_structured_and_frozen():
+    evidence = OLLAMA_ISOLATION
+
+    assert evidence.runtime_owner == "careerops"
+    with pytest.raises(ValidationError):
+        evidence.cloud_disabled = False
+    with pytest.raises(ValidationError):
+        ai_contracts.OllamaIsolationEvidence(
+            attestation_version="ollama_isolation_v1",
+            runtime_owner="careerops",
+            cloud_disabled=True,
+            egress_enforced=True,
+            egress_policy="container_internal_no_egress",
+            runtime_instance_id="careerops_ollama_1",
+            environment_override=True,
+        )
+
+
+def test_unmanaged_ollama_is_fail_closed_without_any_http_request(tmp_path: Path):
+    request = make_request(tmp_path)
+    observed: list[str] = []
+
+    def record_request(handler: BaseHTTPRequestHandler) -> None:
+        observed.append(handler.path)
+        send_http_json(handler, 500, {"secret": "must-not-be-reached"})
+
+    with ollama_test_server(record_request) as endpoint:
+        provider = OllamaProvider(endpoint=endpoint)
+        availability = provider.availability()
+        with pytest.raises(ProviderUnavailableError, match="isolation"):
+            provider.run(request)
+
+    assert availability.available is False
+    assert availability.detail == "isolation_evidence_required"
+    assert availability.privacy_mode is PrivacyMode.CLOUD_EXTERNAL
+    assert availability.data_leaves_machine is True
+    assert observed == []
 
 
 def test_ollama_requires_a_finite_positive_timeout():
@@ -401,7 +529,7 @@ def test_ollama_requires_a_finite_positive_timeout():
     ],
 )
 def test_ollama_invalid_or_nonlocal_endpoint_is_unavailable(endpoint: str):
-    provider = OllamaProvider(endpoint=endpoint)
+    provider = isolated_ollama(endpoint=endpoint)
     status = provider.availability()
 
     assert status.available is False
@@ -412,7 +540,9 @@ def test_ollama_invalid_configuration_fails_run_with_typed_sanitized_error(
     tmp_path: Path,
 ):
     request = make_request(tmp_path)
-    provider = OllamaProvider(endpoint="http://user:private@127.0.0.1:11434")
+    provider = isolated_ollama(
+        endpoint="http://user:private@127.0.0.1:11434"
+    )
 
     with pytest.raises(ProviderUnavailableError) as captured:
         provider.run(request)
@@ -431,7 +561,7 @@ def test_ollama_real_transport_ignores_hostile_proxy_environment(
     monkeypatch.setenv("NO_PROXY", "")
 
     with ollama_test_server(successful_ollama_responder(observed)) as endpoint:
-        provider = OllamaProvider(endpoint=endpoint, model=OLLAMA_MODEL)
+        provider = isolated_ollama(endpoint=endpoint, model=OLLAMA_MODEL)
         status = provider.availability()
         result = provider.run(request)
 
@@ -445,6 +575,164 @@ def test_ollama_real_transport_ignores_hostile_proxy_environment(
         {"role": "system", "content": "Return only evidence-grounded JSON."},
         {"role": "user", "content": '{"resume":"Python"}'},
     ]
+
+
+def test_isolated_ollama_preflight_and_postflight_bind_local_model(tmp_path: Path):
+    observed: dict[str, Any] = {}
+    with ollama_test_server(successful_ollama_responder(observed)) as endpoint:
+        result = isolated_ollama(endpoint=endpoint).run(make_request(tmp_path))
+
+    assert observed["paths"] == [
+        "/api/tags",
+        "/api/show",
+        "/api/chat",
+        "/api/tags",
+        "/api/show",
+    ]
+    assert observed["show"] == [{"model": OLLAMA_MODEL}] * 2
+    assert result.invocation.model_digest == OLLAMA_DIGEST
+
+
+def test_ollama_show_remote_metadata_blocks_before_task_content(tmp_path: Path):
+    observed: dict[str, Any] = {}
+    remote_show = local_model_metadata(remote_host="cloud.ollama.com")
+    with ollama_test_server(
+        successful_ollama_responder(observed, show_metadata=remote_show)
+    ) as endpoint:
+        with pytest.raises(ProviderUnavailableError):
+            isolated_ollama(endpoint=endpoint).run(make_request(tmp_path))
+
+    assert observed["paths"] == ["/api/tags", "/api/show"]
+    assert "chat" not in observed
+
+
+def test_ollama_tags_remote_metadata_anywhere_blocks_before_task_content(
+    tmp_path: Path,
+):
+    observed: list[str] = []
+
+    def remote_tags_envelope(handler: BaseHTTPRequestHandler) -> None:
+        observed.append(handler.path)
+        send_http_json(
+            handler,
+            200,
+            {
+                "models": [local_model_metadata()],
+                "server": {"remote_host": "cloud.ollama.com"},
+            },
+        )
+
+    with ollama_test_server(remote_tags_envelope) as endpoint:
+        with pytest.raises(ProviderUnavailableError):
+            isolated_ollama(endpoint=endpoint).run(make_request(tmp_path))
+
+    assert observed == ["/api/tags"]
+
+
+def test_ollama_chat_remote_metadata_is_rejected(tmp_path: Path):
+    observed: dict[str, Any] = {}
+    chat = {
+        "model": OLLAMA_MODEL,
+        "done": True,
+        "remote_model": "gpt-cloud",
+        "message": {"content": json.dumps(VALID_OUTPUTS["analyze_fit"])},
+    }
+    with ollama_test_server(
+        successful_ollama_responder(observed, chat_payload=chat)
+    ) as endpoint:
+        with pytest.raises(ProviderOutputError):
+            isolated_ollama(endpoint=endpoint).run(make_request(tmp_path))
+
+    assert observed["paths"] == ["/api/tags", "/api/show", "/api/chat"]
+
+
+def test_ollama_preserves_exact_message_content_and_sha256(tmp_path: Path):
+    raw = json.dumps(
+        VALID_OUTPUTS["analyze_fit"],
+        indent=2,
+        sort_keys=False,
+    ) + "\n"
+    observed: dict[str, Any] = {}
+    chat = {
+        "model": OLLAMA_MODEL,
+        "done": True,
+        "message": {"content": raw},
+    }
+    with ollama_test_server(
+        successful_ollama_responder(observed, chat_payload=chat)
+    ) as endpoint:
+        result = isolated_ollama(endpoint=endpoint).run(make_request(tmp_path))
+
+    expected_hash = hashlib.sha256(raw.encode("utf-8")).hexdigest()
+    assert result.raw_output == raw
+    assert result.raw_output_sha256 == expected_hash
+    assert result.invocation.raw_output_sha256 == expected_hash
+
+
+def test_ollama_envelope_rejects_recursive_duplicate_members(tmp_path: Path):
+    content = json.dumps(VALID_OUTPUTS["analyze_fit"])
+
+    def duplicate(handler: BaseHTTPRequestHandler) -> None:
+        if handler.path == "/api/tags":
+            send_http_json(handler, 200, {"models": [local_model_metadata()]})
+            return
+        if handler.path == "/api/show":
+            send_http_json(handler, 200, local_model_metadata())
+            return
+        raw = (
+            '{"model":"qwen2.5:7b","done":true,'
+            '"audit":{"value":1,"value":2},"message":{"content":'
+            f"{json.dumps(content)}"
+            "}}"
+        ).encode("utf-8")
+        send_http_bytes(handler, 200, raw)
+
+    with ollama_test_server(duplicate) as endpoint:
+        with pytest.raises(ProviderOutputError, match="JSON"):
+            isolated_ollama(endpoint=endpoint).run(make_request(tmp_path))
+
+
+@pytest.mark.parametrize(
+    "post_metadata",
+    [
+        local_model_metadata(digest="b" * 64),
+        local_model_metadata(name="other:7b", model="other:7b"),
+    ],
+)
+def test_ollama_postflight_model_or_digest_drift_is_rejected(
+    tmp_path: Path, post_metadata: dict[str, Any]
+):
+    after_chat = False
+    observed: list[str] = []
+
+    def drift(handler: BaseHTTPRequestHandler) -> None:
+        nonlocal after_chat
+        observed.append(handler.path)
+        metadata = post_metadata if after_chat else local_model_metadata()
+        if handler.path == "/api/tags":
+            send_http_json(handler, 200, {"models": [metadata]})
+            return
+        if handler.path == "/api/show":
+            send_http_json(handler, 200, metadata)
+            return
+        after_chat = True
+        send_http_json(
+            handler,
+            200,
+            {
+                "model": OLLAMA_MODEL,
+                "done": True,
+                "message": {
+                    "content": json.dumps(VALID_OUTPUTS["analyze_fit"])
+                },
+            },
+        )
+
+    with ollama_test_server(drift) as endpoint:
+        with pytest.raises(ProviderUnavailableError):
+            isolated_ollama(endpoint=endpoint).run(make_request(tmp_path))
+
+    assert observed[:3] == ["/api/tags", "/api/show", "/api/chat"]
 
 
 def test_ollama_redirect_is_rejected_without_following(tmp_path: Path):
@@ -461,7 +749,7 @@ def test_ollama_redirect_is_rejected_without_following(tmp_path: Path):
         )
 
     with ollama_test_server(redirect) as endpoint:
-        provider = OllamaProvider(endpoint=endpoint)
+        provider = isolated_ollama(endpoint=endpoint)
         assert provider.availability().available is False
         with pytest.raises(ProviderInvocationError):
             provider.run(request)
@@ -475,6 +763,9 @@ def test_ollama_slow_drip_obeys_one_overall_deadline(tmp_path: Path):
     def slow(handler: BaseHTTPRequestHandler) -> None:
         if handler.path == "/api/tags":
             send_http_json(handler, 200, {"models": [local_model_metadata()]})
+            return
+        if handler.path == "/api/show":
+            send_http_json(handler, 200, local_model_metadata())
             return
         body = json.dumps(
             {
@@ -496,7 +787,7 @@ def test_ollama_slow_drip_obeys_one_overall_deadline(tmp_path: Path):
             time.sleep(0.02)
 
     with ollama_test_server(slow) as endpoint:
-        provider = OllamaProvider(endpoint=endpoint, timeout_seconds=0.12)
+        provider = isolated_ollama(endpoint=endpoint, timeout_seconds=0.12)
         started = time.monotonic()
         with pytest.raises(ProviderTimeoutError):
             provider.run(request)
@@ -505,22 +796,81 @@ def test_ollama_slow_drip_obeys_one_overall_deadline(tmp_path: Path):
     assert elapsed < 0.8
 
 
-def test_ollama_rejects_oversized_response_incrementally(tmp_path: Path):
+def test_ollama_escape_expanded_envelope_allows_bounded_inner_output(
+    tmp_path: Path,
+):
+    astral = "\U0010ffff"
+    payload = {
+        "task_type": "analyze_fit",
+        "score": 80,
+        "matches": [astral * 333] * 30,
+        "gaps": [astral * 333] * 30,
+        "risks": [astral * 333] * 30,
+        "recommendations": [astral * 333] * 30,
+    }
+    inner = json.dumps(payload, separators=(",", ":"))
+    envelope = json.dumps(
+        {
+            "model": OLLAMA_MODEL,
+            "done": True,
+            "message": {"content": inner},
+        }
+    ).encode("utf-8")
+    assert len(inner.encode("utf-8")) <= ai_contracts.MAX_PROVIDER_OUTPUT_BYTES
+    assert len(envelope) > ai_contracts.MAX_PROVIDER_OUTPUT_BYTES
+    observed: dict[str, Any] = {}
+
+    with ollama_test_server(
+        successful_ollama_responder(
+            observed,
+            chat_payload=json.loads(envelope),
+        )
+    ) as endpoint:
+        result = isolated_ollama(endpoint=endpoint).run(
+            make_request(tmp_path, "analyze_fit")
+        )
+
+    assert result.structured_output.score == 80
+
+
+def test_ollama_rejects_oversized_envelope_incrementally(tmp_path: Path):
     request = make_request(tmp_path)
 
     def oversized(handler: BaseHTTPRequestHandler) -> None:
         if handler.path == "/api/tags":
             send_http_json(handler, 200, {"models": [local_model_metadata()]})
             return
+        if handler.path == "/api/show":
+            send_http_json(handler, 200, local_model_metadata())
+            return
         send_http_bytes(
             handler,
             200,
-            b"x" * (ai_contracts.MAX_PROVIDER_OUTPUT_BYTES + 1),
+            b"x" * (ollama_provider_module.MAX_OLLAMA_ENVELOPE_BYTES + 1),
         )
 
     with ollama_test_server(oversized) as endpoint:
         with pytest.raises(ProviderOutputError, match="size limit"):
-            OllamaProvider(endpoint=endpoint).run(request)
+            isolated_ollama(endpoint=endpoint).run(request)
+
+
+def test_ollama_inner_output_keeps_canonical_512k_bound(tmp_path: Path):
+    request = make_request(tmp_path)
+    observed: dict[str, Any] = {}
+    content = json.dumps(VALID_OUTPUTS["analyze_fit"]) + (
+        " " * ai_contracts.MAX_PROVIDER_OUTPUT_BYTES
+    )
+    chat = {
+        "model": OLLAMA_MODEL,
+        "done": True,
+        "message": {"content": content},
+    }
+
+    with ollama_test_server(
+        successful_ollama_responder(observed, chat_payload=chat)
+    ) as endpoint:
+        with pytest.raises(ProviderOutputError, match="size limit"):
+            isolated_ollama(endpoint=endpoint).run(request)
 
 
 def test_ollama_http_error_is_typed_sanitized_and_not_retried(tmp_path: Path):
@@ -532,15 +882,34 @@ def test_ollama_http_error_is_typed_sanitized_and_not_retried(tmp_path: Path):
         if handler.path == "/api/tags":
             send_http_json(handler, 200, {"models": [local_model_metadata()]})
             return
+        if handler.path == "/api/show":
+            send_http_json(handler, 200, local_model_metadata())
+            return
         chat_calls += 1
         send_http_json(handler, 500, {"api_key": "private-server-secret"})
 
     with ollama_test_server(fail) as endpoint:
         with pytest.raises(ProviderInvocationError) as captured:
-            OllamaProvider(endpoint=endpoint).run(request)
+            isolated_ollama(endpoint=endpoint).run(request)
 
     assert chat_calls == 1
-    assert "private-server-secret" not in str(captured.value)
+    assert_public_error_is_sanitized(captured.value, "private-server-secret")
+
+
+def test_ollama_transport_error_discards_secret_exception_chain(tmp_path: Path):
+    marker = "PRIVATE_HEADER_MARKER_813c"
+
+    def hostile_length(handler: BaseHTTPRequestHandler) -> None:
+        handler.send_response(200)
+        handler.send_header("Content-Type", "application/json")
+        handler.send_header("Content-Length", marker)
+        handler.end_headers()
+
+    with ollama_test_server(hostile_length) as endpoint:
+        with pytest.raises(ProviderOutputError) as captured:
+            isolated_ollama(endpoint=endpoint).run(make_request(tmp_path))
+
+    assert_public_error_is_sanitized(captured.value, marker)
 
 
 @pytest.mark.parametrize(
@@ -575,12 +944,14 @@ def test_ollama_rejects_malformed_incomplete_or_wrong_model_chat(
     def malformed(handler: BaseHTTPRequestHandler) -> None:
         if handler.path == "/api/tags":
             send_http_json(handler, 200, {"models": [local_model_metadata()]})
+        elif handler.path == "/api/show":
+            send_http_json(handler, 200, local_model_metadata())
         else:
             send_http_bytes(handler, 200, chat_body)
 
     with ollama_test_server(malformed) as endpoint:
         with pytest.raises(ProviderOutputError):
-            OllamaProvider(endpoint=endpoint).run(request)
+            isolated_ollama(endpoint=endpoint).run(request)
 
 
 @pytest.mark.parametrize(
@@ -603,7 +974,7 @@ def test_ollama_rejects_unproven_or_remote_model_metadata(
     with ollama_test_server(
         successful_ollama_responder(observed, model_metadata=metadata)
     ) as endpoint:
-        provider = OllamaProvider(endpoint=endpoint)
+        provider = isolated_ollama(endpoint=endpoint)
         assert provider.availability().available is False
         with pytest.raises(ProviderUnavailableError):
             provider.run(request)
@@ -621,7 +992,7 @@ def test_ollama_rejects_nested_container_remote_metadata_with_typed_error(
         successful_ollama_responder(observed, model_metadata=metadata)
     ) as endpoint:
         with pytest.raises(ProviderUnavailableError):
-            OllamaProvider(endpoint=endpoint).run(request)
+            isolated_ollama(endpoint=endpoint).run(request)
 
     assert "/api/chat" not in observed.get("paths", [])
 
@@ -644,7 +1015,7 @@ def test_ollama_uses_sealed_snapshots_and_request_aware_validation(tmp_path: Pat
         successful_ollama_responder(observed, chat_payload=chat)
     ) as endpoint:
         with pytest.raises(ProviderOutputError, match="claim coverage"):
-            OllamaProvider(endpoint=endpoint).run(request)
+            isolated_ollama(endpoint=endpoint).run(request)
 
     assert observed["chat"]["messages"][0]["content"] == (
         "Return only evidence-grounded JSON."
@@ -900,8 +1271,7 @@ def test_deterministic_callback_failure_is_typed_and_sanitized(tmp_path: Path):
     with pytest.raises(ProviderInvocationError) as captured:
         DeterministicProvider(verifier=fail).run(request)
 
-    assert "private-callback-secret" not in str(captured.value)
-    assert captured.value.__cause__ is None
+    assert_public_error_is_sanitized(captured.value, "private-callback-secret")
 
 
 def test_deterministic_mapping_failure_is_typed_and_sanitized(tmp_path: Path):
@@ -916,8 +1286,7 @@ def test_deterministic_mapping_failure_is_typed_and_sanitized(tmp_path: Path):
     with pytest.raises(ProviderOutputError) as captured:
         provider.run(make_request(tmp_path))
 
-    assert "private-verifier-secret" not in str(captured.value)
-    assert captured.value.__cause__ is None
+    assert_public_error_is_sanitized(captured.value, "private-verifier-secret")
 
 
 def test_mock_mapping_failure_is_typed_and_sanitized(tmp_path: Path):
@@ -931,8 +1300,7 @@ def test_mock_mapping_failure_is_typed_and_sanitized(tmp_path: Path):
     with pytest.raises(ProviderOutputError) as captured:
         MockProvider(raw_output=HostileMapping()).run(make_request(tmp_path))
 
-    assert "private-mapping-secret" not in str(captured.value)
-    assert captured.value.__cause__ is None
+    assert_public_error_is_sanitized(captured.value, "private-mapping-secret")
 
 
 @pytest.mark.parametrize(
@@ -1036,22 +1404,29 @@ class FakeCodexRunner:
         version: str = "codex-cli 0.144.5\n",
         login: str = "Logged in using ChatGPT\n",
         login_stderr: bool = False,
+        raw_output_text: str | None = None,
         output_mode: str = "valid",
     ):
         self.output = output or VALID_OUTPUTS["analyze_fit"]
         self.version = version
         self.login = login
         self.login_stderr = login_stderr
+        self.raw_output_text = raw_output_text
         self.output_mode = output_mode
+        self.native_to_replace: Path | None = None
         self.calls: list[dict[str, Any]] = []
 
     def run(self, command: list[str], **values: Any):
-        self.calls.append({"command": command, **values})
+        call = {"command": command, **values}
+        self.calls.append(call)
         outcome = process_helpers().ProcessOutcome
         if command[-1] == "--version":
             return outcome(0, self.version.encode(), b"")
         if command[-2:] == ["login", "status"]:
             encoded = self.login.encode()
+            if self.output_mode == "replace_after_login":
+                assert self.native_to_replace is not None
+                self.native_to_replace.write_bytes(b"MZ-replaced-after-login")
             return (
                 outcome(0, b"", encoded)
                 if self.login_stderr
@@ -1061,6 +1436,8 @@ class FakeCodexRunner:
             raise process_helpers().ProcessDeadlineExceeded()
         if self.output_mode == "nonzero":
             return outcome(7, b"private prompt echo", b"api_key=private-secret")
+        schema_path = Path(command[command.index("--output-schema") + 1])
+        call["schema_bytes"] = schema_path.read_bytes()
         output_path = Path(command[command.index("--output-last-message") + 1])
         if self.output_mode == "malformed":
             output_path.write_text("not-json", encoding="utf-8")
@@ -1071,7 +1448,19 @@ class FakeCodexRunner:
             outside.write_text(json.dumps(self.output), encoding="utf-8")
             os.link(outside, output_path)
         elif self.output_mode == "valid":
-            output_path.write_text(json.dumps(self.output), encoding="utf-8")
+            output_path.write_bytes(
+                (self.raw_output_text or json.dumps(self.output)).encode("utf-8")
+            )
+        elif self.output_mode == "replace_during_exec":
+            output_path.write_bytes(json.dumps(self.output).encode("utf-8"))
+            assert self.native_to_replace is not None
+            self.native_to_replace.write_bytes(b"MZ-replaced-during-exec")
+        elif self.output_mode == "unexpected_content":
+            output_path.write_bytes(json.dumps(self.output).encode("utf-8"))
+            (output_path.parent / "unexpected.txt").write_text(
+                "do not recursively delete",
+                encoding="utf-8",
+            )
         return outcome(0, b"discarded", b"discarded")
 
 
@@ -1110,6 +1499,58 @@ def test_hardened_codex_discovers_safe_interchangeable_identities(tmp_path: Path
     assert all(Path(item.native_executable).suffix.casefold() == ".exe" for item in providers)
 
 
+def test_codex_single_command_override_takes_precedence(tmp_path: Path):
+    fixture = make_codex_fixture(tmp_path)
+    environment = {
+        **fixture["environment"],
+        "CAREEROPS_CODEX_COMMAND": "codex",
+        "CAREEROPS_CODEX_COMMANDS": "codex2,codex",
+    }
+
+    providers = discover_codex_providers(
+        which=fixture["which"],
+        environment=environment,
+        process_runner=FakeCodexRunner(),
+    )
+
+    assert [item.identity_name for item in providers] == ["codex"]
+    assert [item.is_default for item in providers] == [True]
+
+
+def test_codex_command_list_preserves_configured_order(tmp_path: Path):
+    fixture = make_codex_fixture(tmp_path)
+    environment = {
+        **fixture["environment"],
+        "CAREEROPS_CODEX_COMMANDS": "codex,codex2",
+    }
+
+    providers = discover_codex_providers(
+        which=fixture["which"],
+        environment=environment,
+        process_runner=FakeCodexRunner(),
+    )
+
+    assert [item.identity_name for item in providers] == ["codex", "codex2"]
+    assert [item.is_default for item in providers] == [True, False]
+
+
+def test_codex_command_list_deduplicates_without_reordering(tmp_path: Path):
+    fixture = make_codex_fixture(tmp_path)
+    environment = {
+        **fixture["environment"],
+        "CAREEROPS_CODEX_COMMANDS": " codex2, codex2, codex, codex ",
+    }
+
+    providers = discover_codex_providers(
+        which=fixture["which"],
+        environment=environment,
+        process_runner=FakeCodexRunner(),
+    )
+
+    assert [item.identity_name for item in providers] == ["codex2", "codex"]
+    assert [item.is_default for item in providers] == [True, False]
+
+
 def test_native_codex_hash_streams_a_legitimate_current_size(
     monkeypatch: pytest.MonkeyPatch,
 ):
@@ -1131,6 +1572,7 @@ def test_native_codex_hash_streams_a_legitimate_current_size(
     digest, observed = codex_provider_module._stream_sha256(
         123,
         size_limit=codex_provider_module.MAX_CODEX_EXECUTABLE_BYTES,
+        deadline=time.monotonic() + 5,
     )
 
     assert observed == current_native_size
@@ -1169,12 +1611,16 @@ def test_native_codex_streaming_hash_detects_mutation(
     native.write_bytes(b"MZ-fixture")
     stream_sha256 = codex_provider_module._stream_sha256
 
-    def mutate_then_hash(descriptor: int, *, size_limit: int):
+    def mutate_then_hash(descriptor: int, *, size_limit: int, deadline: float):
         with native.open("ab") as output:
             output.write(b"changed")
             output.flush()
             os.fsync(output.fileno())
-        return stream_sha256(descriptor, size_limit=size_limit)
+        return stream_sha256(
+            descriptor,
+            size_limit=size_limit,
+            deadline=deadline,
+        )
 
     monkeypatch.setattr(
         codex_provider_module,
@@ -1183,7 +1629,10 @@ def test_native_codex_streaming_hash_detects_mutation(
     )
 
     with pytest.raises(ProviderUnavailableError, match="changed during read"):
-        codex_provider_module._validate_codex_native(native)
+        codex_provider_module._validate_codex_native(
+            native,
+            deadline=time.monotonic() + 5,
+        )
 
 
 def test_native_codex_streaming_hash_rejects_hard_link(tmp_path: Path):
@@ -1197,7 +1646,50 @@ def test_native_codex_streaming_hash_rejects_hard_link(tmp_path: Path):
     os.link(original, linked)
 
     with pytest.raises(ProviderUnavailableError, match="unsafe"):
-        codex_provider_module._validate_codex_native(linked)
+        codex_provider_module._validate_codex_native(
+            linked,
+            deadline=time.monotonic() + 5,
+        )
+
+
+def test_native_codex_streaming_hash_obeys_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    calls = 0
+
+    def slow_read(_descriptor: int, _requested: int) -> bytes:
+        nonlocal calls
+        calls += 1
+        time.sleep(0.02)
+        return b"x" if calls == 1 else b""
+
+    monkeypatch.setattr(codex_provider_module.os, "read", slow_read)
+
+    with pytest.raises(ProviderTimeoutError, match="timed out"):
+        codex_provider_module._stream_sha256(
+            123,
+            size_limit=1024,
+            deadline=time.monotonic() + 0.01,
+        )
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows drive policy")
+def test_native_codex_rejects_remote_or_nonfixed_windows_drive(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    native = tmp_path / "codex.exe"
+    native.write_bytes(b"MZ-fixture")
+    monkeypatch.setattr(
+        codex_provider_module,
+        "_windows_drive_type",
+        lambda _path: 4,
+    )
+
+    with pytest.raises(ProviderUnavailableError, match="fixed local drive"):
+        codex_provider_module._validate_codex_native(
+            native,
+            deadline=time.monotonic() + 5,
+        )
 
 
 def test_codex2_wrapper_reader_remains_capped_at_4_kib(tmp_path: Path):
@@ -1278,7 +1770,7 @@ def test_hardened_codex_invokes_native_exe_with_pinned_isolated_command(
     assert attempt_dir.name.startswith(".careerops-attempt-")
     schema_path = Path(command[command.index("--output-schema") + 1])
     assert schema_path.parent == attempt_dir
-    assert schema_path.read_bytes() == request.schema_snapshot
+    assert execution_call["schema_bytes"] == request.schema_snapshot
     assert execution_call["input_bytes"] == (
         b"Return only evidence-grounded JSON.\n\n"
         b"<careerops_context>\n"
@@ -1300,6 +1792,48 @@ def test_hardened_codex_invokes_native_exe_with_pinned_isolated_command(
     assert result.invocation.codex_home == str(fixture["account2_home"].resolve())
     assert result.invocation.reasoning_effort == "xhigh"
     assert result.invocation.command == tuple(command)
+
+
+def test_codex_preserves_exact_output_and_sha256(tmp_path: Path):
+    raw = json.dumps(
+        VALID_OUTPUTS["analyze_fit"],
+        indent=2,
+        sort_keys=False,
+    ) + "\n"
+    runner = FakeCodexRunner(raw_output_text=raw)
+    provider, _fixture = make_hardened_codex_provider(
+        tmp_path / "provider",
+        runner,
+    )
+
+    result = provider.run(make_request(tmp_path / "request"))
+    expected_hash = hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+    assert result.raw_output == raw
+    assert result.raw_output_sha256 == expected_hash
+    assert result.invocation.raw_output_sha256 == expected_hash
+
+
+def test_codex_rejects_native_replacement_immediately_after_login(tmp_path: Path):
+    runner = FakeCodexRunner(output_mode="replace_after_login")
+    provider, fixture = make_hardened_codex_provider(tmp_path / "provider", runner)
+    runner.native_to_replace = fixture["native"]
+
+    with pytest.raises(ProviderUnavailableError, match="identity changed"):
+        provider.run(make_request(tmp_path / "request"))
+
+    assert not any("exec" in call["command"] for call in runner.calls)
+
+
+def test_codex_rejects_native_replacement_during_execution(tmp_path: Path):
+    runner = FakeCodexRunner(output_mode="replace_during_exec")
+    provider, fixture = make_hardened_codex_provider(tmp_path / "provider", runner)
+    runner.native_to_replace = fixture["native"]
+
+    with pytest.raises(ProviderUnavailableError, match="identity changed"):
+        provider.run(make_request(tmp_path / "request"))
+
+    assert len([call for call in runner.calls if "exec" in call["command"]]) == 1
 
 
 def test_hardened_codex_explicit_model_effort_and_home_overrides(tmp_path: Path):
@@ -1430,6 +1964,28 @@ def test_hardened_codex_missing_selected_identity_never_checks_fallback(
     assert observed == ["codex2"]
 
 
+def test_codex_process_start_error_discards_secret_exception_chain(tmp_path: Path):
+    marker = "PRIVATE_PROCESS_MARKER_9f2a"
+
+    class HostileRunner:
+        def run(self, _command: list[str], **_values: Any):
+            raise process_helpers().ProcessStartError(marker)
+
+    fixture = make_codex_fixture(tmp_path / "provider")
+    provider = CodexProvider(
+        executable="codex2",
+        which=fixture["which"],
+        environment=fixture["environment"],
+        process_runner=HostileRunner(),
+        timeout_seconds=2,
+    )
+
+    with pytest.raises(ProviderUnavailableError) as captured:
+        provider.run(make_request(tmp_path / "request"))
+
+    assert_public_error_is_sanitized(captured.value, marker)
+
+
 @pytest.mark.parametrize(
     ("mode", "error_type"),
     [
@@ -1453,6 +2009,57 @@ def test_hardened_codex_failures_are_typed_sanitized_and_single_attempt(
 
     assert "private" not in str(captured.value)
     assert len([call for call in runner.calls if "exec" in call["command"]]) == 1
+
+
+@pytest.mark.parametrize(
+    ("mode", "error_type"),
+    [
+        ("valid", None),
+        ("nonzero", ProviderInvocationError),
+        ("malformed", ProviderOutputError),
+        ("timeout", ProviderTimeoutError),
+    ],
+)
+def test_codex_attempt_directory_is_cleaned_on_every_normal_exit(
+    tmp_path: Path,
+    mode: str,
+    error_type: type[Exception] | None,
+):
+    runner = FakeCodexRunner(output_mode=mode)
+    provider, _fixture = make_hardened_codex_provider(
+        tmp_path / "provider",
+        runner,
+    )
+    request = make_request(tmp_path / "request")
+
+    if error_type is None:
+        provider.run(request)
+    else:
+        with pytest.raises(error_type):
+            provider.run(request)
+
+    assert list(request.task_dir.glob(".careerops-attempt-*")) == []
+
+
+def test_codex_unexpected_attempt_content_fails_closed_without_recursive_delete(
+    tmp_path: Path,
+):
+    runner = FakeCodexRunner(output_mode="unexpected_content")
+    provider, _fixture = make_hardened_codex_provider(
+        tmp_path / "provider",
+        runner,
+    )
+    request = make_request(tmp_path / "request")
+
+    with pytest.raises(ProviderInvocationError, match="clean") as captured:
+        provider.run(request)
+
+    assert_public_error_is_sanitized(captured.value, "do not recursively delete")
+    attempts = list(request.task_dir.glob(".careerops-attempt-*"))
+    assert len(attempts) == 1
+    assert (attempts[0] / "unexpected.txt").read_text(encoding="utf-8") == (
+        "do not recursively delete"
+    )
 
 
 def test_hardened_codex_uses_sealed_inputs_and_request_aware_claims(tmp_path: Path):
@@ -1521,6 +2128,68 @@ def test_hardened_process_runner_bounds_captured_output():
     assert outcome.returncode == 0
     assert len(outcome.stdout) == 1_024
     assert outcome.stderr == b""
+
+
+def test_windows_process_is_suspended_until_job_assignment(monkeypatch):
+    helper = process_helpers()
+    events: list[str] = []
+    observed: dict[str, Any] = {}
+
+    class FakeProcess:
+        def __init__(self):
+            self.stdin = io.BytesIO()
+            self.stdout = None
+            self.stderr = None
+            self.returncode: int | None = None
+            self.pid = 123
+            self._handle = 456
+
+        def wait(self, timeout=None):
+            events.append("wait")
+            self.returncode = 0
+            return 0
+
+        def poll(self):
+            return self.returncode
+
+        def kill(self):
+            events.append("kill")
+            self.returncode = -9
+
+    def fake_popen(command, **values):
+        events.append("popen")
+        observed.update(values)
+        return FakeProcess()
+
+    class FakeJob:
+        def __init__(self, process):
+            events.append("assign")
+
+        def resume(self):
+            events.append("resume")
+
+        def terminate(self):
+            events.append("terminate")
+
+        def close(self):
+            events.append("close")
+
+    monkeypatch.setattr(helper.sys, "platform", "win32")
+    monkeypatch.setattr(helper.subprocess, "CREATE_NO_WINDOW", 0x08000000, raising=False)
+    monkeypatch.setattr(helper.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(helper, "_WindowsJob", FakeJob)
+
+    outcome = helper.run_process(
+        ["codex.exe", "--version"],
+        input_bytes=b"",
+        timeout_seconds=1,
+        environment={},
+        capture_limit=0,
+    )
+
+    assert outcome.returncode == 0
+    assert observed["creationflags"] & helper._CREATE_SUSPENDED
+    assert events.index("assign") < events.index("resume") < events.index("wait")
 
 
 def test_hardened_process_runner_kills_timeout_process_tree(tmp_path: Path):

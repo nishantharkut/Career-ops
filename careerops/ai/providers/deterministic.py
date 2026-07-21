@@ -38,16 +38,20 @@ class DeterministicProvider:
         )
 
     def run(self, request: ProviderRequest) -> ProviderResult:
+        callback_failed = False
         try:
             verifier_output = self.verifier(request)
         except Exception:
-            raise ProviderInvocationError("Deterministic verifier failed") from None
+            callback_failed = True
+        if callback_failed:
+            raise ProviderInvocationError("Deterministic verifier failed")
+        conversion_failed = False
         try:
             payload = dict(verifier_output)
         except Exception:
-            raise ProviderOutputError(
-                "Deterministic verifier output was invalid"
-            ) from None
+            conversion_failed = True
+        if conversion_failed:
+            raise ProviderOutputError("Deterministic verifier output was invalid")
         output = validate_provider_output(request, payload)
         raw_output = serialize_provider_output(output)
         return build_provider_result(
