@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import stat
@@ -95,11 +96,35 @@ def _strict_json_loads(raw: str | bytes) -> Any:
     def reject_nonstandard_constant(_value: str) -> Any:
         raise ValueError("non-standard JSON constant")
 
-    return json.loads(
+    def parse_finite_float(value: str) -> float:
+        parsed = float(value)
+        if not math.isfinite(parsed):
+            raise ValueError("non-finite JSON number")
+        return parsed
+
+    value = json.loads(
         raw,
         object_pairs_hook=_reject_duplicate_json_members,
         parse_constant=reject_nonstandard_constant,
+        parse_float=parse_finite_float,
     )
+    stack = [value]
+    while stack:
+        current = stack.pop()
+        if isinstance(current, str):
+            current.encode("utf-8")
+        elif isinstance(current, float):
+            if not math.isfinite(current):
+                raise ValueError("non-finite JSON number")
+        elif isinstance(current, dict):
+            for key, nested in current.items():
+                key.encode("utf-8")
+                stack.append(nested)
+        elif isinstance(current, list):
+            stack.extend(current)
+        elif current is not None and not isinstance(current, (bool, int)):
+            raise ValueError("unsupported JSON value")
+    return value
 
 
 class ProviderError(RuntimeError):

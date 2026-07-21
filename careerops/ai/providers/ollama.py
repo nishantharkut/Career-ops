@@ -568,7 +568,7 @@ class OllamaProvider:
             model=self.model,
             digest=digest,
             size=size,
-            tags_metadata_sha256=self._metadata_sha256(metadata),
+            tags_metadata_sha256=self._metadata_sha256(payload),
             show_metadata_sha256=show_metadata_sha256,
         )
 
@@ -591,17 +591,44 @@ class OllamaProvider:
         return digest.lower(), size
 
     def _validate_show_metadata(self, metadata: dict[str, Any]) -> str:
+        optional_string_fields = {
+            "license",
+            "modelfile",
+            "modified_at",
+            "parameters",
+            "system",
+            "template",
+        }
+        optional_object_fields = {"details", "model_info"}
+        optional_list_fields = {"messages", "tensors"}
+        recognized_fields = (
+            optional_string_fields
+            | optional_object_fields
+            | optional_list_fields
+            | {"capabilities"}
+        )
+        invalid = not metadata or not recognized_fields.intersection(metadata)
+        invalid = invalid or any(
+            field in metadata and not isinstance(metadata[field], str)
+            for field in optional_string_fields
+        )
+        invalid = invalid or any(
+            field in metadata and not isinstance(metadata[field], dict)
+            for field in optional_object_fields
+        )
+        invalid = invalid or any(
+            field in metadata and not isinstance(metadata[field], list)
+            for field in optional_list_fields
+        )
         capabilities = metadata.get("capabilities")
-        if (
-            not isinstance(metadata.get("parameters"), str)
-            or not isinstance(metadata.get("license"), str)
-            or not isinstance(metadata.get("modified_at"), str)
-            or not isinstance(metadata.get("details"), dict)
-            or not isinstance(capabilities, list)
-            or not all(isinstance(item, str) for item in capabilities)
-            or not isinstance(metadata.get("model_info"), dict)
-            or self._contains_remote_metadata(metadata)
-        ):
+        invalid = invalid or (
+            capabilities is not None
+            and (
+                not isinstance(capabilities, list)
+                or not all(isinstance(item, str) for item in capabilities)
+            )
+        )
+        if invalid or self._contains_remote_metadata(metadata):
             raise ProviderUnavailableError(
                 "Ollama show metadata was invalid or remote"
             )
@@ -609,13 +636,18 @@ class OllamaProvider:
 
     @staticmethod
     def _metadata_sha256(metadata: dict[str, Any]) -> str:
-        raw = json.dumps(
-            metadata,
-            ensure_ascii=False,
-            allow_nan=False,
-            separators=(",", ":"),
-            sort_keys=True,
-        ).encode("utf-8")
+        try:
+            raw = json.dumps(
+                metadata,
+                ensure_ascii=False,
+                allow_nan=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            ).encode("utf-8")
+        except (TypeError, ValueError, UnicodeError, RecursionError):
+            raise ProviderOutputError(
+                "Ollama metadata was not canonical JSON"
+            ) from None
         return hashlib.sha256(raw).hexdigest()
 
     @classmethod
@@ -648,8 +680,6 @@ class OllamaProvider:
             elif isinstance(current, (list, tuple)):
                 for item in current:
                     cls._push_metadata_node(stack, observed, item, depth + 1)
-            elif isinstance(current, str) and "cloud" in current.casefold():
-                return True
         return False
 
     @staticmethod

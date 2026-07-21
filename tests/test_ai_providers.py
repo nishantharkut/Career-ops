@@ -225,6 +225,22 @@ def test_strict_json_rejects_nonstandard_numeric_constants(constant: str):
         ai_contracts.parse_json_object(f'{{"value":{constant}}}')
 
 
+@pytest.mark.parametrize(
+    "raw",
+    [
+        '{"value":1e999}',
+        '{"value":"PRIVATE_SURROGATE_MARKER_6f2a\\ud800"}',
+    ],
+)
+def test_strict_json_rejects_noncanonical_values_without_leaking(raw: str):
+    marker = "PRIVATE_SURROGATE_MARKER_6f2a"
+
+    with pytest.raises(ProviderOutputError, match="JSON") as captured:
+        ai_contracts.parse_json_object(raw)
+
+    assert_public_error_is_sanitized(captured.value, marker)
+
+
 def test_strict_json_sanitizes_deep_nesting_recursion_error(
     monkeypatch: pytest.MonkeyPatch,
 ):
@@ -822,6 +838,26 @@ def test_ollama_accepts_official_current_show_response(tmp_path: Path):
     ]
 
 
+def test_ollama_accepts_optional_show_fields_and_harmless_cloud_prose(
+    tmp_path: Path,
+):
+    observed: dict[str, Any] = {}
+    shown = {
+        "license": "Local model license for cloud-native application authors",
+        "details": official_show_metadata()["details"],
+        "model_info": official_show_metadata()["model_info"],
+    }
+
+    with ollama_test_server(
+        successful_ollama_responder(observed, show_metadata=shown)
+    ) as endpoint:
+        result = isolated_ollama(endpoint=endpoint).run(make_request(tmp_path))
+
+    assert result.invocation.show_metadata_sha256 == hashlib.sha256(
+        json.dumps(shown, separators=(",", ":"), sort_keys=True).encode("utf-8")
+    ).hexdigest()
+
+
 def test_ollama_local_private_result_persists_complete_justification(
     tmp_path: Path,
 ):
@@ -858,7 +894,9 @@ def test_ollama_local_private_result_persists_complete_justification(
         result = provider.run(make_request(tmp_path))
 
     tags_hash = hashlib.sha256(
-        json.dumps(tags, separators=(",", ":"), sort_keys=True).encode("utf-8")
+        json.dumps(
+            {"models": [tags]}, separators=(",", ":"), sort_keys=True
+        ).encode("utf-8")
     ).hexdigest()
     show_hash = hashlib.sha256(
         json.dumps(shown, separators=(",", ":"), sort_keys=True).encode("utf-8")
@@ -880,6 +918,47 @@ def test_ollama_local_private_result_persists_complete_justification(
     assert availability.data_leaves_machine is False
     assert result.privacy_mode is PrivacyMode.LOCAL_PRIVATE
     assert result.data_leaves_machine is False
+
+
+def test_ollama_rejects_full_tags_envelope_change_during_run(tmp_path: Path):
+    tag_calls = 0
+
+    def changing_tags(handler: BaseHTTPRequestHandler) -> None:
+        nonlocal tag_calls
+        if handler.path == "/api/tags":
+            tag_calls += 1
+            send_http_json(
+                handler,
+                200,
+                {
+                    "models": [local_model_metadata()],
+                    "modified_at": f"revision-{tag_calls}",
+                },
+            )
+            return
+
+        length = int(handler.headers.get("Content-Length", "0"))
+        handler.rfile.read(length)
+        if handler.path == "/api/show":
+            send_http_json(handler, 200, official_show_metadata())
+            return
+        send_http_json(
+            handler,
+            200,
+            {
+                "model": OLLAMA_MODEL,
+                "done": True,
+                "message": {
+                    "content": json.dumps(VALID_OUTPUTS["analyze_fit"])
+                },
+            },
+        )
+
+    with ollama_test_server(changing_tags) as endpoint:
+        with pytest.raises(ProviderUnavailableError, match="provenance changed"):
+            isolated_ollama(endpoint=endpoint).run(make_request(tmp_path))
+
+    assert tag_calls == 2
 
 
 def test_ollama_compatibility_probe_calls_only_tags_and_show():
