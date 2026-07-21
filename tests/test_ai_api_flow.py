@@ -3,8 +3,11 @@ from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 import hashlib
+import json
 from pathlib import Path
-from threading import Event, Lock
+import sqlite3
+from threading import Event, Lock, enumerate as enumerate_threads
+import time
 from typing import Any
 
 import pytest
@@ -216,6 +219,170 @@ def select_resume(repo: CareerOpsRepository, application_id: str):
     return resume
 
 
+def wait_for_task_status(
+    repo: CareerOpsRepository,
+    task_id: str,
+    expected_status: str,
+    *,
+    timeout: float = 5,
+):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        task = repo.get_ai_task(task_id)
+        if task.status.value == expected_status:
+            return task
+        time.sleep(0.01)
+    raise AssertionError(
+        f"Task {task_id} did not reach {expected_status}: "
+        f"{repo.get_ai_task(task_id).status.value}"
+    )
+
+
+def test_task_runner_retries_transient_claim_failure_while_service_is_alive(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    repo = make_repo(tmp_path)
+    application = create_application(repo)
+    status = availability()
+    config = create_provider_config(repo, status)
+    provider = ControlledProvider(status)
+    app = create_app(
+        repo,
+        provider_registry={config.id: provider},
+        task_poll_interval_seconds=0.01,
+        task_worker_count=1,
+    )
+    original_claim = repo.claim_ai_task
+    first_failure = Event()
+    claim_attempts = 0
+
+    def fail_first_claim(task_id: str):
+        nonlocal claim_attempts
+        claim_attempts += 1
+        if claim_attempts == 1:
+            first_failure.set()
+            raise sqlite3.OperationalError("transient claim failure")
+        return original_claim(task_id)
+
+    monkeypatch.setattr(repo, "claim_ai_task", fail_first_claim)
+
+    with TestClient(app) as client:
+        response = client.post(
+            f"/applications/{application.id}/ai-tasks",
+            json={"task_type": "analyze_jd", "provider_config_id": config.id},
+        )
+        assert response.status_code == 202
+        assert first_failure.wait(timeout=2)
+        completed = wait_for_task_status(repo, response.json()["id"], "completed")
+
+    assert completed.error_summary == ""
+    assert claim_attempts >= 2
+    assert provider.calls == 1
+
+
+def test_task_runner_executes_pending_and_recovers_expired_tasks_on_startup(
+    tmp_path: Path,
+):
+    from careerops.ai.orchestrator import AiOrchestrator
+
+    repo = make_repo(tmp_path)
+    application = create_application(repo)
+    status = availability()
+    config = create_provider_config(repo, status)
+    provider = ControlledProvider(status)
+    orchestrator = AiOrchestrator(repo, {config.id: provider})
+    pending = orchestrator.enqueue(application.id, "analyze_jd", config.id)
+    expired = orchestrator.enqueue(application.id, "analyze_jd", config.id)
+    assert repo.claim_ai_task(expired.id) is not None
+    with repo.connection() as connection:
+        connection.execute(
+            "UPDATE ai_tasks SET claim_expires_at = ? WHERE id = ?",
+            ("1970-01-01T00:00:00+00:00", expired.id),
+        )
+    app = create_app(
+        repo,
+        provider_registry={config.id: provider},
+        task_poll_interval_seconds=0.01,
+        task_worker_count=1,
+    )
+
+    with TestClient(app):
+        wait_for_task_status(repo, pending.id, "completed")
+        wait_for_task_status(repo, expired.id, "completed")
+
+    assert provider.calls == 2
+
+
+def test_task_runner_deduplicates_api_handoff_and_supervisor_poll(
+    tmp_path: Path,
+):
+    repo = make_repo(tmp_path)
+    application = create_application(repo)
+    status = availability()
+    config = create_provider_config(repo, status)
+    entered = Event()
+    release = Event()
+    provider = ControlledProvider(status, entered=entered, release=release)
+    app = create_app(
+        repo,
+        provider_registry={config.id: provider},
+        task_poll_interval_seconds=0.005,
+        task_worker_count=2,
+    )
+
+    with TestClient(app) as client:
+        response = client.post(
+            f"/applications/{application.id}/ai-tasks",
+            json={"task_type": "analyze_jd", "provider_config_id": config.id},
+        )
+        assert response.status_code == 202
+        assert entered.wait(timeout=2)
+        time.sleep(0.05)
+        release.set()
+        wait_for_task_status(repo, response.json()["id"], "completed")
+
+    assert provider.calls == 1
+
+
+def test_task_runner_lifespan_stops_daemon_threads_cleanly(tmp_path: Path):
+    repo = make_repo(tmp_path)
+    app = create_app(
+        repo,
+        provider_registry={},
+        task_poll_interval_seconds=0.01,
+        task_worker_count=2,
+    )
+
+    with TestClient(app):
+        runner = app.state.task_runner
+        assert runner.is_running
+        runner_threads = [
+            thread
+            for thread in enumerate_threads()
+            if thread.name.startswith(runner.thread_name_prefix)
+        ]
+        assert len(runner_threads) == 3
+        assert all(thread.daemon for thread in runner_threads)
+
+    assert not runner.is_running
+    assert not any(
+        thread.name.startswith(runner.thread_name_prefix)
+        for thread in enumerate_threads()
+    )
+
+    with TestClient(app):
+        restarted_threads = [
+            thread
+            for thread in enumerate_threads()
+            if thread.name.startswith(runner.thread_name_prefix)
+        ]
+        assert runner.is_running
+        assert len(restarted_threads) == 3
+        assert all(thread.daemon for thread in restarted_threads)
+
+    assert not runner.is_running
+
+
 def test_create_task_is_persisted_running_queryable_and_reloadable(tmp_path: Path):
     repo = make_repo(tmp_path)
     application = create_application(repo)
@@ -308,6 +475,66 @@ def test_background_failure_keeps_202_and_never_falls_back(tmp_path: Path):
     assert fallback.calls == 0
 
 
+@pytest.mark.parametrize(
+    ("error", "expected_status", "expected_detail"),
+    [
+        (KeyError("programming private detail"), 500, "AI task launch failed"),
+        (ValueError("Unknown input artifact IDs: private"), 400, "Invalid input artifact IDs"),
+        (ValueError("provider state private detail"), 409, "AI task cannot be launched"),
+        (RuntimeError("database secret=do-not-leak"), 500, "AI task launch failed"),
+    ],
+    ids=["programming-keyerror", "invalid-artifact", "state-conflict", "unexpected"],
+)
+def test_create_ai_task_maps_expected_and_unexpected_errors_without_leaking(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    error: Exception,
+    expected_status: int,
+    expected_detail: str,
+):
+    repo = make_repo(tmp_path)
+    application = create_application(repo)
+    status = availability()
+    config = create_provider_config(repo, status)
+    app = create_app(
+        repo, provider_registry={config.id: ControlledProvider(status)}
+    )
+
+    def reject_enqueue(*_args, **_kwargs):
+        raise error
+
+    monkeypatch.setattr(app.state.ai_orchestrator, "enqueue", reject_enqueue)
+    response = TestClient(app, raise_server_exceptions=False).post(
+        f"/applications/{application.id}/ai-tasks",
+        json={
+            "task_type": "analyze_jd",
+            "provider_config_id": config.id,
+            "input_artifact_ids": [],
+        },
+    )
+
+    assert response.status_code == expected_status
+    assert response.json() == {"detail": expected_detail}
+    assert "private" not in response.text
+    assert "do-not-leak" not in response.text
+
+
+def test_create_ai_task_maps_actual_missing_provider_config_to_404(tmp_path: Path):
+    repo = make_repo(tmp_path)
+    application = create_application(repo)
+    response = TestClient(create_app(repo, provider_registry={})).post(
+        f"/applications/{application.id}/ai-tasks",
+        json={
+            "task_type": "analyze_jd",
+            "provider_config_id": "aip_missing",
+            "input_artifact_ids": [],
+        },
+    )
+
+    assert response.status_code == 404
+    assert response.json() == {"detail": "AI provider not found"}
+
+
 def test_api_heartbeat_setup_failure_returns_202_with_durable_failed_task(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
@@ -363,6 +590,10 @@ def test_provider_listing_combines_persisted_and_honest_runtime_state(tmp_path: 
     assert providers[disabled.id]["available"] is False
     assert "executable" not in providers[present.id]["current_metadata"]
     assert "codex_home" not in providers[present.id]["current_metadata"]
+    assert "runtime_handle" not in providers[present.id]["current_metadata"]
+    assert "runtime_instance_id" not in providers[present.id]["current_metadata"]
+    assert "issuer_instance_id" not in providers[present.id]["current_metadata"]
+    assert "isolation_evidence_signature" not in providers[present.id]["current_metadata"]
 
     missing_launch = client.post(
         f"/applications/{create_application(repo).id}/ai-tasks",
@@ -507,6 +738,299 @@ def test_packet_reloads_selected_resume_report_latest_task_evidence_and_versions
     assert packet["versions"][0]["event_type"] == "packet.seeded"
     assert "tex_path" not in str(packet)
     assert "raw_text_path" not in str(packet)
+
+
+def test_packet_uses_one_snapshot_during_concurrent_requirements_update(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    repo = make_repo(tmp_path)
+    application = create_application(repo)
+    resume = select_resume(repo, application.id)
+    old_requirements = {
+        "raw_ai": {},
+        "deterministic": {},
+        "user_corrected": {"generation": "old"},
+        "uncertainty": {},
+    }
+    with repo.connection() as connection:
+        connection.execute(
+            "UPDATE jd_snapshots SET extracted_requirements_json = ? WHERE id = ?",
+            (json.dumps(old_requirements), application.jd_snapshot_id),
+        )
+    report = repo.save_report(
+        application_id=application.id,
+        resume_version_id=resume.id,
+        jd_snapshot_id=application.jd_snapshot_id,
+        fit={"score": 80},
+        risks={"blockers": [], "warnings": []},
+    )
+    application_materialized = Event()
+    update_committed = Event()
+    original_materialize = repo._application_from_row
+
+    def pause_after_application_read(row):
+        materialized = original_materialize(row)
+        if not application_materialized.is_set():
+            application_materialized.set()
+            assert update_committed.wait(timeout=5)
+        return materialized
+
+    monkeypatch.setattr(repo, "_application_from_row", pause_after_application_read)
+    client = TestClient(create_app(repo, provider_registry={}))
+    writer = CareerOpsRepository(repo.database_path, repo.vault_path)
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        packet_future = pool.submit(
+            client.get, f"/applications/{application.id}/packet"
+        )
+        assert application_materialized.wait(timeout=2)
+        writer.update_user_corrected_requirements(
+            application.id, {"generation": "new"}
+        )
+        update_committed.set()
+        response = packet_future.result(timeout=5)
+
+    assert response.status_code == 200
+    packet = response.json()
+    observed = (
+        packet["job_description"]["requirements"]["user_corrected"],
+        packet["latest_report"]["id"] if packet["latest_report"] else None,
+    )
+    assert observed in [
+        ({"generation": "old"}, report.id),
+        ({"generation": "new"}, None),
+    ]
+
+
+def test_packet_snapshot_does_not_call_independent_public_getters(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    repo = make_repo(tmp_path)
+    application = create_application(repo)
+    resume = select_resume(repo, application.id)
+    repo.save_report(
+        application_id=application.id,
+        resume_version_id=resume.id,
+        jd_snapshot_id=application.jd_snapshot_id,
+        fit={"score": 80},
+        risks={"blockers": [], "warnings": []},
+    )
+
+    def reject_independent_read(*_args, **_kwargs):
+        raise RuntimeError("packet public getter must not run")
+
+    for method_name in (
+        "get_application",
+        "get_jd_snapshot",
+        "get_resume_version",
+        "get_report",
+        "get_approval",
+        "list_ai_tasks",
+        "list_application_evidence",
+        "list_application_versions",
+    ):
+        monkeypatch.setattr(repo, method_name, reject_independent_read)
+
+    response = TestClient(
+        create_app(repo, provider_registry={}), raise_server_exceptions=False
+    ).get(f"/applications/{application.id}/packet")
+
+    assert response.status_code == 200
+    assert response.json()["latest_report"]["resume_version_id"] == resume.id
+
+
+@pytest.mark.parametrize(
+    "mismatch",
+    [
+        "jd_application",
+        "missing_resume",
+        "report_resume",
+        "approval_report",
+        "task_input_manifest",
+    ],
+)
+def test_packet_snapshot_fails_closed_on_broken_aggregate_binding(
+    tmp_path: Path, mismatch: str
+):
+    repo = make_repo(tmp_path)
+    application = create_application(repo)
+    resume = select_resume(repo, application.id)
+    report = repo.save_report(
+        application_id=application.id,
+        resume_version_id=resume.id,
+        jd_snapshot_id=application.jd_snapshot_id,
+        fit={"score": 100},
+        risks={"blockers": [], "warnings": []},
+    )
+    approval = repo.approve_application(application.id, report.id, "Reviewed")
+    foreign_application = create_application(repo, company="Foreign Corp")
+    foreign_resume = select_resume(repo, foreign_application.id)
+    foreign_report = repo.save_report(
+        application_id=foreign_application.id,
+        resume_version_id=foreign_resume.id,
+        jd_snapshot_id=foreign_application.jd_snapshot_id,
+        fit={"score": 100},
+        risks={"blockers": [], "warnings": []},
+    )
+    task = None
+    if mismatch == "task_input_manifest":
+        from careerops.ai.orchestrator import AiOrchestrator
+
+        status = availability()
+        config = create_provider_config(repo, status)
+        task = AiOrchestrator(repo, {config.id: ControlledProvider(status)}).enqueue(
+            application.id, "analyze_jd", config.id
+        )
+    with repo.connection() as connection:
+        if mismatch == "jd_application":
+            connection.execute(
+                "UPDATE jd_snapshots SET application_id = ? WHERE id = ?",
+                (foreign_application.id, application.jd_snapshot_id),
+            )
+        elif mismatch == "missing_resume":
+            connection.execute(
+                "UPDATE applications SET selected_resume_version_id = ? WHERE id = ?",
+                ("res_missing", application.id),
+            )
+        elif mismatch == "report_resume":
+            connection.execute(
+                "UPDATE reports SET resume_version_id = ? WHERE id = ?",
+                (foreign_resume.id, report.id),
+            )
+        elif mismatch == "approval_report":
+            connection.execute(
+                "UPDATE approvals SET report_id = ? WHERE id = ?",
+                (foreign_report.id, approval.id),
+            )
+        elif mismatch == "task_input_manifest":
+            assert task is not None
+            connection.execute(
+                "UPDATE ai_tasks SET input_artifact_ids_json = ? WHERE id = ?",
+                ('["aia_missing"]', task.id),
+            )
+
+    response = TestClient(create_app(repo, provider_registry={})).get(
+        f"/applications/{application.id}/packet"
+    )
+
+    assert response.status_code == 409
+
+
+def test_public_packet_artifacts_and_versions_recursively_sanitize_provenance(
+    tmp_path: Path,
+):
+    repo = make_repo(tmp_path)
+    application = create_application(repo)
+    resume = select_resume(repo, application.id)
+    report = repo.save_report(
+        application_id=application.id,
+        resume_version_id=resume.id,
+        jd_snapshot_id=application.jd_snapshot_id,
+        fit={"score": 80},
+        risks={"blockers": [], "warnings": []},
+    )
+    provider_binding = {
+        "provider_kind": "codex",
+        "model": "gpt-fixture",
+        "privacy_mode": "local_private",
+        "data_leaves_machine": False,
+        "is_ai": True,
+        "endpoint": "local-cli",
+        "identity_name": "codex2",
+        "executable": "C:/private/bin/codex.exe",
+        "executable_sha256": "a" * 64,
+        "executable_version": "1.2.3",
+        "codex_home": "C:/private/CODEX_HOME",
+        "reasoning_effort": "high",
+        "model_digest": "sha256:model",
+        "model_metadata_sha256": "b" * 64,
+        "show_metadata_sha256": "c" * 64,
+        "attestation_version": "1",
+        "runtime_instance_id": "private-runtime-instance",
+        "runtime_handle": "private-runtime-handle",
+        "issuer_instance_id": "private-issuer",
+        "egress_policy": "deny",
+        "cloud_disabled": True,
+        "egress_enforced": True,
+        "isolation_evidence_sha256": "d" * 64,
+        "isolation_evidence_signature": "private-signature",
+    }
+    provenance = {
+        "provider_config_id": "aip_fixture",
+        "provider_kind": "codex",
+        "provider_model": "gpt-fixture",
+        "provider_identity_name": "codex2",
+        "privacy_mode": "local_private",
+        "prompt_template_id": "analyze_fit_v1",
+        "prompt_sha256": "e" * 64,
+        "provider_binding_sha256": "f" * 64,
+        "provider_binding": provider_binding,
+        "nested": {
+            "CODEX_HOME": "C:/private/nested-home",
+            "runtime_handle": "private-nested-handle",
+            "isolation_authority_signature": "private-nested-signature",
+        },
+    }
+    requirements = {
+        "raw_ai": {"required_skills": ["Python"], "provenance": provenance},
+        "deterministic": {},
+        "user_corrected": {},
+        "uncertainty": {"provenance": provenance},
+    }
+    fit = {"score": 80, "details": {"provenance": provenance}}
+    risks = {"blockers": [], "nested": {"provenance": provenance}}
+    with repo.connection() as connection:
+        connection.execute(
+            "UPDATE jd_snapshots SET extracted_requirements_json = ? WHERE id = ?",
+            (json.dumps(requirements), application.jd_snapshot_id),
+        )
+        connection.execute(
+            "UPDATE reports SET fit_json = ?, risks_json = ? WHERE id = ?",
+            (json.dumps(fit), json.dumps(risks), report.id),
+        )
+    version = repo.record_application_version(
+        application.id, "provenance.seeded", {"provenance": provenance}
+    )
+    client = TestClient(create_app(repo, provider_registry={}))
+
+    public_payloads = [
+        client.get(f"/applications/{application.id}/packet").json(),
+        client.get(f"/applications/{application.id}/requirements").json(),
+        client.get(f"/applications/{application.id}/versions").json(),
+        client.get(f"/applications/{application.id}/artifacts/report").json(),
+    ]
+
+    for payload in public_payloads:
+        serialized = json.dumps(payload, sort_keys=True)
+        for private_value in (
+            "C:/private/bin/codex.exe",
+            "C:/private/CODEX_HOME",
+            "C:/private/nested-home",
+            "private-runtime-instance",
+            "private-runtime-handle",
+            "private-nested-handle",
+            "private-issuer",
+            "private-signature",
+            "private-nested-signature",
+        ):
+            assert private_value not in serialized
+        assert "gpt-fixture" in serialized
+        assert "codex2" in serialized
+        assert "local_private" in serialized
+        assert "sha256:model" in serialized
+        assert "a" * 64 in serialized
+        assert "e" * 64 in serialized
+        assert '"egress_enforced": true' in serialized
+
+    stored_requirements = repo.get_jd_snapshot(
+        application.jd_snapshot_id
+    ).extracted_requirements_json
+    stored_report = repo.get_report(report.id)
+    stored_version = repo.get_application_version(version.id)
+    assert stored_requirements == requirements
+    assert stored_report.fit == fit
+    assert stored_report.risks == risks
+    assert stored_version.snapshot["provenance"] == provenance
 
 
 def test_artifact_downloads_are_bound_to_latest_packet_and_verify_integrity(tmp_path: Path):

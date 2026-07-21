@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import math
 import re
 from typing import Annotated, Any, Literal
@@ -14,6 +15,7 @@ from pydantic import (
     model_validator,
 )
 
+from careerops.core.repository import MAX_PERSISTED_JSON_BYTES
 from careerops.core.status import AiTaskType, PrivacyLevel, VerificationState
 
 
@@ -102,6 +104,15 @@ class RequirementsUpdateRequest(ApiRequest):
         normalized = _normalize_json(value, depth=0, budget=[0])
         if not isinstance(normalized, dict):
             raise ValueError("user_corrected must be an object")
+        serialized = json.dumps(
+            normalized,
+            ensure_ascii=False,
+            allow_nan=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        if len(serialized.encode("utf-8")) > MAX_PERSISTED_JSON_BYTES:
+            raise ValueError("user_corrected exceeds the persisted JSON size limit")
         return normalized
 
 

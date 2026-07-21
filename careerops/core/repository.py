@@ -126,6 +126,20 @@ PROVIDER_BINDING_FIELDS = (
     "isolation_evidence_sha256",
     "isolation_evidence_signature",
 )
+
+
+@dataclass(frozen=True)
+class ApplicationPacketSnapshot:
+    application: Application
+    job_description: JobDescriptionSnapshot
+    selected_resume: ResumeVersion | None
+    latest_report: Report | None
+    approval: Approval | None
+    latest_ai_task: AiTask | None
+    evidence: list[EvidenceItem]
+    versions: list[ApplicationVersion]
+
+
 PROVIDER_BINDING_BOOLEAN_FIELDS = frozenset(
     {"data_leaves_machine", "is_ai", "cloud_disabled", "egress_enforced"}
 )
@@ -835,7 +849,13 @@ class CareerOpsRepository:
                     """,
                     (task_id, artifact_id, ordinal, now),
                 )
-        return self.get_ai_task(task_id)
+            task_row = connection.execute(
+                "SELECT * FROM ai_tasks WHERE id = ?", (task_id,)
+            ).fetchone()
+            if task_row is None:
+                raise RuntimeError("Created AI task was not readable")
+            task = self._ai_task_from_row(task_row, list(input_artifact_ids))
+        return task
 
     def get_ai_task(self, task_id: str) -> AiTask:
         with self.connection() as connection:
@@ -877,6 +897,21 @@ class CareerOpsRepository:
             self._ai_task_from_row(row, input_artifact_ids[row["id"]])
             for row in rows
         ]
+
+    def list_pending_ai_task_ids(self, *, limit: int) -> list[str]:
+        if not isinstance(limit, int) or isinstance(limit, bool) or limit < 1:
+            raise ValueError("Pending AI task limit must be a positive integer")
+        with self.connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT id FROM ai_tasks
+                WHERE status = 'pending'
+                ORDER BY created_at ASC, id ASC
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+        return [row["id"] for row in rows]
 
     def claim_ai_task(self, task_id: str) -> str | None:
         claim_token = secrets.token_urlsafe(32)
@@ -1763,7 +1798,13 @@ class CareerOpsRepository:
                     "notes": notes,
                 },
             )
-        return self.get_profile_fact(fact_id)
+            fact_row = connection.execute(
+                "SELECT * FROM profile_facts WHERE id = ?", (fact_id,)
+            ).fetchone()
+            if fact_row is None:
+                raise RuntimeError("Created profile fact was not readable")
+            fact = self._profile_fact_from_row(fact_row)
+        return fact
 
     def get_profile_fact(self, fact_id: str) -> ProfileFact:
         row = self._one("SELECT * FROM profile_facts WHERE id = ?", (fact_id,))
@@ -1834,7 +1875,13 @@ class CareerOpsRepository:
                     "notes": notes,
                 },
             )
-        return self.get_evidence_item(evidence_id)
+            evidence_row = connection.execute(
+                "SELECT * FROM evidence_items WHERE id = ?", (evidence_id,)
+            ).fetchone()
+            if evidence_row is None:
+                raise RuntimeError("Created evidence item was not readable")
+            evidence = self._evidence_item_from_row(evidence_row)
+        return evidence
 
     def create_and_link_evidence_item(
         self,
@@ -1959,7 +2006,13 @@ class CareerOpsRepository:
                     None,
                     {"evidence_item_id": evidence_item_id},
                 )
-        return self.get_evidence_item(evidence_item_id)
+            evidence_row = connection.execute(
+                "SELECT * FROM evidence_items WHERE id = ?", (evidence_item_id,)
+            ).fetchone()
+            if evidence_row is None:
+                raise RuntimeError("Linked evidence item was not readable")
+            evidence = self._evidence_item_from_row(evidence_row)
+        return evidence
 
     def list_application_evidence(self, application_id: str) -> list[EvidenceItem]:
         with self.connection() as connection:
@@ -2001,7 +2054,13 @@ class CareerOpsRepository:
                 snapshot=snapshot,
                 now=now,
             )
-        return self.get_application_version(version_id)
+            version_row = connection.execute(
+                "SELECT * FROM application_versions WHERE id = ?", (version_id,)
+            ).fetchone()
+            if version_row is None:
+                raise RuntimeError("Created application version was not readable")
+            version = self._application_version_from_row(version_row)
+        return version
 
     def _insert_application_version(
         self,
@@ -2202,7 +2261,14 @@ class CareerOpsRepository:
                     "version_number": version_number,
                 },
             )
-        return self.get_jd_snapshot(application["jd_snapshot_id"])
+            updated_snapshot_row = connection.execute(
+                "SELECT * FROM jd_snapshots WHERE id = ?",
+                (application["jd_snapshot_id"],),
+            ).fetchone()
+            if updated_snapshot_row is None:
+                raise RuntimeError("Updated job description was not readable")
+            updated_snapshot = self._jd_snapshot_from_row(updated_snapshot_row)
+        return updated_snapshot
 
     def create_application(
         self,
@@ -2925,6 +2991,172 @@ class CareerOpsRepository:
         row = self._one("SELECT * FROM applications WHERE id = ?", (application_id,))
         return self._application_from_row(row)
 
+    def get_application_packet_snapshot(
+        self, application_id: str
+    ) -> ApplicationPacketSnapshot:
+        with self.connection() as connection:
+            connection.execute("BEGIN")
+            application_row = connection.execute(
+                "SELECT * FROM applications WHERE id = ?", (application_id,)
+            ).fetchone()
+            if application_row is None:
+                raise KeyError("No application with that ID")
+            application = self._application_from_row(application_row)
+
+            jd_row = connection.execute(
+                "SELECT * FROM jd_snapshots WHERE id = ?",
+                (application.jd_snapshot_id,),
+            ).fetchone()
+            if jd_row is None or jd_row["application_id"] != application.id:
+                raise ValueError("Application job description ownership is invalid")
+            try:
+                requirements = json.loads(jd_row["extracted_requirements_json"])
+            except (TypeError, json.JSONDecodeError) as exc:
+                raise ValueError("Stored requirements are invalid") from exc
+            job_description = self._jd_snapshot_from_row(
+                jd_row, parsed_requirements=requirements
+            )
+
+            selected_resume = None
+            if application.selected_resume_version_id is not None:
+                resume_row = connection.execute(
+                    "SELECT * FROM resume_versions WHERE id = ?",
+                    (application.selected_resume_version_id,),
+                ).fetchone()
+                if resume_row is None:
+                    raise ValueError("Selected resume is missing")
+                selected_resume = self._resume_from_row(resume_row)
+
+            latest_report = None
+            if application.latest_report_id is not None:
+                report_row = connection.execute(
+                    "SELECT * FROM reports WHERE id = ?",
+                    (application.latest_report_id,),
+                ).fetchone()
+                if report_row is None:
+                    raise ValueError("Latest report is missing")
+                latest_report = Report(
+                    id=report_row["id"],
+                    application_id=report_row["application_id"],
+                    resume_version_id=report_row["resume_version_id"],
+                    jd_snapshot_id=report_row["jd_snapshot_id"],
+                    fit=json.loads(report_row["fit_json"]),
+                    risks=json.loads(report_row["risks_json"]),
+                    blocking_issue_count=report_row["blocking_issue_count"],
+                    warning_count=report_row["warning_count"],
+                    created_at=report_row["created_at"],
+                )
+                if (
+                    latest_report.application_id != application.id
+                    or latest_report.resume_version_id
+                    != application.selected_resume_version_id
+                    or latest_report.jd_snapshot_id != application.jd_snapshot_id
+                ):
+                    raise ValueError("Latest report ownership is invalid")
+
+            approval = None
+            if application.approval_id is not None:
+                approval_row = connection.execute(
+                    "SELECT * FROM approvals WHERE id = ?", (application.approval_id,)
+                ).fetchone()
+                if approval_row is None:
+                    raise ValueError("Approval is missing")
+                approval = Approval(
+                    id=approval_row["id"],
+                    application_id=approval_row["application_id"],
+                    resume_version_id=approval_row["resume_version_id"],
+                    report_id=approval_row["report_id"],
+                    pdf_sha256=approval_row["pdf_sha256"],
+                    approved_at=approval_row["approved_at"],
+                    approval_note=approval_row["approval_note"],
+                )
+                if (
+                    approval.application_id != application.id
+                    or approval.resume_version_id
+                    != application.selected_resume_version_id
+                    or approval.report_id != application.latest_report_id
+                    or selected_resume is None
+                    or approval.pdf_sha256 != selected_resume.pdf_sha256
+                ):
+                    raise ValueError("Approval ownership is invalid")
+
+            task_row = connection.execute(
+                """
+                SELECT * FROM ai_tasks
+                WHERE application_id = ?
+                ORDER BY created_at DESC, id DESC
+                LIMIT 1
+                """,
+                (application.id,),
+            ).fetchone()
+            latest_ai_task = None
+            if task_row is not None:
+                artifact_rows = connection.execute(
+                    """
+                    SELECT links.artifact_id, source_tasks.application_id
+                    FROM ai_task_input_artifacts AS links
+                    LEFT JOIN ai_artifacts AS artifacts
+                      ON artifacts.id = links.artifact_id
+                    LEFT JOIN ai_tasks AS source_tasks
+                      ON source_tasks.id = artifacts.task_id
+                    WHERE links.task_id = ?
+                    ORDER BY links.ordinal ASC
+                    """,
+                    (task_row["id"],),
+                ).fetchall()
+                if any(
+                    row["application_id"] != application.id for row in artifact_rows
+                ):
+                    raise ValueError("AI task input ownership is invalid")
+                linked_artifact_ids = [row["artifact_id"] for row in artifact_rows]
+                try:
+                    declared_artifact_ids = json.loads(
+                        task_row["input_artifact_ids_json"]
+                    )
+                except (TypeError, json.JSONDecodeError) as exc:
+                    raise ValueError("AI task input manifest is invalid") from exc
+                if declared_artifact_ids != linked_artifact_ids:
+                    raise ValueError("AI task input manifest is invalid")
+                latest_ai_task = self._ai_task_from_row(
+                    task_row, linked_artifact_ids
+                )
+
+            evidence_rows = connection.execute(
+                """
+                SELECT evidence_items.*
+                FROM application_evidence_links
+                JOIN evidence_items
+                  ON evidence_items.id = application_evidence_links.evidence_item_id
+                WHERE application_evidence_links.application_id = ?
+                ORDER BY application_evidence_links.created_at ASC,
+                         evidence_items.id ASC
+                """,
+                (application.id,),
+            ).fetchall()
+            version_rows = connection.execute(
+                """
+                SELECT * FROM application_versions
+                WHERE application_id = ?
+                ORDER BY version_number ASC
+                """,
+                (application.id,),
+            ).fetchall()
+            packet = ApplicationPacketSnapshot(
+                application=application,
+                job_description=job_description,
+                selected_resume=selected_resume,
+                latest_report=latest_report,
+                approval=approval,
+                latest_ai_task=latest_ai_task,
+                evidence=[
+                    self._evidence_item_from_row(row) for row in evidence_rows
+                ],
+                versions=[
+                    self._application_version_from_row(row) for row in version_rows
+                ],
+            )
+        return packet
+
     def list_applications(self) -> list[Application]:
         with self.connection() as connection:
             rows = connection.execute("SELECT * FROM applications ORDER BY created_at DESC").fetchall()
@@ -2932,6 +3164,19 @@ class CareerOpsRepository:
 
     def get_jd_snapshot(self, snapshot_id: str) -> JobDescriptionSnapshot:
         row = self._one("SELECT * FROM jd_snapshots WHERE id = ?", (snapshot_id,))
+        return self._jd_snapshot_from_row(row)
+
+    @staticmethod
+    def _jd_snapshot_from_row(
+        row: sqlite3.Row,
+        *,
+        parsed_requirements: Any | None = None,
+    ) -> JobDescriptionSnapshot:
+        requirements = (
+            json.loads(row["extracted_requirements_json"])
+            if parsed_requirements is None
+            else parsed_requirements
+        )
         return JobDescriptionSnapshot(
             id=row["id"],
             application_id=row["application_id"],
@@ -2939,7 +3184,7 @@ class CareerOpsRepository:
             raw_text_path=Path(row["raw_text_path"]),
             raw_text_sha256=row["raw_text_sha256"],
             captured_at=row["captured_at"],
-            extracted_requirements_json=json.loads(row["extracted_requirements_json"]),
+            extracted_requirements_json=requirements,
             parser_version=row["parser_version"],
         )
 

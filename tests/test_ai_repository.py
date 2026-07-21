@@ -2737,6 +2737,25 @@ def test_ai_task_is_persisted_pending_before_execution(tmp_path: Path):
     }
 
 
+def test_ai_task_creation_materializes_before_commit_exit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    repo = make_repo(tmp_path)
+    application = create_application(repo)
+    provider = create_provider(repo)
+
+    def reject_public_reload(_task_id: str):
+        raise RuntimeError("post-commit task getter must not run")
+
+    monkeypatch.setattr(repo, "get_ai_task", reject_public_reload)
+
+    task = create_task(repo, application.id, provider.id)
+
+    verifier = CareerOpsRepository(repo.database_path, repo.vault_path)
+    assert verifier.get_ai_task(task.id) == task
+    assert task.status == "pending"
+
+
 def test_only_one_worker_can_claim_pending_task(tmp_path: Path):
     repo = make_repo(tmp_path)
     application = create_application(repo)

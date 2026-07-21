@@ -1,14 +1,17 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 import hashlib
 import json
 from pathlib import Path
+from threading import Event
 
 import pytest
 from fastapi.testclient import TestClient
 
 from apps.api.careerops_api.main import create_app
-from careerops.core.repository import CareerOpsRepository
+from careerops.core.repository import CareerOpsRepository, MAX_PERSISTED_JSON_BYTES
 
 
 def make_repo(tmp_path: Path) -> CareerOpsRepository:
@@ -67,6 +70,28 @@ def seed_requirements(repo: CareerOpsRepository, snapshot_id: str) -> None:
         )
 
 
+def canonical_json_size(value: object) -> int:
+    return len(
+        json.dumps(
+            value,
+            ensure_ascii=False,
+            allow_nan=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+    )
+
+
+def ascii_requirements_with_size(target_size: int) -> dict[str, str]:
+    value = {f"field_{index:02d}": "x" * 4_000 for index in range(63)}
+    value["field_63"] = ""
+    remaining = target_size - canonical_json_size(value)
+    assert 0 <= remaining <= 4_000
+    value["field_63"] = "x" * remaining
+    assert canonical_json_size(value) == target_size
+    return value
+
+
 def test_repository_user_corrections_are_transactional_and_preserve_provenance(tmp_path: Path):
     repo = make_repo(tmp_path)
     application = create_application(repo)
@@ -107,6 +132,158 @@ def test_repository_user_corrections_are_transactional_and_preserve_provenance(t
     assert versions[-1].snapshot["invalidated_report_id"] == report.id
 
 
+def test_user_corrections_do_not_reload_through_public_getter_after_commit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    repo = make_repo(tmp_path)
+    application = create_application(repo)
+
+    def reject_public_reload(_snapshot_id: str):
+        raise RuntimeError("post-commit JD getter must not run")
+
+    monkeypatch.setattr(repo, "get_jd_snapshot", reject_public_reload)
+
+    updated = repo.update_user_corrected_requirements(
+        application.id, {"generation": "first"}
+    )
+
+    verifier = CareerOpsRepository(repo.database_path, repo.vault_path)
+    assert updated.extracted_requirements_json["user_corrected"] == {
+        "generation": "first"
+    }
+    assert verifier.get_jd_snapshot(updated.id) == updated
+
+
+def test_user_corrections_return_their_own_commit_when_a_second_update_wins(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    repo = make_repo(tmp_path)
+    application = create_application(repo)
+    writer = CareerOpsRepository(repo.database_path, repo.vault_path)
+    first_committed = Event()
+    second_committed = Event()
+    original_connection = repo.connection
+    delay_first_commit = True
+
+    @contextmanager
+    def pause_after_first_commit():
+        nonlocal delay_first_commit
+        with original_connection() as connection:
+            yield connection
+        if delay_first_commit:
+            delay_first_commit = False
+            first_committed.set()
+            assert second_committed.wait(timeout=5)
+
+    monkeypatch.setattr(repo, "connection", pause_after_first_commit)
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        first_future = pool.submit(
+            repo.update_user_corrected_requirements,
+            application.id,
+            {"generation": "first"},
+        )
+        assert first_committed.wait(timeout=2)
+        writer.update_user_corrected_requirements(
+            application.id, {"generation": "second"}
+        )
+        second_committed.set()
+        first = first_future.result(timeout=5)
+
+    persisted = writer.get_jd_snapshot(application.jd_snapshot_id)
+    assert first.extracted_requirements_json["user_corrected"] == {
+        "generation": "first"
+    }
+    assert persisted.extracted_requirements_json["user_corrected"] == {
+        "generation": "second"
+    }
+
+
+def test_profile_fact_creation_does_not_reload_through_public_getter_after_commit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    repo = make_repo(tmp_path)
+
+    def reject_public_reload(_fact_id: str):
+        raise RuntimeError("post-commit profile getter must not run")
+
+    monkeypatch.setattr(repo, "get_profile_fact", reject_public_reload)
+
+    fact = repo.create_profile_fact(
+        fact_key="skills.python",
+        fact_value="Advanced",
+        verification_state="verified",
+        privacy_level="public",
+    )
+
+    verifier = CareerOpsRepository(repo.database_path, repo.vault_path)
+    assert verifier.get_profile_fact(fact.id) == fact
+
+
+def test_existing_evidence_link_does_not_reload_through_public_getter_after_commit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    repo = make_repo(tmp_path)
+    application = create_application(repo)
+    evidence = repo.create_evidence_item(
+        claim_text="Built a Python service",
+        evidence_type="project",
+        verification_state="verified",
+        privacy_level="public",
+    )
+
+    def reject_public_reload(_evidence_id: str):
+        raise RuntimeError("post-commit evidence getter must not run")
+
+    monkeypatch.setattr(repo, "get_evidence_item", reject_public_reload)
+
+    linked = repo.link_application_evidence(application.id, evidence.id)
+
+    verifier = CareerOpsRepository(repo.database_path, repo.vault_path)
+    assert linked == evidence
+    assert verifier.list_application_evidence(application.id) == [evidence]
+
+
+def test_standalone_evidence_creation_materializes_before_commit_exit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    repo = make_repo(tmp_path)
+
+    def reject_public_reload(_evidence_id: str):
+        raise RuntimeError("post-commit evidence getter must not run")
+
+    monkeypatch.setattr(repo, "get_evidence_item", reject_public_reload)
+
+    evidence = repo.create_evidence_item(
+        claim_text="Built a Python service",
+        evidence_type="project",
+        verification_state="verified",
+        privacy_level="public",
+    )
+
+    verifier = CareerOpsRepository(repo.database_path, repo.vault_path)
+    assert verifier.get_evidence_item(evidence.id) == evidence
+
+
+def test_application_version_materializes_before_commit_exit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    repo = make_repo(tmp_path)
+    application = create_application(repo)
+
+    def reject_public_reload(_version_id: str):
+        raise RuntimeError("post-commit version getter must not run")
+
+    monkeypatch.setattr(repo, "get_application_version", reject_public_reload)
+
+    version = repo.record_application_version(
+        application.id, "packet.reviewed", {"state": "reviewed"}
+    )
+
+    verifier = CareerOpsRepository(repo.database_path, repo.vault_path)
+    assert verifier.get_application_version(version.id) == version
+
+
 def test_requirements_api_only_updates_user_corrected_and_rejects_unknown_fields(tmp_path: Path):
     repo = make_repo(tmp_path)
     application = create_application(repo)
@@ -131,6 +308,31 @@ def test_requirements_api_only_updates_user_corrected_and_rejects_unknown_fields
     assert updated.json()["uncertainty"] == before.json()["uncertainty"]
     assert updated.json()["user_corrected"] == {"required_skills": ["Rust"]}
     assert unknown.status_code == 422
+
+
+@pytest.mark.parametrize(
+    ("user_corrected", "expected_status"),
+    [
+        (ascii_requirements_with_size(MAX_PERSISTED_JSON_BYTES - 1), 404),
+        (ascii_requirements_with_size(MAX_PERSISTED_JSON_BYTES + 1), 422),
+        ({f"field_{index:02d}": "€" * 4_000 for index in range(21)}, 404),
+        ({f"field_{index:02d}": "€" * 4_000 for index in range(22)}, 422),
+    ],
+    ids=["ascii-under", "ascii-over", "unicode-under", "unicode-over"],
+)
+def test_requirements_request_enforces_canonical_utf8_byte_limit(
+    tmp_path: Path,
+    user_corrected: dict[str, str],
+    expected_status: int,
+):
+    client = TestClient(create_app(make_repo(tmp_path), provider_registry={}))
+
+    response = client.put(
+        "/applications/app_missing/requirements",
+        json={"user_corrected": user_corrected},
+    )
+
+    assert response.status_code == expected_status
 
 
 @pytest.mark.parametrize("terminal_state", ["approved", "submitted"])

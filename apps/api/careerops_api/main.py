@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from base64 import b64decode
 from collections.abc import Mapping
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 import hashlib
 import json
@@ -38,6 +39,7 @@ from apps.api.careerops_api.schemas import (
     ProfileFactRequest,
     RequirementsUpdateRequest,
 )
+from apps.api.careerops_api.task_runner import AiTaskRunner
 from careerops.ai.contracts import ProviderAvailability, ProviderRequest
 from careerops.ai.orchestrator import AiOrchestrator
 from careerops.ai.providers.base import AiProvider
@@ -58,7 +60,11 @@ from careerops.core.models import (
     Report,
     ResumeVersion,
 )
-from careerops.core.repository import CareerOpsRepository, redact
+from careerops.core.repository import (
+    ApplicationPacketSnapshot,
+    CareerOpsRepository,
+    redact,
+)
 from careerops.gates.risk import evaluate_risks
 from careerops.parsers.jd_parser import parse_jd
 from careerops.parsers.pdf_parser import parse_pdf
@@ -234,6 +240,8 @@ def create_app(
     allowed_origins: list[str] | None = None,
     auth: BasicAuthConfig | None = None,
     static_dir: Path | None = None,
+    task_poll_interval_seconds: float = 1.0,
+    task_worker_count: int = 2,
 ) -> FastAPI:
     repo = repository or default_repository()
     registry = (
@@ -242,11 +250,27 @@ def create_app(
         else _default_provider_registry(repo)
     )
     orchestrator = AiOrchestrator(repo, registry)
+    task_runner = AiTaskRunner(
+        repo,
+        orchestrator,
+        poll_interval_seconds=task_poll_interval_seconds,
+        worker_count=task_worker_count,
+    )
+
+    @asynccontextmanager
+    async def lifespan(_api: FastAPI):
+        task_runner.start()
+        try:
+            yield
+        finally:
+            task_runner.stop()
+
     root = Path(__file__).resolve().parents[3]
-    api = FastAPI(title="CareerOps Local API")
+    api = FastAPI(title="CareerOps Local API", lifespan=lifespan)
     api.state.repository = repo
     api.state.provider_registry = registry
     api.state.ai_orchestrator = orchestrator
+    api.state.task_runner = task_runner
     _add_basic_auth_middleware(api, auth if auth is not None else _auth_from_env())
     api.add_middleware(
         CORSMiddleware,
@@ -460,21 +484,23 @@ def create_app(
     ) -> dict[str, Any]:
         _get_application(repo, application_id)
         try:
+            repo.get_ai_provider_config(payload.provider_config_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail="AI provider not found") from exc
+        try:
             task = orchestrator.enqueue(
                 application_id,
                 payload.task_type.value,
                 payload.provider_config_id,
                 payload.input_artifact_ids,
             )
-        except KeyError as exc:
-            raise HTTPException(status_code=404, detail="AI provider not found") from exc
         except ValueError as exc:
             if "artifact" in str(exc).lower():
                 raise HTTPException(status_code=400, detail="Invalid input artifact IDs") from exc
             raise HTTPException(status_code=409, detail="AI task cannot be launched") from exc
         except Exception as exc:
-            raise HTTPException(status_code=409, detail="AI task cannot be launched") from exc
-        background_tasks.add_task(_run_ai_task, orchestrator, task.id)
+            raise HTTPException(status_code=500, detail="AI task launch failed") from exc
+        background_tasks.add_task(task_runner.submit, task.id)
         return _ai_task_payload(task)
 
     @api.get("/ai-tasks/{task_id}")
@@ -510,7 +536,13 @@ def create_app(
 
     @api.get("/applications/{application_id}/packet")
     def get_application_packet(application_id: ApplicationId) -> dict[str, Any]:
-        return _packet_payload(repo, _get_application(repo, application_id))
+        try:
+            snapshot = repo.get_application_packet_snapshot(application_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail="Application not found") from exc
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(status_code=409, detail="Application packet is invalid") from exc
+        return _packet_payload(snapshot)
 
     @api.get("/applications/{application_id}/requirements")
     def get_requirements(application_id: ApplicationId) -> dict[str, Any]:
@@ -707,14 +739,6 @@ def create_app(
     return api
 
 
-def _run_ai_task(orchestrator: AiOrchestrator, task_id: str) -> None:
-    try:
-        orchestrator.run(task_id)
-    except Exception:
-        # AiOrchestrator owns state transitions and sanitizes terminal errors.
-        return
-
-
 def _get_application(repo: CareerOpsRepository, application_id: str) -> Application:
     try:
         return repo.get_application(application_id)
@@ -734,70 +758,107 @@ def _get_owned_snapshot(
     return snapshot
 
 
-def _packet_payload(repo: CareerOpsRepository, application: Application) -> dict[str, Any]:
-    snapshot = _get_owned_snapshot(repo, application)
-    selected_resume: dict[str, Any] | None = None
-    if application.selected_resume_version_id is not None:
-        try:
-            selected_resume = _resume_payload(
-                repo.get_resume_version(application.selected_resume_version_id)
-            )
-        except KeyError:
-            selected_resume = None
-    latest_report: dict[str, Any] | None = None
-    if application.latest_report_id is not None:
-        try:
-            report = repo.get_report(application.latest_report_id)
-        except KeyError:
-            report = None
-        if report is not None:
-            if report.application_id != application.id:
-                raise HTTPException(status_code=409, detail="Application report ownership is invalid")
-            latest_report = _report_payload(report)
-    approval_payload: dict[str, Any] | None = None
-    if application.approval_id is not None:
-        try:
-            approval = repo.get_approval(application.approval_id)
-        except KeyError:
-            approval = None
-        if approval is not None:
-            if approval.application_id != application.id:
-                raise HTTPException(status_code=409, detail="Application approval ownership is invalid")
-            approval_payload = _approval_payload(approval)
-    tasks = repo.list_ai_tasks(application.id)
+def _packet_payload(snapshot: ApplicationPacketSnapshot) -> dict[str, Any]:
     return {
-        "application": _application_payload(application),
-        "job_description": _jd_payload(snapshot),
-        "selected_resume": selected_resume,
-        "latest_report": latest_report,
-        "approval": approval_payload,
-        "latest_ai_task": _ai_task_payload(tasks[-1]) if tasks else None,
-        "evidence": [
-            _evidence_payload(item)
-            for item in repo.list_application_evidence(application.id)
-        ],
+        "application": _application_payload(snapshot.application),
+        "job_description": _jd_payload(snapshot.job_description),
+        "selected_resume": (
+            _resume_payload(snapshot.selected_resume)
+            if snapshot.selected_resume is not None
+            else None
+        ),
+        "latest_report": (
+            _report_payload(snapshot.latest_report)
+            if snapshot.latest_report is not None
+            else None
+        ),
+        "approval": (
+            _approval_payload(snapshot.approval)
+            if snapshot.approval is not None
+            else None
+        ),
+        "latest_ai_task": (
+            _ai_task_payload(snapshot.latest_ai_task)
+            if snapshot.latest_ai_task is not None
+            else None
+        ),
+        "evidence": [_evidence_payload(item) for item in snapshot.evidence],
         "versions": [
-            _application_version_payload(item)
-            for item in repo.list_application_versions(application.id)
+            _application_version_payload(item) for item in snapshot.versions
         ],
     }
 
 
 def _requirements_payload(value: Any) -> dict[str, Any]:
-    if not isinstance(value, dict):
+    public_value = _sanitize_public_json(value)
+    if not isinstance(public_value, dict):
         raise HTTPException(status_code=409, detail="Stored requirements are invalid")
     grouped = any(
-        key in value for key in ("raw_ai", "deterministic", "user_corrected", "uncertainty")
+        key in public_value
+        for key in ("raw_ai", "deterministic", "user_corrected", "uncertainty")
     )
     result = {
-        "raw_ai": value.get("raw_ai", {}) if grouped else {},
-        "deterministic": value.get("deterministic", {}) if grouped else value,
-        "user_corrected": value.get("user_corrected", {}) if grouped else {},
-        "uncertainty": value.get("uncertainty", {}) if grouped else {},
+        "raw_ai": public_value.get("raw_ai", {}) if grouped else {},
+        "deterministic": (
+            public_value.get("deterministic", {}) if grouped else public_value
+        ),
+        "user_corrected": public_value.get("user_corrected", {}) if grouped else {},
+        "uncertainty": public_value.get("uncertainty", {}) if grouped else {},
     }
     if not all(isinstance(group, dict) for group in result.values()):
         raise HTTPException(status_code=409, detail="Stored requirement groups are invalid")
     return result
+
+
+_PUBLIC_PROVIDER_BINDING_FIELDS = frozenset(
+    {
+        "provider_kind",
+        "model",
+        "privacy_mode",
+        "data_leaves_machine",
+        "is_ai",
+        "endpoint",
+        "identity_name",
+        "executable_sha256",
+        "executable_version",
+        "reasoning_effort",
+        "model_digest",
+        "model_metadata_sha256",
+        "show_metadata_sha256",
+        "attestation_version",
+        "egress_policy",
+        "cloud_disabled",
+        "egress_enforced",
+        "isolation_evidence_sha256",
+    }
+)
+_PRIVATE_PUBLIC_KEYS = frozenset(
+    {"executable", "executable_path", "codex_home", "runtime_handle"}
+)
+
+
+def _sanitize_public_json(value: Any, *, provider_binding: bool = False) -> Any:
+    if isinstance(value, Mapping):
+        sanitized: dict[str, Any] = {}
+        for key, inner in value.items():
+            if not isinstance(key, str):
+                continue
+            normalized_key = key.casefold()
+            if provider_binding and normalized_key not in _PUBLIC_PROVIDER_BINDING_FIELDS:
+                continue
+            if normalized_key in _PRIVATE_PUBLIC_KEYS or (
+                "isolation" in normalized_key and "signature" in normalized_key
+            ):
+                continue
+            sanitized[key] = _sanitize_public_json(
+                inner,
+                provider_binding=normalized_key
+                in {"provider_binding", "availability_binding"},
+            )
+        return sanitized
+    if isinstance(value, (list, tuple)):
+        return [_sanitize_public_json(item) for item in value]
+    return value
 
 
 def _provider_payload(
@@ -853,34 +914,13 @@ def _provider_payload(
 
 
 def _public_provider_metadata(status: ProviderAvailability) -> dict[str, Any]:
-    return {
-        field: getattr(status, field).value
-        if field == "privacy_mode"
-        else getattr(status, field)
-        for field in (
-            "provider_kind",
-            "model",
-            "privacy_mode",
-            "data_leaves_machine",
-            "is_ai",
-            "detail",
-            "endpoint",
-            "identity_name",
-            "executable_sha256",
-            "executable_version",
-            "model_digest",
-            "model_metadata_sha256",
-            "show_metadata_sha256",
-            "attestation_version",
-            "runtime_instance_id",
-            "issuer_instance_id",
-            "egress_policy",
-            "cloud_disabled",
-            "egress_enforced",
-            "isolation_evidence_sha256",
-            "reasoning_effort",
-        )
-    }
+    metadata = _sanitize_public_json(
+        status.model_dump(mode="json"), provider_binding=True
+    )
+    if not isinstance(metadata, dict):
+        raise RuntimeError("Provider metadata sanitization failed")
+    metadata["detail"] = status.detail
+    return metadata
 
 
 def _artifact_bytes(
@@ -1197,8 +1237,8 @@ def _report_payload(report: Report) -> dict[str, Any]:
         "application_id": report.application_id,
         "resume_version_id": report.resume_version_id,
         "jd_snapshot_id": report.jd_snapshot_id,
-        "fit": report.fit,
-        "risks": report.risks,
+        "fit": _sanitize_public_json(report.fit),
+        "risks": _sanitize_public_json(report.risks),
         "blocking_issue_count": report.blocking_issue_count,
         "warning_count": report.warning_count,
         "created_at": report.created_at,
@@ -1292,7 +1332,7 @@ def _application_version_payload(version: ApplicationVersion) -> dict[str, Any]:
         "application_id": version.application_id,
         "version_number": version.version_number,
         "event_type": version.event_type,
-        "snapshot": version.snapshot,
+        "snapshot": _sanitize_public_json(version.snapshot),
         "created_at": version.created_at,
     }
 
