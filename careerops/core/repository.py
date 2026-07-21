@@ -164,6 +164,8 @@ class ResumeDraftAuthority:
     finding_signatures: tuple[tuple[str, str], ...]
     evidence_signatures: tuple[tuple[str, str], ...]
     profile_fact_signatures: tuple[tuple[str, str], ...]
+    artifact_file_evidence: tuple[tuple[str, _ArtifactFileEvidence], ...]
+    parent_file_evidence: _ArtifactFileEvidence
 
 
 PROVIDER_BINDING_BOOLEAN_FIELDS = frozenset(
@@ -2500,6 +2502,7 @@ class CareerOpsRepository:
             attempt_token = context_row["claim_token"]
             if type(attempt_token) is not str or not attempt_token:
                 raise ValueError("AI task completed attempt is invalid")
+            artifact_file_evidence: dict[str, _ArtifactFileEvidence] = {}
             for artifact_id, manifest in manifest_by_id.items():
                 artifact_row = artifact_by_id[artifact_id]
                 if (
@@ -2509,7 +2512,9 @@ class CareerOpsRepository:
                     or artifact_row["sha256"] != manifest["sha256"]
                 ):
                     raise ValueError("AI task artifact authority changed")
-                self._validate_artifact_row(artifact_row)
+                artifact_file_evidence[artifact_id] = (
+                    self._artifact_evidence_for_row(artifact_row)
+                )
             attempt_artifact_rows = connection.execute(
                 """
                 SELECT * FROM ai_artifacts
@@ -2595,6 +2600,7 @@ class CareerOpsRepository:
                 or context_evidence.sha256 != context_row["sha256"]
             ):
                 raise ValueError("AI task context checksum is invalid")
+            artifact_file_evidence[context_row["id"]] = context_evidence
 
             parent_buffer = BytesIO()
             parent_evidence = self._stable_artifact_read(
@@ -2670,6 +2676,10 @@ class CareerOpsRepository:
                         for row in profile_fact_rows
                     )
                 ),
+                artifact_file_evidence=tuple(
+                    sorted(artifact_file_evidence.items())
+                ),
+                parent_file_evidence=parent_evidence,
             )
         return authority
 
@@ -2714,8 +2724,19 @@ class CareerOpsRepository:
             raise ValueError("Resume draft source is not repository-owned")
 
         expected_artifact_signatures = dict(authority.artifact_signatures)
+        expected_artifact_file_evidence = dict(
+            authority.artifact_file_evidence
+        )
+        if set(expected_artifact_file_evidence) != set(
+            expected_artifact_signatures
+        ):
+            raise ValueError("AI task artifact preflight is incomplete")
         expected_finding_signatures = dict(authority.finding_signatures)
         expected_profile_signatures = dict(authority.profile_fact_signatures)
+        expected_parent_evidence = authority.parent_file_evidence
+        expected_parent_source_sha256 = hashlib.sha256(
+            authority.parent_source
+        ).hexdigest()
         inserted_resume: ResumeVersion | None = None
         with self.connection() as connection:
             connection.execute("BEGIN IMMEDIATE")
@@ -2805,7 +2826,10 @@ class CareerOpsRepository:
             } != expected_artifact_signatures:
                 raise ValueError("AI task artifact authority changed")
             for artifact_row in artifact_rows:
-                self._validate_artifact_row(artifact_row)
+                self._validate_artifact_row_fast(
+                    artifact_row,
+                    expected_artifact_file_evidence[artifact_row["id"]],
+                )
 
             finding_rows = connection.execute(
                 """
@@ -2924,20 +2948,32 @@ class CareerOpsRepository:
                 or database_row_sha256(parent_row) != authority.parent_signature
             ):
                 raise ValueError("Parent resume authority changed")
-            parent_evidence = self._stable_artifact_read(
-                Path(parent_row["tex_path"])
-            )
+            try:
+                parent_path, parent_identity = self._fast_artifact_identity(
+                    Path(parent_row["tex_path"])
+                )
+            except (FileNotFoundError, OSError, ValueError) as exc:
+                raise ValueError("Parent resume source changed") from exc
             if (
-                parent_evidence.sha256 != parent_row["tex_sha256"]
-                or parent_evidence.sha256
-                != hashlib.sha256(authority.parent_source).hexdigest()
+                parent_path != expected_parent_evidence.path
+                or parent_identity != expected_parent_evidence.identity
+                or parent_row["tex_sha256"] != expected_parent_evidence.sha256
+                or expected_parent_evidence.sha256
+                != expected_parent_source_sha256
             ):
                 raise ValueError("Parent resume source changed")
 
-            committed_child_evidence = self._stable_artifact_read(tex_path)
+            try:
+                committed_child_path, committed_child_identity = (
+                    self._fast_artifact_identity(tex_path)
+                )
+            except (FileNotFoundError, OSError, ValueError) as exc:
+                raise ValueError(
+                    "Resume draft source changed before commit"
+                ) from exc
             if (
-                committed_child_evidence.path != child_evidence.path
-                or committed_child_evidence.sha256 != child_evidence.sha256
+                committed_child_path != child_evidence.path
+                or committed_child_identity != child_evidence.identity
             ):
                 raise ValueError("Resume draft source changed before commit")
 
@@ -2954,8 +2990,8 @@ class CareerOpsRepository:
                     resume_id,
                     name,
                     parent_row["role_family"],
-                    str(committed_child_evidence.path),
-                    committed_child_evidence.sha256,
+                    str(child_evidence.path),
+                    child_evidence.sha256,
                     parent_row["id"],
                     now,
                     now,
@@ -2972,7 +3008,7 @@ class CareerOpsRepository:
                     "parent_resume_version_id": parent_row["id"],
                     "role_family": parent_row["role_family"],
                     "task_id": authority.task.id,
-                    "tex_sha256": committed_child_evidence.sha256,
+                    "tex_sha256": child_evidence.sha256,
                 },
             )
             invalidated_report_id = application["latest_report_id"]
@@ -3017,7 +3053,7 @@ class CareerOpsRepository:
                     "parent_resume_version_id": parent_row["id"],
                     "resume_version_id": resume_id,
                     "task_id": authority.task.id,
-                    "tex_sha256": committed_child_evidence.sha256,
+                    "tex_sha256": child_evidence.sha256,
                 },
                 now=now,
             )

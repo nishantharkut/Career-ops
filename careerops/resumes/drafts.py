@@ -353,6 +353,7 @@ class _PublishedSource:
 
 @dataclass
 class _PosixPublicationState:
+    temporary_created: bool = False
     temporary_owns_inode: bool = False
     destination_owns_inode: bool = False
     temporary_identity: tuple[int, int] | None = None
@@ -406,8 +407,7 @@ def _publish_source_posix(
         os.mkdir(resume_id, mode=0o700, dir_fd=resumes_handle)
         child_created = True
         child_handle = os.open(resume_id, directory_flags, dir_fd=resumes_handle)
-        child_stat = _require_open_directory(child_handle)
-        child_identity = (child_stat.st_dev, child_stat.st_ino)
+        child_identity = _posix_capture_child_identity(child_handle)
 
         temporary_name = f".source.tex.tmp-{uuid4().hex}"
         flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
@@ -415,6 +415,7 @@ def _publish_source_posix(
         source_descriptor = os.open(
             temporary_name, flags, 0o600, dir_fd=child_handle
         )
+        publication_state.temporary_created = True
         _posix_write_temporary_source(
             source_descriptor, content, publication_state
         )
@@ -445,33 +446,20 @@ def _publish_source_posix(
             source_identity=(source_stat.st_dev, source_stat.st_ino),
         )
     except BaseException as exc:
+        if child_created:
+            _cleanup_posix_failed_publication(
+                child_handle=child_handle,
+                resumes_handle=resumes_handle,
+                resume_id=resume_id,
+                child_identity=child_identity,
+                temporary_descriptor=source_descriptor,
+                temporary_name=temporary_name,
+                state=publication_state,
+            )
         if source_descriptor >= 0:
-            if (
-                publication_state.temporary_identity is not None
-                and child_identity is not None
-            ):
-                _cleanup_posix_failed_publication(
-                    child_handle=child_handle,
-                    resumes_handle=resumes_handle,
-                    resume_id=resume_id,
-                    child_identity=child_identity,
-                    temporary_name=temporary_name,
-                    state=publication_state,
-                )
             os.close(source_descriptor)
         if child_handle >= 0:
             os.close(child_handle)
-        if (
-            child_created
-            and publication_state.temporary_identity is None
-            and child_identity is not None
-        ):
-            try:
-                _posix_remove_owned_directory(
-                    resumes_handle, resume_id, child_identity
-                )
-            except OSError:
-                pass
         if resumes_handle >= 0:
             os.close(resumes_handle)
         if vault_handle >= 0:
@@ -498,6 +486,7 @@ def _publish_source_windows(
     temporary_handle = 0
     temporary_name = ""
     temporary_identity: tuple[int, int] | None = None
+    temporary_created = False
     renamed = False
     try:
         vault_handle = _windows_open_absolute_directory(vault_root)
@@ -517,6 +506,7 @@ def _publish_source_windows(
             file_access="write",
             share_delete=True,
         )
+        temporary_created = True
         temporary_identity = _windows_file_identity(temporary_handle)
         temporary_descriptor = msvcrt.open_osfhandle(
             temporary_handle, os.O_WRONLY | os.O_BINARY
@@ -576,15 +566,34 @@ def _publish_source_windows(
                 _windows_close_handle(rename_handle)
             except OSError:
                 pass
+        temporary_deleted = not temporary_created
         if temporary_handle:
+            if temporary_created:
+                try:
+                    _windows_mark_delete(temporary_handle)
+                    temporary_deleted = True
+                except OSError:
+                    pass
             try:
                 _windows_close_handle(temporary_handle)
             except OSError:
                 pass
         if temporary_descriptor >= 0:
+            if temporary_created:
+                try:
+                    _windows_mark_delete(
+                        msvcrt.get_osfhandle(temporary_descriptor)
+                    )
+                    temporary_deleted = True
+                except OSError:
+                    pass
             os.close(temporary_descriptor)
-        child_is_empty = temporary_identity is None
-        if child_handle and temporary_identity is not None:
+        child_is_empty = temporary_deleted
+        if (
+            child_handle
+            and not temporary_deleted
+            and temporary_identity is not None
+        ):
             try:
                 child_is_empty = _windows_delete_owned_relative(
                     child_handle,
@@ -623,6 +632,7 @@ def _posix_write_temporary_source(
     content: bytes,
     state: _PosixPublicationState,
 ) -> None:
+    state.temporary_created = True
     opened = os.fstat(descriptor)
     state.temporary_identity = (opened.st_dev, opened.st_ino)
     state.temporary_owns_inode = True
@@ -652,6 +662,11 @@ def _require_open_directory(descriptor: int) -> os.stat_result:
     return opened
 
 
+def _posix_capture_child_identity(descriptor: int) -> tuple[int, int]:
+    opened = _require_open_directory(descriptor)
+    return (opened.st_dev, opened.st_ino)
+
+
 def _posix_atomic_publish_no_replace(
     directory_handle: int,
     temporary_name: str,
@@ -661,7 +676,10 @@ def _posix_atomic_publish_no_replace(
     use_renameat2: bool | None = None,
 ) -> None:
     if state is None:
-        state = _PosixPublicationState(temporary_owns_inode=True)
+        state = _PosixPublicationState(
+            temporary_created=True,
+            temporary_owns_inode=True,
+        )
     if use_renameat2 is None:
         use_renameat2 = sys.platform.startswith("linux")
     if use_renameat2:
@@ -699,35 +717,94 @@ def _cleanup_posix_failed_publication(
     child_handle: int,
     resumes_handle: int,
     resume_id: str,
-    child_identity: tuple[int, int],
+    child_identity: tuple[int, int] | None,
+    temporary_descriptor: int,
     temporary_name: str,
     state: _PosixPublicationState,
 ) -> None:
     temporary_identity = state.temporary_identity
-    if temporary_identity is None:
-        return
-    if state.destination_owns_inode:
+    if (
+        state.temporary_created
+        and temporary_identity is None
+        and temporary_descriptor >= 0
+    ):
         try:
-            destination_removed = _posix_unlink_owned_entry(
-                child_handle, "source.tex", temporary_identity
+            opened = os.fstat(temporary_descriptor)
+        except OSError:
+            pass
+        else:
+            if stat.S_ISREG(opened.st_mode) and opened.st_nlink == 1:
+                temporary_identity = (opened.st_dev, opened.st_ino)
+                state.temporary_identity = temporary_identity
+                state.temporary_owns_inode = True
+    if (
+        state.temporary_created
+        and temporary_identity is None
+        and child_handle >= 0
+        and temporary_name
+    ):
+        try:
+            current = os.stat(
+                temporary_name,
+                dir_fd=child_handle,
+                follow_symlinks=False,
             )
         except OSError:
-            destination_removed = False
-        if destination_removed:
-            state.destination_owns_inode = False
-    if state.temporary_owns_inode:
-        try:
-            temporary_removed = _posix_unlink_owned_entry(
-                child_handle, temporary_name, temporary_identity
-            )
-        except OSError:
-            temporary_removed = False
-        if temporary_removed:
-            state.temporary_owns_inode = False
+            pass
+        else:
+            if stat.S_ISREG(current.st_mode) and current.st_nlink == 1:
+                temporary_identity = (current.st_dev, current.st_ino)
+                state.temporary_identity = temporary_identity
+                state.temporary_owns_inode = True
+    if temporary_identity is not None:
+        if state.destination_owns_inode:
+            try:
+                destination_removed = _posix_unlink_owned_entry(
+                    child_handle, "source.tex", temporary_identity
+                )
+            except OSError:
+                destination_removed = False
+            if destination_removed:
+                state.destination_owns_inode = False
+        if state.temporary_owns_inode:
+            try:
+                temporary_removed = _posix_unlink_owned_entry(
+                    child_handle, temporary_name, temporary_identity
+                )
+            except OSError:
+                temporary_removed = False
+            if temporary_removed:
+                state.temporary_owns_inode = False
     if not state.destination_owns_inode and not state.temporary_owns_inode:
+        state.temporary_created = False
+
+    resolved_child_identity = child_identity
+    if resolved_child_identity is None and child_handle >= 0:
+        try:
+            resolved_child_identity = _posix_capture_child_identity(child_handle)
+        except OSError:
+            pass
+    if resolved_child_identity is None:
+        try:
+            current_child = os.stat(
+                resume_id,
+                dir_fd=resumes_handle,
+                follow_symlinks=False,
+            )
+        except OSError:
+            pass
+        else:
+            if stat.S_ISDIR(current_child.st_mode) and not stat.S_ISLNK(
+                current_child.st_mode
+            ):
+                resolved_child_identity = (
+                    current_child.st_dev,
+                    current_child.st_ino,
+                )
+    if not state.temporary_created and resolved_child_identity is not None:
         try:
             _posix_remove_owned_directory(
-                resumes_handle, resume_id, child_identity
+                resumes_handle, resume_id, resolved_child_identity
             )
         except OSError:
             pass
@@ -960,7 +1037,7 @@ def _windows_open_relative(
         desired_access |= 0x00010000
     elif file_access != "guard":
         raise ValueError("Repository resume storage access is invalid")
-    if create and directory:
+    if create:
         desired_access |= 0x00010000
     create_options = 0x00200000 | 0x00000020
     create_options |= 0x00000001 if directory else 0x00000040
@@ -991,6 +1068,11 @@ def _windows_open_relative(
         ):
             raise ValueError("Repository resume storage handle is invalid")
     except BaseException:
+        if create:
+            try:
+                _windows_mark_delete(opened_handle)
+            except OSError:
+                pass
         _windows_close_handle(opened_handle)
         raise
     return opened_handle

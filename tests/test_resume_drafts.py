@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
 from dataclasses import dataclass
 import hashlib
 import json
@@ -933,6 +934,68 @@ def test_completed_authority_race_fails_closed_and_cleans_new_draft(
     assert list((repo.vault_path / "resumes").glob("res_*/source.tex")) == []
 
 
+def test_draft_commit_does_not_hash_files_under_writer_lock(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    repo = _make_repo(tmp_path)
+    application = _create_application(repo)
+    _select_parent(repo, application.id)
+    task, findings, _evidence = _create_completed_suggestion_task(
+        repo, application.id
+    )
+    original_connection = repo.connection
+    original_stable_read = repo._stable_artifact_read
+    original_artifact_evidence = repo._artifact_evidence_for_row
+    writer_active = False
+    writer_seen = False
+    violations: list[str] = []
+
+    @contextmanager
+    def tracked_connection():
+        nonlocal writer_active, writer_seen
+        with original_connection() as connection:
+            def trace(statement: str) -> None:
+                nonlocal writer_active, writer_seen
+                normalized = statement.strip().upper()
+                if normalized.startswith("BEGIN IMMEDIATE"):
+                    writer_active = True
+                    writer_seen = True
+                elif normalized.startswith(("COMMIT", "ROLLBACK")):
+                    writer_active = False
+
+            connection.set_trace_callback(trace)
+            yield connection
+
+    def tracked_stable_read(*args: Any, **kwargs: Any):
+        if writer_active:
+            violations.append("stable_read")
+        return original_stable_read(*args, **kwargs)
+
+    def tracked_artifact_evidence(*args: Any, **kwargs: Any):
+        if writer_active:
+            violations.append("artifact_evidence")
+        return original_artifact_evidence(*args, **kwargs)
+
+    monkeypatch.setattr(repo, "connection", tracked_connection)
+    monkeypatch.setattr(repo, "_stable_artifact_read", tracked_stable_read)
+    monkeypatch.setattr(
+        repo, "_artifact_evidence_for_row", tracked_artifact_evidence
+    )
+
+    child = create_verified_resume_draft(
+        repo,
+        application_id=application.id,
+        task_id=task.id,
+        finding_ids=[findings[0].id],
+        name="Bounded writer draft",
+    )
+
+    assert writer_seen
+    assert violations == []
+    assert repo.get_application(application.id).selected_resume_version_id == child.id
+
+
 def test_parent_substitution_cannot_write_resume_source_outside_vault(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1038,6 +1101,53 @@ def test_windows_publication_failure_cleans_owned_directory(
         )
 
     assert not draft_dir.exists()
+    assert repo.get_application(application.id).selected_resume_version_id == parent.id
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows native publication path")
+def test_windows_temp_identity_failure_deletes_exclusive_create(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from careerops.resumes import drafts as drafts_module
+
+    repo = _make_repo(tmp_path)
+    application = _create_application(repo)
+    parent = _select_parent(repo, application.id)
+    task, findings, _evidence = _create_completed_suggestion_task(
+        repo, application.id
+    )
+    resume_id = "res_" + ("f" * 32)
+    draft_dir = repo.vault_path / "resumes" / resume_id
+    original_information = drafts_module._windows_handle_information
+    information_calls = 0
+
+    def fail_temp_create_identity(handle: int):
+        nonlocal information_calls
+        information_calls += 1
+        if information_calls == 5:
+            raise OSError("simulated temp identity failure")
+        return original_information(handle)
+
+    monkeypatch.setattr(drafts_module, "new_id", lambda _prefix: resume_id)
+    monkeypatch.setattr(
+        drafts_module,
+        "_windows_handle_information",
+        fail_temp_create_identity,
+    )
+
+    with pytest.raises(ValueError, match="changed during publication"):
+        create_verified_resume_draft(
+            repo,
+            application_id=application.id,
+            task_id=task.id,
+            finding_ids=[findings[0].id],
+            name="Failed temp identity draft",
+        )
+
+    assert information_calls == 5
+    assert not draft_dir.exists()
+    assert list((repo.vault_path / "resumes").glob("res_*/.source.tex.tmp-*")) == []
     assert repo.get_application(application.id).selected_resume_version_id == parent.id
 
 
@@ -1168,6 +1278,7 @@ def test_posix_partial_hard_link_publication_is_fully_cleaned(
             resumes_handle=37,
             resume_id=resume_id,
             child_identity=child_identity,
+            temporary_descriptor=-1,
             temporary_name=temporary_name,
             state=state,
         )
@@ -1252,6 +1363,7 @@ def test_posix_write_failure_after_temp_creation_is_fully_cleaned(
             resumes_handle=43,
             resume_id=resume_id,
             child_identity=child_identity,
+            temporary_descriptor=-1,
             temporary_name=temporary_name,
             state=state,
         )
@@ -1259,6 +1371,151 @@ def test_posix_write_failure_after_temp_creation_is_fully_cleaned(
     assert not state.temporary_owns_inode
     assert not (child_dir / "source.tex").exists()
     assert not temporary_path.exists()
+    assert not child_dir.exists()
+
+
+def test_posix_child_identity_failure_cleans_exclusive_directory(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from careerops.resumes import drafts as drafts_module
+
+    resumes_dir = tmp_path / "resumes"
+    resumes_dir.mkdir()
+    resume_id = "res_" + ("1" * 32)
+    child_dir = resumes_dir / resume_id
+    child_dir.mkdir()
+    child_stat = child_dir.lstat()
+    fstat_calls = 0
+    real_stat = os.stat
+    real_rmdir = os.rmdir
+
+    def fail_first_child_fstat(descriptor: int) -> os.stat_result:
+        nonlocal fstat_calls
+        assert descriptor == 47
+        fstat_calls += 1
+        if fstat_calls == 1:
+            raise OSError("simulated child identity failure")
+        return child_stat
+
+    def stat_relative(
+        name: str, *, dir_fd: int, follow_symlinks: bool
+    ) -> os.stat_result:
+        assert name == resume_id
+        assert dir_fd == 49
+        assert not follow_symlinks
+        return real_stat(child_dir, follow_symlinks=False)
+
+    def rmdir_relative(name: str, *, dir_fd: int) -> None:
+        assert name == resume_id
+        assert dir_fd == 49
+        real_rmdir(child_dir)
+
+    with monkeypatch.context() as posix_ops:
+        posix_ops.setattr(drafts_module.os, "fstat", fail_first_child_fstat)
+        posix_ops.setattr(drafts_module.os, "stat", stat_relative)
+        posix_ops.setattr(drafts_module.os, "rmdir", rmdir_relative)
+        with pytest.raises(OSError, match="child identity"):
+            drafts_module._posix_capture_child_identity(47)
+        drafts_module._cleanup_posix_failed_publication(
+            child_handle=47,
+            resumes_handle=49,
+            resume_id=resume_id,
+            child_identity=None,
+            temporary_descriptor=-1,
+            temporary_name="",
+            state=drafts_module._PosixPublicationState(),
+        )
+
+    assert fstat_calls == 2
+    assert not child_dir.exists()
+
+
+def test_posix_temp_identity_failure_cleans_exclusive_file_and_directory(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from careerops.resumes import drafts as drafts_module
+
+    resumes_dir = tmp_path / "resumes"
+    resumes_dir.mkdir()
+    resume_id = "res_" + ("2" * 32)
+    child_dir = resumes_dir / resume_id
+    child_dir.mkdir()
+    temporary_name = ".source.tex.tmp-identity-failure"
+    temporary_path = child_dir / temporary_name
+    descriptor = os.open(
+        temporary_path,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0),
+        0o600,
+    )
+    descriptor_open = True
+    temporary_stat = temporary_path.lstat()
+    child_stat = child_dir.lstat()
+    child_identity = (child_stat.st_dev, child_stat.st_ino)
+    state = drafts_module._PosixPublicationState(temporary_created=True)
+    fstat_calls = 0
+    real_stat = os.stat
+    real_unlink = os.unlink
+    real_rmdir = os.rmdir
+
+    def fail_first_temp_fstat(opened_descriptor: int) -> os.stat_result:
+        nonlocal fstat_calls
+        assert opened_descriptor == descriptor
+        fstat_calls += 1
+        if fstat_calls == 1:
+            raise OSError("simulated temp identity failure")
+        return temporary_stat
+
+    def stat_relative(
+        name: str, *, dir_fd: int, follow_symlinks: bool
+    ) -> os.stat_result:
+        assert not follow_symlinks
+        if dir_fd == 53:
+            return real_stat(child_dir / name, follow_symlinks=False)
+        assert dir_fd == 59
+        return real_stat(resumes_dir / name, follow_symlinks=False)
+
+    def unlink_relative(name: str, *, dir_fd: int) -> None:
+        nonlocal descriptor_open
+        assert dir_fd == 53
+        if descriptor_open:
+            os.close(descriptor)
+            descriptor_open = False
+        real_unlink(child_dir / name)
+
+    def rmdir_relative(name: str, *, dir_fd: int) -> None:
+        assert dir_fd == 59
+        real_rmdir(resumes_dir / name)
+
+    try:
+        with monkeypatch.context() as posix_ops:
+            posix_ops.setattr(drafts_module.os, "fstat", fail_first_temp_fstat)
+            posix_ops.setattr(drafts_module.os, "stat", stat_relative)
+            posix_ops.setattr(drafts_module.os, "unlink", unlink_relative)
+            posix_ops.setattr(drafts_module.os, "rmdir", rmdir_relative)
+            with pytest.raises(OSError, match="temp identity"):
+                drafts_module._posix_write_temporary_source(
+                    descriptor,
+                    b"owned resume source",
+                    state,
+                )
+            drafts_module._cleanup_posix_failed_publication(
+                child_handle=53,
+                resumes_handle=59,
+                resume_id=resume_id,
+                child_identity=child_identity,
+                temporary_descriptor=descriptor,
+                temporary_name=temporary_name,
+                state=state,
+            )
+    finally:
+        if descriptor_open:
+            os.close(descriptor)
+
+    assert fstat_calls == 2
+    assert not temporary_path.exists()
+    assert not (child_dir / "source.tex").exists()
     assert not child_dir.exists()
 
 
