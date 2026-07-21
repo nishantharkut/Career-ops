@@ -2193,7 +2193,7 @@ def test_lock_delayed_recovery_observes_expiry_after_lock_wait(tmp_path: Path):
     assert repo.get_ai_task(task.id).status == "pending"
 
 
-def create_approved_application(repo: CareerOpsRepository, tmp_path: Path):
+def prepare_approvable_application(repo: CareerOpsRepository, tmp_path: Path):
     application = create_application(repo)
     source_dir = repo.vault_path / "resumes" / "approved"
     source_dir.mkdir(parents=True, exist_ok=True)
@@ -2219,8 +2219,256 @@ def create_approved_application(repo: CareerOpsRepository, tmp_path: Path):
         fit={"score": 90},
         risks={"blockers": [], "warnings": []},
     )
+    return application, resume, report
+
+
+def create_approved_application(repo: CareerOpsRepository, tmp_path: Path):
+    application, resume, report = prepare_approvable_application(repo, tmp_path)
     approval = repo.approve_application(application.id, report.id, "Reviewed")
     return application, resume, report, approval
+
+
+@pytest.mark.parametrize("submitted", [False, True], ids=["approved", "submitted"])
+def test_create_ai_task_rejects_read_only_application_transactionally(
+    tmp_path: Path, submitted: bool
+):
+    repo = make_repo(tmp_path)
+    application, _resume, report = prepare_approvable_application(repo, tmp_path)
+    provider = create_provider(repo)
+    repo.approve_application(application.id, report.id, "Reviewed")
+    if submitted:
+        repo.mark_submitted_manual(application.id, "Submitted")
+
+    with pytest.raises(ValueError, match="approved or submitted"):
+        create_bound_task(repo, application.id, provider.id, "analyze_jd")
+
+    assert repo.list_ai_tasks(application.id) == []
+
+
+def test_approval_rejects_claimed_task_and_leaves_invocation_path_coherent(
+    tmp_path: Path,
+):
+    repo = make_repo(tmp_path)
+    application, _resume, report = prepare_approvable_application(repo, tmp_path)
+    provider = create_provider(repo)
+    task = create_bound_task(repo, application.id, provider.id, "analyze_jd")
+    claim = claim_task(repo, task.id)
+
+    with pytest.raises(ValueError, match="running AI task"):
+        repo.approve_application(application.id, report.id, "Reviewed")
+
+    unchanged = repo.get_application(application.id)
+    assert unchanged.approval_id is None
+    assert unchanged.status == "ready_for_review"
+    assert repo.get_ai_task(task.id).status == "running"
+    assert repo.begin_ai_task_invocation(task.id, claim) is True
+    repo.fail_ai_task(task.id, claim, "cancelled")
+
+
+def test_begin_invocation_rejects_non_pristine_application_in_same_update(
+    tmp_path: Path,
+):
+    repo = make_repo(tmp_path)
+    application = create_application(repo)
+    provider = create_provider(repo)
+    task = create_bound_task(repo, application.id, provider.id, "analyze_jd")
+    claim = claim_task(repo, task.id)
+    with repo.connection() as connection:
+        connection.execute(
+            """
+            UPDATE applications
+            SET status = 'submitted_manual', submission_state = 'submitted_manual',
+                submitted_at = ?
+            WHERE id = ?
+            """,
+            ("2026-07-22T00:00:00+00:00", application.id),
+        )
+
+    assert repo.begin_ai_task_invocation(task.id, claim) is False
+    assert repo.get_ai_task(task.id).invocation_started_at is None
+
+
+def test_approval_wins_before_invocation_and_cancels_pending_task(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    repo = make_repo(tmp_path)
+    application, _resume, report = prepare_approvable_application(repo, tmp_path)
+    provider_config = create_provider(repo)
+    task = create_bound_task(
+        repo, application.id, provider_config.id, "analyze_jd"
+    )
+    approval_repo = CareerOpsRepository(repo.database_path, repo.vault_path)
+    invocation_repo = CareerOpsRepository(repo.database_path, repo.vault_path)
+    approval_updated = Event()
+    release_approval = Event()
+    invocation_started = Event()
+    original_write_audit = approval_repo._write_audit
+
+    def pause_approval_audit(
+        connection, event_type, entity_type, entity_id, before, after
+    ):
+        original_write_audit(
+            connection, event_type, entity_type, entity_id, before, after
+        )
+        if event_type == "application.approved":
+            approval_updated.set()
+            assert release_approval.wait(2)
+
+    monkeypatch.setattr(approval_repo, "_write_audit", pause_approval_audit)
+
+    class ProviderRunCounter:
+        calls = 0
+
+        def run(self):
+            self.calls += 1
+
+    provider = ProviderRunCounter()
+
+    def begin_invocation():
+        invocation_started.set()
+        began = invocation_repo.begin_ai_task_invocation(task.id, "stale-claim")
+        if began:
+            provider.run()
+        return began
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        approval_future = executor.submit(
+            approval_repo.approve_application,
+            application.id,
+            report.id,
+            "Reviewed",
+        )
+        assert approval_updated.wait(2)
+        invocation_future = executor.submit(begin_invocation)
+        assert invocation_started.wait(2)
+        release_approval.set()
+        approval_future.result(timeout=2)
+        assert invocation_future.result(timeout=2) is False
+
+    cancelled = repo.get_ai_task(task.id)
+    assert cancelled.status == "failed"
+    assert cancelled.error_summary == "cancelled"
+    assert provider.calls == 0
+    assert repo.get_application(application.id).approval_id is not None
+
+
+def test_invocation_wins_before_approval_and_application_stays_unapproved(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    repo = make_repo(tmp_path)
+    application, _resume, report = prepare_approvable_application(repo, tmp_path)
+    provider = create_provider(repo)
+    task = create_bound_task(repo, application.id, provider.id, "analyze_jd")
+    claim = claim_task(repo, task.id)
+    invocation_repo = CareerOpsRepository(repo.database_path, repo.vault_path)
+    approval_repo = CareerOpsRepository(repo.database_path, repo.vault_path)
+    invocation_updated = Event()
+    release_invocation = Event()
+    approval_started = Event()
+    original_write_audit = invocation_repo._write_audit
+
+    def pause_invocation_audit(
+        connection, event_type, entity_type, entity_id, before, after
+    ):
+        original_write_audit(
+            connection, event_type, entity_type, entity_id, before, after
+        )
+        if event_type == "ai_task.invocation_started":
+            invocation_updated.set()
+            assert release_invocation.wait(2)
+
+    monkeypatch.setattr(invocation_repo, "_write_audit", pause_invocation_audit)
+
+    def approve():
+        approval_started.set()
+        return approval_repo.approve_application(
+            application.id, report.id, "Reviewed"
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        invocation_future = executor.submit(
+            invocation_repo.begin_ai_task_invocation, task.id, claim
+        )
+        assert invocation_updated.wait(2)
+        approval_future = executor.submit(approve)
+        assert approval_started.wait(2)
+        release_invocation.set()
+        assert invocation_future.result(timeout=2) is True
+        with pytest.raises(ValueError, match="running AI task"):
+            approval_future.result(timeout=2)
+
+    assert repo.get_application(application.id).approval_id is None
+    assert repo.get_ai_task(task.id).invocation_started_at is not None
+    repo.fail_ai_task(task.id, claim, "cancelled")
+
+
+def test_approval_cancels_pending_tasks_with_audit_and_preserves_terminal_tasks(
+    tmp_path: Path,
+):
+    repo = make_repo(tmp_path)
+    application, _resume, report = prepare_approvable_application(repo, tmp_path)
+    provider = create_provider(repo)
+    pending = create_bound_task(repo, application.id, provider.id, "analyze_jd")
+    terminal = create_bound_task(repo, application.id, provider.id, "analyze_jd")
+    terminal_claim = claim_task(repo, terminal.id)
+    terminal_before = repo.fail_ai_task(terminal.id, terminal_claim, "provider_error")
+
+    repo.approve_application(application.id, report.id, "Reviewed")
+
+    cancelled = repo.get_ai_task(pending.id)
+    assert cancelled.status == "failed"
+    assert cancelled.started_at is None
+    assert cancelled.completed_at is not None
+    assert cancelled.error_summary == "cancelled"
+    assert repo.get_ai_task(terminal.id) == terminal_before
+    cancellation_events = [
+        event
+        for event in repo.list_audit_events()
+        if event.entity_id == pending.id and event.event_type == "ai_task.failed"
+    ]
+    assert len(cancellation_events) == 1
+    assert cancellation_events[0].before_json["status"] == "pending"
+    assert cancellation_events[0].after_json["error_summary"] == "cancelled"
+
+
+def test_submission_defensively_cancels_pending_tasks_with_audit(tmp_path: Path):
+    repo = make_repo(tmp_path)
+    application, _resume, report = prepare_approvable_application(repo, tmp_path)
+    provider = create_provider(repo)
+    task = create_bound_task(repo, application.id, provider.id, "analyze_jd")
+    repo.approve_application(application.id, report.id, "Reviewed")
+    with repo.connection() as connection:
+        connection.execute(
+            """
+            UPDATE ai_tasks
+            SET status = 'pending', started_at = NULL, completed_at = NULL,
+                error_summary = '', claim_token = NULL, claim_expires_at = NULL,
+                invocation_started_at = NULL
+            WHERE id = ?
+            """,
+            (task.id,),
+        )
+    prior_events = len(
+        [
+            event
+            for event in repo.list_audit_events()
+            if event.entity_id == task.id and event.event_type == "ai_task.failed"
+        ]
+    )
+
+    repo.mark_submitted_manual(application.id, "Submitted")
+
+    cancelled = repo.get_ai_task(task.id)
+    assert cancelled.status == "failed"
+    assert cancelled.error_summary == "cancelled"
+    cancellation_events = [
+        event
+        for event in repo.list_audit_events()
+        if event.entity_id == task.id and event.event_type == "ai_task.failed"
+    ]
+    assert len(cancellation_events) == prior_events + 1
+    assert cancellation_events[-1].before_json["status"] == "pending"
+    assert repo.get_application(application.id).submission_state == "submitted_manual"
 
 
 @pytest.mark.parametrize(
@@ -2565,17 +2813,13 @@ def test_public_ai_business_writes_reject_approved_packet(tmp_path: Path):
     application, resume, report, _approval = create_approved_application(
         repo, tmp_path
     )
-    provider = create_provider(repo)
-    task = create_bound_task(repo, application.id, provider.id, "analyze_jd")
-    assert repo.claim_ai_task(task.id) is None
-    assert repo.get_ai_task(task.id).error_summary == "cancelled"
     before_application = repo.get_application(application.id)
     before_jd = repo.get_jd_snapshot(application.jd_snapshot_id)
 
     with pytest.raises(ValueError, match="aggregate finalizer"):
         repo.update_jd_requirements_from_ai(
             snapshot_id=application.jd_snapshot_id,
-            task_id=task.id,
+            task_id="ait_read_only",
             claim_token="inactive-claim",
             raw_ai={"required_skills": ["Rust"]},
             uncertainty={"items": []},

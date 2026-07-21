@@ -791,6 +791,12 @@ class CareerOpsRepository:
         with self.connection() as connection:
             connection.execute("BEGIN IMMEDIATE")
             now = utc_now()
+            application = connection.execute(
+                "SELECT * FROM applications WHERE id = ?", (application_id,)
+            ).fetchone()
+            if application is None:
+                raise KeyError("No application with that ID")
+            self._require_pristine_application_packet(application)
             provider = connection.execute(
                 "SELECT * FROM ai_provider_configs WHERE id = ?",
                 (provider_config_id,),
@@ -969,29 +975,7 @@ class CareerOpsRepository:
             if application is None:
                 raise ValueError("AI task application is missing")
             if not self._application_packet_is_pristine(application):
-                cursor = connection.execute(
-                    """
-                    UPDATE ai_tasks
-                    SET status = 'failed', completed_at = ?, error_summary = 'cancelled',
-                        claim_token = NULL, claim_expires_at = NULL, updated_at = ?
-                    WHERE id = ? AND status = 'pending'
-                    """,
-                    (now, now, task_id),
-                )
-                if cursor.rowcount != 1:
-                    return None
-                self._write_audit(
-                    connection,
-                    "ai_task.failed",
-                    "ai_task",
-                    task_id,
-                    dict(task),
-                    {
-                        "status": "failed",
-                        "completed_at": now,
-                        "error_summary": "cancelled",
-                    },
-                )
+                self._cancel_pending_ai_task_rows(connection, [task], now)
                 return None
             expires_at = (
                 datetime.fromisoformat(now)
@@ -1030,6 +1014,15 @@ class CareerOpsRepository:
                   AND lower(prompt_sha256) = prompt_sha256
                   AND prompt_sha256 NOT GLOB '*[^0-9a-f]*'
                   AND provider_binding_sha256 != ''
+                  AND EXISTS (
+                    SELECT 1
+                    FROM applications AS application
+                    WHERE application.id = ai_tasks.application_id
+                      AND application.approval_id IS NULL
+                      AND application.submission_state = 'not_submitted'
+                      AND application.submitted_at IS NULL
+                      AND application.status NOT IN ('approved', 'submitted_manual')
+                  )
                   AND EXISTS (
                     SELECT 1
                     FROM ai_provider_configs AS config
@@ -3486,6 +3479,9 @@ class CareerOpsRepository:
             application, report, resume = self._approval_packet_rows(
                 connection, application_id, report_id
             )
+            self._prepare_ai_tasks_for_read_only_transition(
+                connection, application_id, now
+            )
             connection.execute(
                 """
                 INSERT INTO approvals (
@@ -3535,6 +3531,9 @@ class CareerOpsRepository:
             connection.execute("BEGIN IMMEDIATE")
             now = utc_now()
             application = self._submission_packet_row(connection, application_id)
+            self._prepare_ai_tasks_for_read_only_transition(
+                connection, application_id, now
+            )
             connection.execute(
                 """
                 UPDATE applications
@@ -3573,6 +3572,63 @@ class CareerOpsRepository:
                 ApplicationStatus.SUBMITTED_MANUAL.value,
             }
         )
+
+    def _prepare_ai_tasks_for_read_only_transition(
+        self,
+        connection: sqlite3.Connection,
+        application_id: str,
+        now: str,
+    ) -> None:
+        running = connection.execute(
+            """
+            SELECT id FROM ai_tasks
+            WHERE application_id = ? AND status = 'running'
+            LIMIT 1
+            """,
+            (application_id,),
+        ).fetchone()
+        if running is not None:
+            raise ValueError("Application has a running AI task")
+        pending = connection.execute(
+            """
+            SELECT * FROM ai_tasks
+            WHERE application_id = ? AND status = 'pending'
+            ORDER BY created_at ASC, id ASC
+            """,
+            (application_id,),
+        ).fetchall()
+        self._cancel_pending_ai_task_rows(connection, pending, now)
+
+    def _cancel_pending_ai_task_rows(
+        self,
+        connection: sqlite3.Connection,
+        tasks: Sequence[sqlite3.Row],
+        now: str,
+    ) -> None:
+        for task in tasks:
+            cursor = connection.execute(
+                """
+                UPDATE ai_tasks
+                SET status = 'failed', completed_at = ?, error_summary = 'cancelled',
+                    claim_token = NULL, claim_expires_at = NULL, updated_at = ?
+                WHERE id = ? AND status = 'pending'
+                """,
+                (now, now, task["id"]),
+            )
+            if cursor.rowcount != 1:
+                raise ValueError("AI task is not pending")
+            self._write_audit(
+                connection,
+                "ai_task.failed",
+                "ai_task",
+                task["id"],
+                dict(task),
+                {
+                    "status": "failed",
+                    "completed_at": now,
+                    "error_summary": "cancelled",
+                },
+            )
 
     @classmethod
     def _require_pristine_application_packet(cls, application: sqlite3.Row) -> None:

@@ -469,6 +469,46 @@ def test_enqueue_rejects_read_only_application_before_provider_access(
     assert repo.list_ai_tasks(application.id) == []
 
 
+def test_enqueue_rechecks_application_after_provider_availability_callback(
+    tmp_path: Path,
+):
+    from careerops.ai.orchestrator import AiOrchestrator
+
+    repo = make_repo(tmp_path)
+    application = create_application(repo)
+    resume = select_resume(repo, application.id)
+    report = repo.save_report(
+        application_id=application.id,
+        resume_version_id=resume.id,
+        jd_snapshot_id=application.jd_snapshot_id,
+        fit={"score": 100},
+        risks={"blockers": [], "warnings": []},
+    )
+    status = availability()
+    config = create_provider_config(repo, binding_status=status)
+
+    class ApprovingAvailabilityProvider:
+        calls = 0
+
+        def availability(self):
+            self.calls += 1
+            repo.approve_application(application.id, report.id, "Reviewed")
+            return status
+
+        def run(self, _request):
+            raise AssertionError("enqueue must not invoke the provider")
+
+    provider = ApprovingAvailabilityProvider()
+    orchestrator = AiOrchestrator(repo, {config.id: provider})
+
+    with pytest.raises(ValueError, match="approved or submitted"):
+        orchestrator.enqueue(application.id, "analyze_jd", config.id)
+
+    assert provider.calls == 1
+    assert repo.get_application(application.id).approval_id is not None
+    assert repo.list_ai_tasks(application.id) == []
+
+
 @pytest.mark.parametrize("submitted", [False, True], ids=["approved", "submitted"])
 def test_run_cancels_queued_task_when_application_becomes_read_only_before_provider_access(
     tmp_path: Path, submitted: bool
