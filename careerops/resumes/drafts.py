@@ -351,6 +351,12 @@ class _PublishedSource:
     source_identity: tuple[int, int]
 
 
+@dataclass
+class _PosixPublicationState:
+    temporary_owns_inode: bool = False
+    destination_owns_inode: bool = False
+
+
 def _publish_source(
     repository: CareerOpsRepository,
     resume_id: str,
@@ -389,7 +395,7 @@ def _publish_source_posix(
     child_identity: tuple[int, int] | None = None
     temporary_name = ""
     temporary_identity: tuple[int, int] | None = None
-    destination_published = False
+    publication_state = _PosixPublicationState()
     try:
         vault_handle = os.open(vault_root, directory_flags)
         _require_open_directory(vault_handle)
@@ -412,12 +418,13 @@ def _publish_source_posix(
         _write_and_sync(source_descriptor, content)
         temporary_stat = os.fstat(source_descriptor)
         temporary_identity = (temporary_stat.st_dev, temporary_stat.st_ino)
+        publication_state.temporary_owns_inode = True
         _posix_atomic_publish_no_replace(
             child_handle,
             temporary_name,
             "source.tex",
+            state=publication_state,
         )
-        destination_published = True
         source_stat = os.stat(
             "source.tex", dir_fd=child_handle, follow_symlinks=False
         )
@@ -440,31 +447,23 @@ def _publish_source_posix(
         )
     except BaseException as exc:
         if source_descriptor >= 0:
-            if temporary_identity is not None:
-                owned_name = (
-                    "source.tex" if destination_published else temporary_name
+            if temporary_identity is not None and child_identity is not None:
+                _cleanup_posix_failed_publication(
+                    child_handle=child_handle,
+                    resumes_handle=resumes_handle,
+                    resume_id=resume_id,
+                    child_identity=child_identity,
+                    temporary_name=temporary_name,
+                    temporary_identity=temporary_identity,
+                    state=publication_state,
                 )
-                try:
-                    owned_stat = os.stat(
-                        owned_name,
-                        dir_fd=child_handle,
-                        follow_symlinks=False,
-                    )
-                    if (
-                        stat.S_ISREG(owned_stat.st_mode)
-                        and (owned_stat.st_dev, owned_stat.st_ino)
-                        == temporary_identity
-                    ):
-                        os.unlink(owned_name, dir_fd=child_handle)
-                except OSError:
-                    pass
             os.close(source_descriptor)
         if child_handle >= 0:
             os.close(child_handle)
         if (
             child_created
+            and temporary_identity is None
             and child_identity is not None
-            and resumes_handle >= 0
         ):
             try:
                 _posix_remove_owned_directory(
@@ -644,8 +643,11 @@ def _posix_atomic_publish_no_replace(
     temporary_name: str,
     destination_name: str,
     *,
+    state: _PosixPublicationState | None = None,
     use_renameat2: bool | None = None,
 ) -> None:
+    if state is None:
+        state = _PosixPublicationState(temporary_owns_inode=True)
     if use_renameat2 is None:
         use_renameat2 = sys.platform.startswith("linux")
     if use_renameat2:
@@ -653,6 +655,8 @@ def _posix_atomic_publish_no_replace(
             _linux_renameat2_no_replace(
                 directory_handle, temporary_name, destination_name
             )
+            state.temporary_owns_inode = False
+            state.destination_owns_inode = True
             return
         except OSError as exc:
             unsupported = {
@@ -671,7 +675,71 @@ def _posix_atomic_publish_no_replace(
         dst_dir_fd=directory_handle,
         follow_symlinks=False,
     )
+    state.destination_owns_inode = True
     os.unlink(temporary_name, dir_fd=directory_handle)
+    state.temporary_owns_inode = False
+
+
+def _cleanup_posix_failed_publication(
+    *,
+    child_handle: int,
+    resumes_handle: int,
+    resume_id: str,
+    child_identity: tuple[int, int],
+    temporary_name: str,
+    temporary_identity: tuple[int, int],
+    state: _PosixPublicationState,
+) -> None:
+    if state.destination_owns_inode:
+        try:
+            destination_removed = _posix_unlink_owned_entry(
+                child_handle, "source.tex", temporary_identity
+            )
+        except OSError:
+            destination_removed = False
+        if destination_removed:
+            state.destination_owns_inode = False
+    if state.temporary_owns_inode:
+        try:
+            temporary_removed = _posix_unlink_owned_entry(
+                child_handle, temporary_name, temporary_identity
+            )
+        except OSError:
+            temporary_removed = False
+        if temporary_removed:
+            state.temporary_owns_inode = False
+    if not state.destination_owns_inode and not state.temporary_owns_inode:
+        try:
+            _posix_remove_owned_directory(
+                resumes_handle, resume_id, child_identity
+            )
+        except OSError:
+            pass
+
+
+def _posix_unlink_owned_entry(
+    directory_handle: int,
+    name: str,
+    expected_identity: tuple[int, int],
+) -> bool:
+    try:
+        current = os.stat(
+            name,
+            dir_fd=directory_handle,
+            follow_symlinks=False,
+        )
+    except FileNotFoundError:
+        return True
+    if (
+        not stat.S_ISREG(current.st_mode)
+        or (current.st_dev, current.st_ino) != expected_identity
+    ):
+        return False
+    try:
+        os.unlink(name, dir_fd=directory_handle)
+    except FileNotFoundError:
+        return True
+    return True
 
 
 def _linux_renameat2_no_replace(
