@@ -6,6 +6,7 @@ import hashlib
 import json
 from pathlib import Path
 from threading import Event, Lock
+import time
 from types import SimpleNamespace
 from typing import Any
 
@@ -92,7 +93,16 @@ def create_provider_config(
     endpoint: str = "",
     identity_name: str = "",
     enabled: bool = True,
+    binding_status: ProviderAvailability | None = None,
 ):
+    status = binding_status or availability(
+        provider_kind=provider_kind,
+        model=model,
+        privacy_mode=PrivacyMode(privacy_mode),
+        data_leaves_machine=privacy_mode == "cloud_external",
+        endpoint=endpoint,
+        identity_name=identity_name,
+    )
     return repo.upsert_ai_provider_config(
         provider_kind=provider_kind,
         display_name=f"{provider_kind} {model}",
@@ -101,6 +111,7 @@ def create_provider_config(
         identity_name=identity_name,
         model=model,
         enabled=enabled,
+        availability_binding=provider_binding_values(status),
     )
 
 
@@ -162,6 +173,27 @@ class ScriptedProvider:
                 mode="test_fixture",
                 endpoint=self.status.endpoint,
                 identity_name=self.status.identity_name,
+                executable=self.status.executable,
+                executable_sha256=self.status.executable_sha256,
+                executable_version=self.status.executable_version,
+                codex_home=self.status.codex_home,
+                model_digest=self.status.model_digest,
+                model_metadata_sha256=self.status.model_metadata_sha256,
+                show_metadata_sha256=self.status.show_metadata_sha256,
+                attestation_version=self.status.attestation_version,
+                runtime_instance_id=self.status.runtime_instance_id,
+                runtime_handle=self.status.runtime_handle,
+                issuer_instance_id=self.status.issuer_instance_id,
+                egress_policy=self.status.egress_policy,
+                cloud_disabled=self.status.cloud_disabled,
+                egress_enforced=self.status.egress_enforced,
+                isolation_evidence_sha256=(
+                    self.status.isolation_evidence_sha256
+                ),
+                isolation_evidence_signature=(
+                    self.status.isolation_evidence_signature
+                ),
+                reasoning_effort=self.status.reasoning_effort,
             ),
             **self.result_overrides,
         }
@@ -200,6 +232,11 @@ def availability(
     data_leaves_machine: bool = False,
     endpoint: str = "",
     identity_name: str = "",
+    executable: str = "",
+    executable_sha256: str = "",
+    executable_version: str = "",
+    codex_home: str = "",
+    reasoning_effort: str = "",
     available: bool = True,
 ) -> ProviderAvailability:
     return ProviderAvailability(
@@ -212,7 +249,19 @@ def availability(
         detail="available" if available else "unavailable",
         endpoint=endpoint,
         identity_name=identity_name,
+        executable=executable,
+        executable_sha256=executable_sha256,
+        executable_version=executable_version,
+        codex_home=codex_home,
+        reasoning_effort=reasoning_effort,
     )
+
+
+def provider_binding_values(status: ProviderAvailability) -> dict[str, Any]:
+    values = status.model_dump(mode="json")
+    values.pop("available")
+    values.pop("detail")
+    return values
 
 
 def select_resume(repo: CareerOpsRepository, application_id: str, text: str = "Python"):
@@ -245,6 +294,7 @@ def test_repository_blocks_only_the_active_claim_and_audits_it(tmp_path: Path):
         privacy_mode="local_private",
     )
     claim_token = repo.start_ai_task(task.id)
+    assert repo.begin_ai_task_invocation(task.id, claim_token) is True
 
     blocked = repo.block_ai_task(task.id, claim_token, "verification_failed")
 
@@ -310,6 +360,26 @@ def test_exact_config_selects_second_same_kind_provider_once(tmp_path: Path):
 
     repo = make_repo(tmp_path)
     application = create_application(repo)
+    preferred_status = availability(
+        provider_kind="codex",
+        model="gpt-5.6-sol",
+        privacy_mode=PrivacyMode.CLOUD_EXTERNAL,
+        data_leaves_machine=True,
+        endpoint="codex-identity://codex2",
+        identity_name="codex2",
+        executable="C:/Codex/codex.exe",
+        executable_sha256="a" * 64,
+        executable_version="codex-cli 1.0.0",
+        codex_home="C:/Users/test/codex-account2/.codex",
+        reasoning_effort="high",
+    )
+    alternate_status = preferred_status.model_copy(
+        update={
+            "endpoint": "codex-identity://codex",
+            "identity_name": "codex",
+            "codex_home": "C:/Users/test/.codex",
+        }
+    )
     preferred_config = create_provider_config(
         repo,
         provider_kind="codex",
@@ -317,6 +387,7 @@ def test_exact_config_selects_second_same_kind_provider_once(tmp_path: Path):
         privacy_mode="cloud_external",
         endpoint="codex-identity://codex2",
         identity_name="codex2",
+        binding_status=preferred_status,
     )
     alternate_config = create_provider_config(
         repo,
@@ -325,27 +396,10 @@ def test_exact_config_selects_second_same_kind_provider_once(tmp_path: Path):
         privacy_mode="cloud_external",
         endpoint="codex-identity://codex",
         identity_name="codex",
+        binding_status=alternate_status,
     )
-    preferred = ScriptedProvider(
-        availability(
-            provider_kind="codex",
-            model="gpt-5.6-sol",
-            privacy_mode=PrivacyMode.CLOUD_EXTERNAL,
-            data_leaves_machine=True,
-            endpoint="codex-identity://codex2",
-            identity_name="codex2",
-        )
-    )
-    alternate = ScriptedProvider(
-        availability(
-            provider_kind="codex",
-            model="gpt-5.6-sol",
-            privacy_mode=PrivacyMode.CLOUD_EXTERNAL,
-            data_leaves_machine=True,
-            endpoint="codex-identity://codex",
-            identity_name="codex",
-        )
-    )
+    preferred = ScriptedProvider(preferred_status)
+    alternate = ScriptedProvider(alternate_status)
     orchestrator = AiOrchestrator(
         repo,
         {preferred_config.id: preferred, alternate_config.id: alternate},
@@ -385,6 +439,108 @@ def test_codex_identity_mismatch_fails_closed_without_provider_call(tmp_path: Pa
             identity_name="codex2",
         )
     )
+    orchestrator = AiOrchestrator(repo, {config.id: provider})
+
+    with pytest.raises(ValueError, match="metadata"):
+        orchestrator.enqueue(application.id, "analyze_jd", config.id)
+
+    assert provider.calls == 0
+    assert repo.list_ai_tasks(application.id) == []
+
+
+def test_pending_task_fails_closed_after_provider_binding_reregistration(
+    tmp_path: Path,
+):
+    from careerops.ai.orchestrator import AiOrchestrator
+
+    repo = make_repo(tmp_path)
+    application = create_application(repo)
+    initial = availability(
+        provider_kind="codex",
+        model="gpt-5.6-sol",
+        privacy_mode=PrivacyMode.CLOUD_EXTERNAL,
+        data_leaves_machine=True,
+        endpoint="codex-identity://codex2",
+        identity_name="codex2",
+        executable="C:/Codex/codex.exe",
+        executable_sha256="a" * 64,
+        executable_version="codex-cli 1.0.0",
+        codex_home="C:/Users/test/codex-account2/.codex",
+        reasoning_effort="high",
+    )
+    config = create_provider_config(
+        repo,
+        provider_kind="codex",
+        model="gpt-5.6-sol",
+        privacy_mode="cloud_external",
+        endpoint="codex-identity://codex2",
+        identity_name="codex2",
+        binding_status=initial,
+    )
+    provider = ScriptedProvider(initial)
+    orchestrator = AiOrchestrator(repo, {config.id: provider})
+    task = orchestrator.enqueue(application.id, "analyze_jd", config.id)
+    changed = initial.model_copy(
+        update={"codex_home": "C:/Users/test/.codex"}
+    )
+
+    updated_config = repo.upsert_ai_provider_config(
+        provider_kind="codex",
+        display_name="Re-registered codex2",
+        privacy_mode="cloud_external",
+        endpoint="codex-identity://codex2",
+        identity_name="codex2",
+        model="gpt-5.6-sol",
+        enabled=True,
+        availability_binding=provider_binding_values(changed),
+    )
+    provider.status = changed
+    result = orchestrator.run(task.id)
+
+    assert updated_config.id == config.id
+    assert task.provider_binding_sha256 != updated_config.availability_binding_sha256
+    assert result.status == "failed"
+    assert result.error_summary == "provider_unavailable"
+    assert provider.calls == 0
+    assert repo.list_application_versions(application.id) == []
+
+
+def test_same_identity_model_with_different_binary_fails_before_enqueue(
+    tmp_path: Path,
+):
+    from careerops.ai.orchestrator import AiOrchestrator
+
+    repo = make_repo(tmp_path)
+    application = create_application(repo)
+    registered = availability(
+        provider_kind="codex",
+        model="gpt-5.6-sol",
+        privacy_mode=PrivacyMode.CLOUD_EXTERNAL,
+        data_leaves_machine=True,
+        endpoint="codex-identity://codex",
+        identity_name="codex",
+        executable="C:/Codex/codex.exe",
+        executable_sha256="a" * 64,
+        executable_version="codex-cli 1.0.0",
+        codex_home="C:/Users/test/.codex",
+        reasoning_effort="high",
+    )
+    config = create_provider_config(
+        repo,
+        provider_kind="codex",
+        model="gpt-5.6-sol",
+        privacy_mode="cloud_external",
+        endpoint="codex-identity://codex",
+        identity_name="codex",
+        binding_status=registered,
+    )
+    changed = registered.model_copy(
+        update={
+            "executable": "D:/Codex/codex.exe",
+            "executable_sha256": "b" * 64,
+        }
+    )
+    provider = AvailabilityOnlyProvider(changed)
     orchestrator = AiOrchestrator(repo, {config.id: provider})
 
     with pytest.raises(ValueError, match="metadata"):
@@ -605,15 +761,20 @@ def test_run_rejects_provider_config_privacy_drift_before_invocation(tmp_path: P
     provider = ScriptedProvider(availability())
     orchestrator = AiOrchestrator(repo, {config.id: provider})
     task = orchestrator.enqueue(application.id, "analyze_jd", config.id)
-    with repo.connection() as connection:
-        connection.execute(
-            "UPDATE ai_provider_configs SET privacy_mode = ? WHERE id = ?",
-            ("cloud_external", config.id),
-        )
-    provider.status = availability(
+    changed = availability(
         privacy_mode=PrivacyMode.CLOUD_EXTERNAL,
         data_leaves_machine=True,
     )
+    repo.upsert_ai_provider_config(
+        provider_kind="mock",
+        display_name="Changed privacy",
+        privacy_mode="cloud_external",
+        endpoint="",
+        model="fixture-v1",
+        enabled=True,
+        availability_binding=provider_binding_values(changed),
+    )
+    provider.status = changed
 
     result = orchestrator.run(task.id)
 
@@ -670,6 +831,59 @@ def test_attempt_artifacts_are_atomic_checksummed_and_never_contain_sidecar(
         assert ".tmp-" not in path.name
 
 
+def test_jd_source_bytes_preserve_crlf_without_decode_normalization(tmp_path: Path):
+    from careerops.ai.orchestrator import AiOrchestrator
+
+    repo = make_repo(tmp_path)
+    jd_text = "Build Python APIs.\r\nKeep exact lines.\n"
+    application = repo.create_application(
+        company="Example Corp",
+        role_title="Engineer",
+        location="Remote",
+        source_url="https://example.com/job",
+        jd_text=jd_text,
+    )
+    snapshot = repo.get_jd_snapshot(application.jd_snapshot_id)
+    assert snapshot.raw_text_path.read_bytes() == jd_text.encode("utf-8")
+    config = create_provider_config(repo)
+    provider = ScriptedProvider(availability())
+    orchestrator = AiOrchestrator(repo, {config.id: provider})
+    task = orchestrator.enqueue(application.id, "analyze_jd", config.id)
+
+    result = orchestrator.run(task.id)
+
+    assert result.status in {"completed", "blocked"}
+    context = json.loads(provider.requests[0].context_text())
+    assert context["job_description"]["text"] == jd_text
+
+
+def test_resume_source_bytes_preserve_crlf_latex(tmp_path: Path):
+    from careerops.ai.orchestrator import AiOrchestrator
+
+    repo = make_repo(tmp_path)
+    application = create_application(repo)
+    latex_bytes = b"\\section{Skills}\r\nPython\\\\\r\n"
+    latex_path = repo.vault_path / "resumes" / "exact.tex"
+    latex_path.write_bytes(latex_bytes)
+    resume = repo.create_resume_version(
+        name="Exact resume",
+        role_family="software",
+        tex_path=latex_path,
+        tex_sha256=hashlib.sha256(latex_bytes).hexdigest(),
+    )
+    repo.select_resume(application.id, resume.id)
+    config = create_provider_config(repo)
+    provider = ScriptedProvider(availability())
+    orchestrator = AiOrchestrator(repo, {config.id: provider})
+    task = orchestrator.enqueue(application.id, "analyze_fit", config.id)
+
+    result = orchestrator.run(task.id)
+
+    assert result.status == "completed"
+    context = json.loads(provider.requests[0].context_text())
+    assert context["selected_resume"]["source_text"] == latex_bytes.decode("utf-8")
+
+
 def test_requeue_invalidates_stale_attempt_without_reinvoking_provider(tmp_path: Path):
     from careerops.ai.orchestrator import AiOrchestrator
 
@@ -681,6 +895,11 @@ def test_requeue_invalidates_stale_attempt_without_reinvoking_provider(tmp_path:
     def interrupt_first_attempt(_request: Any, calls: int) -> None:
         if calls != 1:
             return
+        with repo.connection() as connection:
+            connection.execute(
+                "UPDATE ai_tasks SET claim_expires_at = ? WHERE id = ?",
+                ("1970-01-01T00:00:00+00:00", task.id),
+            )
         assert repo.requeue_interrupted_ai_tasks() == 1
         repo.create_profile_fact(
             fact_key="skill",
@@ -704,6 +923,41 @@ def test_requeue_invalidates_stale_attempt_without_reinvoking_provider(tmp_path:
     contexts = [item for item in artifacts if item.artifact_type == "context"]
     assert len(contexts) == 1
     assert repo.list_application_versions(application.id) == []
+
+
+def test_live_orchestrator_renews_claim_while_provider_runs(tmp_path: Path):
+    from careerops.ai.orchestrator import AiOrchestrator
+
+    repo = CareerOpsRepository(
+        tmp_path / "careerops.db",
+        tmp_path / "vault",
+        claim_lease_seconds=0.15,
+    )
+    repo.initialize()
+    application = create_application(repo)
+    config = create_provider_config(repo)
+    provider_started = Event()
+    release_provider = Event()
+
+    def wait_in_provider(_request: Any, _calls: int) -> None:
+        provider_started.set()
+        assert release_provider.wait(5)
+
+    provider = ScriptedProvider(availability(), on_run=wait_in_provider)
+    orchestrator = AiOrchestrator(repo, {config.id: provider})
+    task = orchestrator.enqueue(application.id, "analyze_jd", config.id)
+    recovery = CareerOpsRepository(repo.database_path, repo.vault_path)
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(orchestrator.run, task.id)
+        assert provider_started.wait(5)
+        time.sleep(0.4)
+        assert recovery.requeue_interrupted_ai_tasks() == 0
+        release_provider.set()
+        result = future.result(timeout=5)
+
+    assert result.status == "completed"
+    assert provider.calls == 1
 
 
 def test_finalization_crash_recovery_never_reinvokes_or_writes_business_state(
@@ -748,6 +1002,11 @@ def test_finalization_crash_recovery_never_reinvokes_or_writes_business_state(
         ).fetchone()[0] == 0
     assert provider.calls == 1
 
+    with repo.connection() as connection:
+        connection.execute(
+            "UPDATE ai_tasks SET claim_expires_at = ? WHERE id = ?",
+            ("1970-01-01T00:00:00+00:00", task.id),
+        )
     assert repo.requeue_interrupted_ai_tasks() == 1
     recovered = orchestrator.run(task.id)
 
@@ -908,6 +1167,8 @@ def test_analyze_fit_creates_normal_report_with_complete_provenance(tmp_path: Pa
         "provider_kind": "mock",
         "provider_identity_name": "",
         "provider_model": "fixture-v1",
+        "provider_binding": config.availability_binding,
+        "provider_binding_sha256": config.availability_binding_sha256,
     }
     assert updated_application.approval_id is None
     assert updated_application.submission_state == "not_submitted"
@@ -954,6 +1215,36 @@ def test_analyze_jd_preserves_user_corrections_in_provenance_groups(tmp_path: Pa
     assert requirements["raw_ai"]["required_skills"] == ["Python"]
     assert requirements["raw_ai"]["provenance"]["ai_task_id"] == task.id
     assert requirements["uncertainty"]["items"] == []
+
+
+def test_analyze_jd_cannot_mutate_an_approved_packet(tmp_path: Path):
+    from careerops.ai.orchestrator import AiOrchestrator
+
+    repo = make_repo(tmp_path)
+    application = create_application(repo)
+    resume = select_resume(repo, application.id, "Python developer")
+    report = repo.save_report(
+        application_id=application.id,
+        resume_version_id=resume.id,
+        jd_snapshot_id=application.jd_snapshot_id,
+        fit={"score": 90},
+        risks={"blockers": [], "warnings": []},
+    )
+    repo.approve_application(application.id, report.id, "Reviewed")
+    before_application = repo.get_application(application.id)
+    before_jd = repo.get_jd_snapshot(application.jd_snapshot_id)
+    config = create_provider_config(repo)
+    provider = ScriptedProvider(availability())
+    orchestrator = AiOrchestrator(repo, {config.id: provider})
+    task = orchestrator.enqueue(application.id, "analyze_jd", config.id)
+
+    result = orchestrator.run(task.id)
+
+    assert result.status == "failed"
+    assert provider.calls == 1
+    assert repo.get_application(application.id) == before_application
+    assert repo.get_jd_snapshot(application.jd_snapshot_id) == before_jd
+    assert repo.list_application_versions(application.id) == []
 
 
 def test_suggest_resume_edits_creates_findings_without_resume_mutation(tmp_path: Path):

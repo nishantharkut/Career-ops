@@ -38,6 +38,8 @@ def _add_ai_evidence_and_version_tables(connection: sqlite3.Connection) -> None:
             ),
             endpoint TEXT NOT NULL,
             model TEXT NOT NULL,
+            availability_binding_json TEXT NOT NULL DEFAULT '{}',
+            availability_binding_sha256 TEXT NOT NULL DEFAULT '',
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL,
             UNIQUE(provider_kind, endpoint, model)
@@ -64,7 +66,10 @@ def _add_ai_evidence_and_version_tables(connection: sqlite3.Connection) -> None:
                     'local_private', 'trusted_private', 'cloud_external', 'verifier_only'
                 )
             ),
+            provider_binding_json TEXT NOT NULL DEFAULT '{}',
+            provider_binding_sha256 TEXT NOT NULL DEFAULT '',
             started_at TEXT,
+            claim_expires_at TEXT,
             invocation_started_at TEXT,
             completed_at TEXT,
             error_summary TEXT NOT NULL,
@@ -517,6 +522,152 @@ def _repair_ai_orchestration_migrations(connection: sqlite3.Connection) -> None:
     _add_provider_identity(connection)
 
 
+def _add_provider_availability_bindings(connection: sqlite3.Connection) -> None:
+    provider_columns = _column_names(connection, "ai_provider_configs")
+    if "availability_binding_json" not in provider_columns:
+        connection.execute(
+            """
+            ALTER TABLE ai_provider_configs
+            ADD COLUMN availability_binding_json TEXT NOT NULL DEFAULT '{}'
+            """
+        )
+    if "availability_binding_sha256" not in provider_columns:
+        connection.execute(
+            """
+            ALTER TABLE ai_provider_configs
+            ADD COLUMN availability_binding_sha256 TEXT NOT NULL DEFAULT ''
+            """
+        )
+    task_columns = _column_names(connection, "ai_tasks")
+    if "provider_binding_json" not in task_columns:
+        connection.execute(
+            """
+            ALTER TABLE ai_tasks
+            ADD COLUMN provider_binding_json TEXT NOT NULL DEFAULT '{}'
+            """
+        )
+    if "provider_binding_sha256" not in task_columns:
+        connection.execute(
+            """
+            ALTER TABLE ai_tasks
+            ADD COLUMN provider_binding_sha256 TEXT NOT NULL DEFAULT ''
+            """
+        )
+    if "claim_expires_at" not in task_columns:
+        connection.execute("ALTER TABLE ai_tasks ADD COLUMN claim_expires_at TEXT")
+    connection.execute(
+        """
+        UPDATE ai_provider_configs
+        SET enabled = 0,
+            availability_binding_json = '{}',
+            availability_binding_sha256 = ''
+        """
+    )
+    connection.execute(
+        """
+        UPDATE ai_tasks
+        SET provider_binding_json = '{}', provider_binding_sha256 = ''
+        """
+    )
+    connection.execute(
+        """
+        UPDATE ai_tasks
+        SET invocation_started_at = COALESCE(started_at, updated_at, created_at)
+        WHERE status = 'running' AND invocation_started_at IS NULL
+        """
+    )
+    connection.execute(
+        """
+        UPDATE ai_tasks
+        SET claim_expires_at = COALESCE(updated_at, started_at, created_at)
+        WHERE status = 'running' AND claim_expires_at IS NULL
+        """
+    )
+    text_fields = (
+        "provider_kind",
+        "model",
+        "privacy_mode",
+        "endpoint",
+        "identity_name",
+        "executable",
+        "executable_sha256",
+        "executable_version",
+        "codex_home",
+        "reasoning_effort",
+        "model_digest",
+        "model_metadata_sha256",
+        "show_metadata_sha256",
+        "attestation_version",
+        "runtime_instance_id",
+        "runtime_handle",
+        "issuer_instance_id",
+        "egress_policy",
+        "isolation_evidence_sha256",
+        "isolation_evidence_signature",
+    )
+    boolean_fields = (
+        "data_leaves_machine",
+        "is_ai",
+        "cloud_disabled",
+        "egress_enforced",
+    )
+    field_conditions = "\n                OR ".join(
+        [
+            f"json_type(NEW.availability_binding_json, '$.{field}') IS NOT 'text'"
+            for field in text_fields
+        ]
+        + [
+            "(json_type(NEW.availability_binding_json, "
+            f"'$.{field}') IS NULL OR json_type(NEW.availability_binding_json, "
+            f"'$.{field}') NOT IN ('true', 'false'))"
+            for field in boolean_fields
+        ]
+    )
+    for operation in ("INSERT", "UPDATE"):
+        trigger_name = f"validate_provider_binding_sha_{operation.lower()}"
+        connection.execute(f"DROP TRIGGER IF EXISTS {trigger_name}")
+        connection.execute(
+            f"""
+            CREATE TRIGGER {trigger_name}
+            BEFORE {operation} ON ai_provider_configs
+            WHEN NEW.enabled = 1
+             AND (
+                length(NEW.availability_binding_sha256) != 64
+                OR lower(NEW.availability_binding_sha256)
+                    != NEW.availability_binding_sha256
+                OR NEW.availability_binding_sha256 GLOB '*[^0-9a-f]*'
+                OR NEW.availability_binding_json = '{{}}'
+                OR NOT json_valid(NEW.availability_binding_json)
+                OR json_type(NEW.availability_binding_json) != 'object'
+                OR (
+                    SELECT COUNT(*)
+                    FROM json_each(NEW.availability_binding_json)
+                ) != 24
+                OR length(NEW.availability_binding_json) > 32768
+                OR {field_conditions}
+                OR json_extract(
+                    NEW.availability_binding_json, '$.provider_kind'
+                ) IS NOT NEW.provider_kind
+                OR json_extract(
+                    NEW.availability_binding_json, '$.privacy_mode'
+                ) IS NOT NEW.privacy_mode
+                OR json_extract(
+                    NEW.availability_binding_json, '$.endpoint'
+                ) IS NOT NEW.endpoint
+                OR json_extract(
+                    NEW.availability_binding_json, '$.identity_name'
+                ) IS NOT NEW.identity_name
+                OR json_extract(
+                    NEW.availability_binding_json, '$.model'
+                ) IS NOT NEW.model
+             )
+            BEGIN
+                SELECT RAISE(ABORT, 'enabled provider is missing availability binding');
+            END
+            """
+        )
+
+
 MIGRATIONS: tuple[tuple[int, Migration], ...] = (
     (1, _add_application_role_type),
     (2, _add_application_submitted_at),
@@ -530,6 +681,7 @@ MIGRATIONS: tuple[tuple[int, Migration], ...] = (
     (10, _add_ai_invocation_fence),
     (11, _add_provider_identity),
     (12, _repair_ai_orchestration_migrations),
+    (13, _add_provider_availability_bindings),
 )
 
 LATEST_SCHEMA_VERSION = MIGRATIONS[-1][0]

@@ -109,6 +109,40 @@ MODEL_BY_TASK = {
 }
 
 
+def provider_binding_from_result(result: Any) -> dict[str, Any]:
+    return {
+        "provider_kind": result.provider_kind,
+        "model": result.model,
+        "privacy_mode": result.privacy_mode.value,
+        "data_leaves_machine": result.data_leaves_machine,
+        "is_ai": result.is_ai,
+        **{
+            field: getattr(result.invocation, field)
+            for field in (
+                "endpoint",
+                "identity_name",
+                "executable",
+                "executable_sha256",
+                "executable_version",
+                "codex_home",
+                "reasoning_effort",
+                "model_digest",
+                "model_metadata_sha256",
+                "show_metadata_sha256",
+                "attestation_version",
+                "runtime_instance_id",
+                "runtime_handle",
+                "issuer_instance_id",
+                "egress_policy",
+                "cloud_disabled",
+                "egress_enforced",
+                "isolation_evidence_sha256",
+                "isolation_evidence_signature",
+            )
+        },
+    }
+
+
 def make_request(
     tmp_path: Path,
     task_type: str = "analyze_fit",
@@ -1846,6 +1880,7 @@ def test_provider_result_privacy_enum_persists_to_provider_and_task(
         identity_name=result.invocation.identity_name,
         model=result.model,
         enabled=True,
+        availability_binding=provider_binding_from_result(result),
     )
     task = repo.create_ai_task(
         application_id=application.id,
@@ -2617,6 +2652,7 @@ def test_hardened_codex_result_privacy_persists_to_repository(tmp_path: Path):
         identity_name=result.invocation.identity_name,
         model=result.model,
         enabled=True,
+        availability_binding=provider_binding_from_result(result),
     )
     task = repo.create_ai_task(
         application_id=application.id,

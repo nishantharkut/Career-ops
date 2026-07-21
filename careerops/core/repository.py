@@ -5,10 +5,12 @@ from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 import hashlib
 import json
+import os
 from pathlib import Path
 import re
 import secrets
 import sqlite3
+import stat
 from threading import Lock
 from typing import Any
 from uuid import uuid4
@@ -67,6 +69,37 @@ PROVIDER_ERROR_CATEGORIES = frozenset(
 SHA256_PATTERN = re.compile(r"[0-9a-fA-F]{64}\Z")
 CODEX_IDENTITIES = frozenset({"codex2", "codex"})
 MAX_PERSISTED_JSON_BYTES = 256_000
+MAX_PROVIDER_BINDING_BYTES = 32_768
+MAX_AI_ARTIFACT_BYTES = 16_000_000
+PROVIDER_BINDING_FIELDS = (
+    "provider_kind",
+    "model",
+    "privacy_mode",
+    "data_leaves_machine",
+    "is_ai",
+    "endpoint",
+    "identity_name",
+    "executable",
+    "executable_sha256",
+    "executable_version",
+    "codex_home",
+    "reasoning_effort",
+    "model_digest",
+    "model_metadata_sha256",
+    "show_metadata_sha256",
+    "attestation_version",
+    "runtime_instance_id",
+    "runtime_handle",
+    "issuer_instance_id",
+    "egress_policy",
+    "cloud_disabled",
+    "egress_enforced",
+    "isolation_evidence_sha256",
+    "isolation_evidence_signature",
+)
+PROVIDER_BINDING_BOOLEAN_FIELDS = frozenset(
+    {"data_leaves_machine", "is_ai", "cloud_disabled", "egress_enforced"}
+)
 UTC_NOW_LOCK = Lock()
 LAST_UTC_NOW: datetime | None = None
 
@@ -141,6 +174,27 @@ def persisted_json(value: Any) -> tuple[Any, str]:
     return safe_value, serialized
 
 
+def canonical_provider_binding(
+    value: Mapping[str, Any],
+) -> tuple[dict[str, Any], str, str]:
+    if set(value) != set(PROVIDER_BINDING_FIELDS):
+        raise ValueError("Provider availability binding fields did not match")
+    normalized: dict[str, Any] = {}
+    for field in PROVIDER_BINDING_FIELDS:
+        field_value = value[field]
+        if field in PROVIDER_BINDING_BOOLEAN_FIELDS:
+            if not isinstance(field_value, bool):
+                raise ValueError(f"Provider binding {field} must be a boolean")
+        elif not isinstance(field_value, str):
+            raise ValueError(f"Provider binding {field} must be a string")
+        normalized[field] = field_value
+    safe_value, serialized = persisted_json(normalized)
+    if len(serialized.encode("utf-8")) > MAX_PROVIDER_BINDING_BYTES:
+        raise ValueError("Provider availability binding exceeded its size limit")
+    binding = dict(safe_value)
+    return binding, serialized, sha256_text(serialized)
+
+
 def finite_value(enum_type: type[Any], value: str, label: str) -> str:
     try:
         return enum_type(value).value
@@ -149,9 +203,22 @@ def finite_value(enum_type: type[Any], value: str, label: str) -> str:
 
 
 class CareerOpsRepository:
-    def __init__(self, database_path: Path, vault_path: Path):
+    def __init__(
+        self,
+        database_path: Path,
+        vault_path: Path,
+        *,
+        claim_lease_seconds: float = 30.0,
+    ):
+        if claim_lease_seconds <= 0:
+            raise ValueError("AI task claim lease must be positive")
         self.database_path = Path(database_path)
         self.vault_path = Path(vault_path)
+        self.claim_lease_seconds = float(claim_lease_seconds)
+
+    @property
+    def claim_heartbeat_interval(self) -> float:
+        return max(0.02, min(10.0, self.claim_lease_seconds / 3))
 
     def initialize(self) -> None:
         initialize_database(self.database_path)
@@ -177,6 +244,7 @@ class CareerOpsRepository:
         identity_name: str = "",
         model: str,
         enabled: bool,
+        availability_binding: Mapping[str, Any],
     ) -> AiProviderConfig:
         privacy_mode = finite_value(PrivacyMode, privacy_mode, "privacy mode")
         if provider_kind == "codex":
@@ -187,6 +255,17 @@ class CareerOpsRepository:
                 raise ValueError("Codex endpoint does not match its identity name")
         elif identity_name:
             raise ValueError("Identity names are only supported for Codex providers")
+        binding, binding_json, binding_sha256 = canonical_provider_binding(
+            availability_binding
+        )
+        if (
+            binding["provider_kind"] != provider_kind
+            or binding["model"] != model
+            or binding["privacy_mode"] != privacy_mode
+            or binding["endpoint"] != endpoint
+            or binding["identity_name"] != identity_name
+        ):
+            raise ValueError("Provider availability binding did not match configuration")
         provider_id = new_id("aip")
         now = utc_now()
         with self.connection() as connection:
@@ -194,13 +273,16 @@ class CareerOpsRepository:
                 """
                 INSERT INTO ai_provider_configs (
                     id, provider_kind, display_name, identity_name, enabled,
-                    privacy_mode, endpoint, model, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    privacy_mode, endpoint, model, availability_binding_json,
+                    availability_binding_sha256, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(provider_kind, endpoint, model) DO UPDATE SET
                     display_name = excluded.display_name,
                     identity_name = excluded.identity_name,
                     enabled = excluded.enabled,
                     privacy_mode = excluded.privacy_mode,
+                    availability_binding_json = excluded.availability_binding_json,
+                    availability_binding_sha256 = excluded.availability_binding_sha256,
                     updated_at = excluded.updated_at
                 """,
                 (
@@ -212,6 +294,8 @@ class CareerOpsRepository:
                     privacy_mode,
                     endpoint,
                     model,
+                    binding_json,
+                    binding_sha256,
                     now,
                     now,
                 ),
@@ -270,6 +354,29 @@ class CareerOpsRepository:
         now = utc_now()
         with self.connection() as connection:
             connection.execute("BEGIN IMMEDIATE")
+            provider = connection.execute(
+                "SELECT * FROM ai_provider_configs WHERE id = ?",
+                (provider_config_id,),
+            ).fetchone()
+            if provider is None:
+                raise KeyError("No AI provider configuration with that ID")
+            if not provider["enabled"]:
+                raise ValueError("AI provider configuration is disabled")
+            if provider["privacy_mode"] != privacy_mode:
+                raise ValueError("AI task privacy mode does not match its provider")
+            if (
+                not provider["availability_binding_sha256"]
+                or provider["availability_binding_json"] == "{}"
+            ):
+                raise ValueError("AI provider configuration is not durably bound")
+            binding, binding_json, binding_sha256 = canonical_provider_binding(
+                json.loads(provider["availability_binding_json"])
+            )
+            if (
+                binding_json != provider["availability_binding_json"]
+                or binding_sha256 != provider["availability_binding_sha256"]
+            ):
+                raise ValueError("AI provider configuration binding is invalid")
             if input_artifact_ids:
                 placeholders = ", ".join("?" for _ in input_artifact_ids)
                 rows = connection.execute(
@@ -305,8 +412,9 @@ class CareerOpsRepository:
                 INSERT INTO ai_tasks (
                     id, application_id, task_type, provider_config_id,
                     prompt_template_id, input_artifact_ids_json, status, privacy_mode,
-                    started_at, completed_at, error_summary, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    provider_binding_json, provider_binding_sha256, started_at,
+                    completed_at, error_summary, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     task_id,
@@ -317,6 +425,8 @@ class CareerOpsRepository:
                     json.dumps(input_artifact_ids),
                     "pending",
                     privacy_mode,
+                    binding_json,
+                    binding_sha256,
                     None,
                     None,
                     "",
@@ -378,16 +488,21 @@ class CareerOpsRepository:
 
     def claim_ai_task(self, task_id: str) -> str | None:
         now = utc_now()
+        expires_at = (
+            datetime.fromisoformat(now)
+            + timedelta(seconds=self.claim_lease_seconds)
+        ).isoformat(timespec="microseconds")
         claim_token = secrets.token_urlsafe(32)
         with self.connection() as connection:
             cursor = connection.execute(
                 """
                 UPDATE ai_tasks
                 SET status = 'running', started_at = ?, completed_at = NULL,
-                    error_summary = '', claim_token = ?, updated_at = ?
+                    error_summary = '', claim_token = ?, claim_expires_at = ?,
+                    updated_at = ?
                 WHERE id = ? AND status = 'pending'
                 """,
-                (now, claim_token, now, task_id),
+                (now, claim_token, expires_at, now, task_id),
             )
         return claim_token if cursor.rowcount == 1 else None
 
@@ -407,8 +522,9 @@ class CareerOpsRepository:
                 SET invocation_started_at = ?, updated_at = ?
                 WHERE id = ? AND status = 'running' AND claim_token = ?
                   AND invocation_started_at IS NULL
+                  AND claim_expires_at > ?
                 """,
-                (now, now, task_id, claim_token),
+                (now, now, task_id, claim_token, now),
             )
             if cursor.rowcount == 1:
                 self._write_audit(
@@ -422,6 +538,24 @@ class CareerOpsRepository:
                 return True
         return False
 
+    def renew_ai_task_claim(self, task_id: str, claim_token: str) -> bool:
+        now = utc_now()
+        expires_at = (
+            datetime.fromisoformat(now)
+            + timedelta(seconds=self.claim_lease_seconds)
+        ).isoformat(timespec="microseconds")
+        with self.connection() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE ai_tasks
+                SET claim_expires_at = ?, updated_at = ?
+                WHERE id = ? AND status = 'running' AND claim_token = ?
+                  AND claim_expires_at > ?
+                """,
+                (expires_at, now, task_id, claim_token, now),
+            )
+        return cursor.rowcount == 1
+
     def complete_ai_task(self, task_id: str, claim_token: str) -> AiTask:
         before = self.get_ai_task(task_id)
         now = utc_now()
@@ -430,10 +564,12 @@ class CareerOpsRepository:
                 """
                 UPDATE ai_tasks
                 SET status = 'completed', completed_at = ?, error_summary = '',
-                    claim_token = NULL, updated_at = ?
+                    claim_token = NULL, claim_expires_at = NULL, updated_at = ?
                 WHERE id = ? AND status = 'running' AND claim_token = ?
+                  AND invocation_started_at IS NOT NULL
+                  AND claim_expires_at > ?
                 """,
-                (now, now, task_id, claim_token),
+                (now, now, task_id, claim_token, now),
             )
             if cursor.rowcount != 1:
                 raise ValueError("AI task claim is not active")
@@ -456,10 +592,11 @@ class CareerOpsRepository:
                 """
                 UPDATE ai_tasks
                 SET status = 'failed', completed_at = ?, error_summary = ?,
-                    claim_token = NULL, updated_at = ?
+                    claim_token = NULL, claim_expires_at = NULL, updated_at = ?
                 WHERE id = ? AND status = 'running' AND claim_token = ?
+                  AND claim_expires_at > ?
                 """,
-                (now, safe_error, now, task_id, claim_token),
+                (now, safe_error, now, task_id, claim_token, now),
             )
             if cursor.rowcount != 1:
                 raise ValueError("AI task claim is not active")
@@ -484,10 +621,12 @@ class CareerOpsRepository:
                 """
                 UPDATE ai_tasks
                 SET status = 'blocked', completed_at = ?, error_summary = ?,
-                    claim_token = NULL, updated_at = ?
+                    claim_token = NULL, claim_expires_at = NULL, updated_at = ?
                 WHERE id = ? AND status = 'running' AND claim_token = ?
+                  AND invocation_started_at IS NOT NULL
+                  AND claim_expires_at > ?
                 """,
-                (now, safe_error, now, task_id, claim_token),
+                (now, safe_error, now, task_id, claim_token, now),
             )
             if cursor.rowcount != 1:
                 raise ValueError("AI task claim is not active")
@@ -530,10 +669,8 @@ class CareerOpsRepository:
             if terminal_status == AiTaskStatus.COMPLETED.value
             else provider_error_category(error_summary)
         )
-        safe_artifacts, _ = persisted_json(list(artifacts))
-        safe_provenance, _ = persisted_json(dict(provenance))
         safe_success, _ = persisted_json(dict(success_payload or {}))
-        safe_version_side_effect, _ = persisted_json(dict(version_side_effect or {}))
+        persisted_json(dict(version_side_effect or {}))
         now = utc_now()
 
         with self.connection() as connection:
@@ -545,8 +682,69 @@ class CareerOpsRepository:
                 task is None
                 or task["status"] != AiTaskStatus.RUNNING.value
                 or task["claim_token"] != claim_token
+                or task["invocation_started_at"] is None
+                or task["claim_expires_at"] is None
+                or task["claim_expires_at"] <= now
             ):
                 raise ValueError("AI task claim is not active")
+            artifact_rows = connection.execute(
+                """
+                SELECT * FROM ai_artifacts
+                WHERE task_id = ? AND claim_token = ?
+                ORDER BY created_at ASC, id ASC
+                """,
+                (task_id, claim_token),
+            ).fetchall()
+            artifacts_by_id = {
+                artifact["id"]: artifact for artifact in artifact_rows
+            }
+            seen_artifact_ids: set[str] = set()
+            for supplied in artifacts:
+                artifact_id = supplied.get("id")
+                if not isinstance(artifact_id, str) or artifact_id in seen_artifact_ids:
+                    raise ValueError("AI task artifact metadata was invalid")
+                seen_artifact_ids.add(artifact_id)
+                artifact = artifacts_by_id.get(artifact_id)
+                if (
+                    artifact is None
+                    or supplied.get("artifact_type") != artifact["artifact_type"]
+                    or supplied.get("sha256") != artifact["sha256"]
+                ):
+                    raise ValueError("AI task artifact is not owned by this attempt")
+                self._validate_artifact_row(artifact)
+            if seen_artifact_ids != set(artifacts_by_id):
+                raise ValueError("AI task artifact list was incomplete")
+            safe_artifacts = [
+                {
+                    "artifact_type": artifact["artifact_type"],
+                    "id": artifact["id"],
+                    "sha256": artifact["sha256"],
+                }
+                for artifact in artifact_rows
+            ]
+            checksums = {
+                artifact["artifact_type"]: artifact["sha256"]
+                for artifact in artifact_rows
+            }
+            if len(checksums) != len(artifact_rows):
+                raise ValueError("AI task artifact types must be unique per attempt")
+            derived_provenance = dict(provenance)
+            supplied_context = derived_provenance.pop("context_sha256", None)
+            supplied_outputs = derived_provenance.pop("output_checksums", None)
+            expected_context = checksums.get("context", "")
+            expected_outputs = {
+                key: checksums[key]
+                for key in ("raw_output", "validated_output")
+                if key in checksums
+            }
+            if (
+                supplied_context not in (None, expected_context)
+                or supplied_outputs not in (None, expected_outputs)
+            ):
+                raise ValueError("AI task artifact provenance did not match")
+            derived_provenance["context_sha256"] = expected_context
+            derived_provenance["output_checksums"] = expected_outputs
+            safe_provenance, _ = persisted_json(derived_provenance)
             application = connection.execute(
                 "SELECT * FROM applications WHERE id = ?",
                 (task["application_id"],),
@@ -580,11 +778,19 @@ class CareerOpsRepository:
                 )
                 if decision != FindingDecision.PENDING.value:
                     raise ValueError("AI findings must start with a pending decision")
+                safe_finding, _ = persisted_json(
+                    {
+                        "claim_text": str(finding["claim_text"]),
+                        "finding_type": str(finding["finding_type"]),
+                        "payload": dict(finding.get("payload", {})),
+                        "recommendation": str(finding["recommendation"]),
+                    }
+                )
                 _safe_payload, payload_json = persisted_json(
-                    dict(finding.get("payload", {}))
+                    safe_finding["payload"]
                 )
                 finding_id = new_id("aif")
-                finding_type = str(finding["finding_type"])
+                finding_type = safe_finding["finding_type"]
                 connection.execute(
                     """
                     INSERT INTO ai_findings (
@@ -599,9 +805,9 @@ class CareerOpsRepository:
                         claim_token,
                         finding_type,
                         severity,
-                        str(redact(str(finding["claim_text"]))),
+                        safe_finding["claim_text"],
                         finding.get("evidence_item_id"),
-                        str(redact(str(finding["recommendation"]))),
+                        safe_finding["recommendation"],
                         verifier_state,
                         decision,
                         payload_json,
@@ -612,9 +818,10 @@ class CareerOpsRepository:
                 finding_ids.append(finding_id)
                 finding_types.setdefault(finding_type, []).append(finding_id)
 
-            side_effect = dict(safe_version_side_effect)
+            side_effect: dict[str, Any] = {}
             if terminal_status == AiTaskStatus.COMPLETED.value:
                 if task["task_type"] == AiTaskType.ANALYZE_JD.value:
+                    self._require_pristine_application_packet(application)
                     snapshot = connection.execute(
                         "SELECT * FROM jd_snapshots WHERE id = ?",
                         (expected_jd_snapshot_id,),
@@ -634,13 +841,17 @@ class CareerOpsRepository:
                             "uncertainty",
                         )
                     )
+                    raw_ai = dict(safe_success["raw_ai"])
+                    uncertainty = dict(safe_success["uncertainty"])
+                    raw_ai["provenance"] = safe_provenance
+                    uncertainty["provenance"] = safe_provenance
                     updated = {
-                        "raw_ai": safe_success["raw_ai"],
+                        "raw_ai": raw_ai,
                         "deterministic": (
                             existing.get("deterministic", {}) if grouped else existing
                         ),
                         "user_corrected": existing.get("user_corrected", {}),
-                        "uncertainty": safe_success["uncertainty"],
+                        "uncertainty": uncertainty,
                     }
                     _safe_updated, serialized = persisted_json(updated)
                     connection.execute(
@@ -671,17 +882,13 @@ class CareerOpsRepository:
                 elif task["task_type"] == AiTaskType.ANALYZE_FIT.value:
                     if expected_resume_version_id is None:
                         raise ValueError("A selected resume is required for this AI task")
-                    if (
-                        application["approval_id"] is not None
-                        or application["submission_state"]
-                        != SubmissionState.NOT_SUBMITTED.value
-                        or application["submitted_at"] is not None
-                    ):
-                        raise ValueError(
-                            "AI task cannot replace approved or submitted application state"
-                        )
-                    fit, fit_json = persisted_json(dict(safe_success["fit"]))
-                    risks, risks_json = persisted_json(dict(safe_success["risks"]))
+                    self._require_pristine_application_packet(application)
+                    fit_values = dict(safe_success["fit"])
+                    risk_values = dict(safe_success["risks"])
+                    fit_values["provenance"] = safe_provenance
+                    risk_values["provenance"] = safe_provenance
+                    fit, fit_json = persisted_json(fit_values)
+                    risks, risks_json = persisted_json(risk_values)
                     blockers = risks.get("blockers", [])
                     warnings = risks.get("warnings", [])
                     if not isinstance(blockers, list) or not isinstance(warnings, list):
@@ -750,6 +957,18 @@ class CareerOpsRepository:
                             "claim_review_decision", []
                         )
                     }
+                elif task["task_type"] == AiTaskType.DRAFT_COVER_LETTER.value:
+                    draft_artifacts = [
+                        artifact
+                        for artifact in artifact_rows
+                        if artifact["artifact_type"] == "draft_text"
+                    ]
+                    if len(draft_artifacts) != 1:
+                        raise ValueError("Cover letter task draft artifact was invalid")
+                    side_effect = {
+                        "draft_text_artifact_id": draft_artifacts[0]["id"],
+                        "draft_text_sha256": draft_artifacts[0]["sha256"],
+                    }
 
             snapshot = {
                 "ai_task": {
@@ -809,8 +1028,10 @@ class CareerOpsRepository:
                 """
                 UPDATE ai_tasks
                 SET status = ?, completed_at = ?, error_summary = ?,
-                    claim_token = NULL, updated_at = ?
+                    claim_token = NULL, claim_expires_at = NULL, updated_at = ?
                 WHERE id = ? AND status = 'running' AND claim_token = ?
+                  AND invocation_started_at IS NOT NULL
+                  AND claim_expires_at > ?
                 """,
                 (
                     terminal_status,
@@ -819,6 +1040,7 @@ class CareerOpsRepository:
                     now,
                     task_id,
                     claim_token,
+                    now,
                 ),
             )
             if cursor.rowcount != 1:
@@ -847,10 +1069,12 @@ class CareerOpsRepository:
                 """
                 UPDATE ai_tasks
                 SET status = 'pending', started_at = NULL, completed_at = NULL,
-                    error_summary = '', claim_token = NULL, updated_at = ?
+                    error_summary = '', claim_token = NULL,
+                    claim_expires_at = NULL, updated_at = ?
                 WHERE status = 'running'
+                  AND (claim_expires_at IS NULL OR claim_expires_at <= ?)
                 """,
-                (now,),
+                (now, now),
             )
         return cursor.rowcount
 
@@ -867,18 +1091,8 @@ class CareerOpsRepository:
             raise ValueError(
                 "Artifact SHA-256 must contain exactly 64 hexadecimal characters"
             )
-        try:
-            artifact_path = Path(path).resolve(strict=True)
-        except FileNotFoundError as exc:
-            raise FileNotFoundError(f"Artifact file does not exist: {path}") from exc
-        vault_root = self.vault_path.resolve(strict=True)
-        if not artifact_path.is_relative_to(vault_root):
-            raise ValueError("Artifact path must remain within the repository vault")
-        if not artifact_path.is_file():
-            raise FileNotFoundError(f"Artifact path is not a file: {artifact_path}")
-        with artifact_path.open("rb") as artifact_file:
-            actual_sha256 = hashlib.file_digest(artifact_file, "sha256").hexdigest()
         normalized_sha256 = sha256.lower()
+        artifact_path, actual_sha256 = self._stable_artifact_digest(path)
         if actual_sha256 != normalized_sha256:
             raise ValueError("Artifact checksum does not match file bytes")
 
@@ -909,6 +1123,7 @@ class CareerOpsRepository:
 
     def get_ai_artifact(self, artifact_id: str) -> AiArtifact:
         row = self._one("SELECT * FROM ai_artifacts WHERE id = ?", (artifact_id,))
+        self._validate_artifact_row(row)
         return self._ai_artifact_from_row(row)
 
     def list_ai_artifacts(self, task_id: str) -> list[AiArtifact]:
@@ -921,6 +1136,8 @@ class CareerOpsRepository:
                 """,
                 (task_id,),
             ).fetchall()
+        for row in rows:
+            self._validate_artifact_row(row)
         return [self._ai_artifact_from_row(row) for row in rows]
 
     def save_ai_finding(
@@ -944,6 +1161,15 @@ class CareerOpsRepository:
             raise ValueError("AI findings must start with a pending decision")
         finding_id = new_id("aif")
         now = utc_now()
+        safe_finding, _ = persisted_json(
+            {
+                "claim_text": claim_text,
+                "finding_type": finding_type,
+                "recommendation": recommendation,
+                "payload": payload or {},
+            }
+        )
+        _safe_payload, payload_json = persisted_json(safe_finding["payload"])
         with self.connection() as connection:
             connection.execute("BEGIN IMMEDIATE")
             self._require_active_ai_claim(connection, task_id, claim_token)
@@ -959,14 +1185,14 @@ class CareerOpsRepository:
                     finding_id,
                     task_id,
                     claim_token,
-                    finding_type,
+                    safe_finding["finding_type"],
                     severity,
-                    claim_text,
+                    safe_finding["claim_text"],
                     evidence_item_id,
-                    recommendation,
+                    safe_finding["recommendation"],
                     verifier_state,
                     decision,
-                    json.dumps(payload or {}),
+                    payload_json,
                     now,
                     now,
                 ),
@@ -1326,6 +1552,16 @@ class CareerOpsRepository:
                 or task["task_type"] != "analyze_jd"
             ):
                 raise ValueError("AI task cannot update this JD snapshot")
+            application = connection.execute(
+                "SELECT * FROM applications WHERE id = ?",
+                (snapshot["application_id"],),
+            ).fetchone()
+            if (
+                application is None
+                or application["jd_snapshot_id"] != snapshot_id
+            ):
+                raise ValueError("Selected job description changed")
+            self._require_pristine_application_packet(application)
 
             existing = json.loads(snapshot["extracted_requirements_json"])
             grouped = any(
@@ -1345,13 +1581,7 @@ class CareerOpsRepository:
                 "user_corrected": existing.get("user_corrected", {}),
                 "uncertainty": uncertainty,
             }
-            serialized = json.dumps(
-                updated,
-                ensure_ascii=False,
-                allow_nan=False,
-                separators=(",", ":"),
-                sort_keys=True,
-            )
+            _safe_updated, serialized = persisted_json(updated)
             connection.execute(
                 """
                 UPDATE jd_snapshots
@@ -1396,9 +1626,10 @@ class CareerOpsRepository:
         snapshot_dir = self.vault_path / "applications" / application_id
         snapshot_dir.mkdir(parents=True, exist_ok=True)
         raw_text_path = snapshot_dir / "jd.txt"
-        raw_text_path.write_text(jd_text, encoding="utf-8")
+        jd_bytes = jd_text.encode("utf-8")
+        raw_text_path.write_bytes(jd_bytes)
         source_kind = "url" if source_url else "manual"
-        jd_sha = sha256_text(jd_text)
+        jd_sha = hashlib.sha256(jd_bytes).hexdigest()
 
         with self.connection() as connection:
             connection.execute(
@@ -1603,21 +1834,36 @@ class CareerOpsRepository:
         now = utc_now()
         blockers = risks.get("blockers", [])
         warnings = risks.get("warnings", [])
-        status = ApplicationStatus.READY_FOR_REVIEW if not blockers else ApplicationStatus.NEEDS_EVIDENCE
+        if not isinstance(blockers, list) or not isinstance(warnings, list):
+            raise ValueError("Report risk groups must be lists")
+        _safe_fit, fit_json = persisted_json(fit)
+        _safe_risks, risks_json = persisted_json(risks)
+        status = (
+            ApplicationStatus.READY_FOR_REVIEW
+            if not blockers
+            else ApplicationStatus.NEEDS_EVIDENCE
+        )
         with self.connection() as connection:
             connection.execute("BEGIN IMMEDIATE")
+            application = connection.execute(
+                "SELECT * FROM applications WHERE id = ?", (application_id,)
+            ).fetchone()
+            if application is None:
+                raise KeyError("No application with that ID")
+            self._require_pristine_application_packet(application)
+            if (
+                application["selected_resume_version_id"] != resume_version_id
+                or application["jd_snapshot_id"] != jd_snapshot_id
+            ):
+                raise ValueError("Report does not match the selected application packet")
             if ai_task_id is not None and claim_token is not None:
                 self._require_active_ai_claim(connection, ai_task_id, claim_token)
                 owner = connection.execute(
                     "SELECT application_id, task_type FROM ai_tasks WHERE id = ?",
                     (ai_task_id,),
                 ).fetchone()
-                application = connection.execute(
-                    "SELECT * FROM applications WHERE id = ?", (application_id,)
-                ).fetchone()
                 if (
                     owner is None
-                    or application is None
                     or owner["application_id"] != application_id
                     or owner["task_type"] != "analyze_fit"
                     or application["selected_resume_version_id"] != resume_version_id
@@ -1636,8 +1882,8 @@ class CareerOpsRepository:
                     application_id,
                     resume_version_id,
                     jd_snapshot_id,
-                    json.dumps(fit),
-                    json.dumps(risks),
+                    fit_json,
+                    risks_json,
                     len(blockers),
                     len(warnings),
                     now,
@@ -1646,7 +1892,7 @@ class CareerOpsRepository:
             connection.execute(
                 """
                 UPDATE applications
-                SET latest_report_id = ?, approval_id = NULL, status = ?, updated_at = ?
+                SET latest_report_id = ?, status = ?, updated_at = ?
                 WHERE id = ?
                 """,
                 (report_id, status.value, now, application_id),
@@ -1665,24 +1911,16 @@ class CareerOpsRepository:
             )
         return self.get_report(report_id)
 
-    def approve_application(self, application_id: str, report_id: str, note: str) -> Approval:
-        application = self.get_application(application_id)
-        report = self.get_report(report_id)
-        resume = self.get_resume_version(report.resume_version_id)
-        if report.application_id != application.id:
-            raise ValueError("Report does not belong to application")
-        if report.blocking_issue_count:
-            raise ValueError("Application has blocking risks")
-        if application.selected_resume_version_id != report.resume_version_id:
-            raise ValueError("Selected resume differs from report resume")
-        if application.jd_snapshot_id != report.jd_snapshot_id:
-            raise ValueError("Selected JD differs from report JD")
-        if not resume.pdf_sha256:
-            raise ValueError("Selected resume has no PDF checksum")
-
+    def approve_application(
+        self, application_id: str, report_id: str, note: str
+    ) -> Approval:
         approval_id = new_id("apr")
         now = utc_now()
         with self.connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            application, report, resume = self._approval_packet_rows(
+                connection, application_id, report_id
+            )
             connection.execute(
                 """
                 INSERT INTO approvals (
@@ -1692,10 +1930,10 @@ class CareerOpsRepository:
                 """,
                 (
                     approval_id,
-                    application.id,
-                    resume.id,
-                    report.id,
-                    resume.pdf_sha256,
+                    application["id"],
+                    resume["id"],
+                    report["id"],
+                    resume["pdf_sha256"],
                     now,
                     note,
                 ),
@@ -1706,24 +1944,32 @@ class CareerOpsRepository:
                 SET approval_id = ?, status = ?, updated_at = ?
                 WHERE id = ?
                 """,
-                (approval_id, ApplicationStatus.APPROVED.value, now, application.id),
+                (
+                    approval_id,
+                    ApplicationStatus.APPROVED.value,
+                    now,
+                    application["id"],
+                ),
             )
             self._write_audit(
                 connection,
                 "application.approved",
                 "application",
-                application.id,
-                application.__dict__,
-                {"approval_id": approval_id, "report_id": report.id, "pdf_sha256": resume.pdf_sha256},
+                application["id"],
+                dict(application),
+                {
+                    "approval_id": approval_id,
+                    "report_id": report["id"],
+                    "pdf_sha256": resume["pdf_sha256"],
+                },
             )
         return self.get_approval(approval_id)
 
     def mark_submitted_manual(self, application_id: str, note: str) -> Application:
-        application = self.get_application(application_id)
-        if application.status != ApplicationStatus.APPROVED:
-            raise ValueError("Application must be approved before manual submission is recorded")
         now = utc_now()
         with self.connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            application = self._submission_packet_row(connection, application_id)
             connection.execute(
                 """
                 UPDATE applications
@@ -1744,10 +1990,102 @@ class CareerOpsRepository:
                 "application.submitted_manual",
                 "application",
                 application_id,
-                application.__dict__,
+                dict(application),
                 {"submission_state": SubmissionState.SUBMITTED_MANUAL.value, "notes": note},
             )
         return self.get_application(application_id)
+
+    @staticmethod
+    def _require_pristine_application_packet(application: sqlite3.Row) -> None:
+        if (
+            application["approval_id"] is not None
+            or application["submission_state"]
+            != SubmissionState.NOT_SUBMITTED.value
+            or application["submitted_at"] is not None
+        ):
+            raise ValueError(
+                "AI task cannot replace approved or submitted application state"
+            )
+
+    def _approval_packet_rows(
+        self,
+        connection: sqlite3.Connection,
+        application_id: str,
+        report_id: str,
+    ) -> tuple[sqlite3.Row, sqlite3.Row, sqlite3.Row]:
+        application = connection.execute(
+            "SELECT * FROM applications WHERE id = ?", (application_id,)
+        ).fetchone()
+        report = connection.execute(
+            "SELECT * FROM reports WHERE id = ?", (report_id,)
+        ).fetchone()
+        if application is None or report is None:
+            raise KeyError("Application approval packet was incomplete")
+        resume = connection.execute(
+            "SELECT * FROM resume_versions WHERE id = ?",
+            (report["resume_version_id"],),
+        ).fetchone()
+        if resume is None:
+            raise KeyError("Application approval resume was missing")
+        if report["application_id"] != application["id"]:
+            raise ValueError("Report does not belong to application")
+        if report["blocking_issue_count"]:
+            raise ValueError("Application has blocking risks")
+        if application["latest_report_id"] != report["id"]:
+            raise ValueError("Report is not the current application report")
+        if application["selected_resume_version_id"] != report["resume_version_id"]:
+            raise ValueError("Selected resume differs from report resume")
+        if application["jd_snapshot_id"] != report["jd_snapshot_id"]:
+            raise ValueError("Selected JD differs from report JD")
+        if not resume["pdf_sha256"]:
+            raise ValueError("Selected resume has no PDF checksum")
+        if (
+            application["approval_id"] is not None
+            or application["submission_state"] != SubmissionState.NOT_SUBMITTED.value
+            or application["submitted_at"] is not None
+        ):
+            raise ValueError("Application is already approved or submitted")
+        return application, report, resume
+
+    def _submission_packet_row(
+        self, connection: sqlite3.Connection, application_id: str
+    ) -> sqlite3.Row:
+        application = connection.execute(
+            "SELECT * FROM applications WHERE id = ?", (application_id,)
+        ).fetchone()
+        if application is None:
+            raise KeyError("No application with that ID")
+        if (
+            application["status"] != ApplicationStatus.APPROVED.value
+            or application["approval_id"] is None
+        ):
+            raise ValueError(
+                "Application must be approved before manual submission is recorded"
+            )
+        approval = connection.execute(
+            "SELECT * FROM approvals WHERE id = ?", (application["approval_id"],)
+        ).fetchone()
+        report = connection.execute(
+            "SELECT * FROM reports WHERE id = ?", (application["latest_report_id"],)
+        ).fetchone()
+        resume = connection.execute(
+            "SELECT * FROM resume_versions WHERE id = ?",
+            (application["selected_resume_version_id"],),
+        ).fetchone()
+        if (
+            approval is None
+            or report is None
+            or resume is None
+            or approval["application_id"] != application["id"]
+            or approval["report_id"] != report["id"]
+            or approval["resume_version_id"] != resume["id"]
+            or approval["pdf_sha256"] != resume["pdf_sha256"]
+            or report["application_id"] != application["id"]
+            or report["resume_version_id"] != resume["id"]
+            or report["jd_snapshot_id"] != application["jd_snapshot_id"]
+        ):
+            raise ValueError("Approved application packet changed before submission")
+        return application
 
     def get_application(self, application_id: str) -> Application:
         row = self._one("SELECT * FROM applications WHERE id = ?", (application_id,))
@@ -1836,6 +2174,114 @@ class CareerOpsRepository:
             raise KeyError(f"No row for query: {query}")
         return row
 
+    def _stable_artifact_digest(self, path: Path) -> tuple[Path, str]:
+        vault_root = Path(os.path.abspath(self.vault_path))
+        artifact_path = Path(os.path.abspath(path))
+        try:
+            relative = artifact_path.relative_to(vault_root)
+        except ValueError as exc:
+            raise ValueError(
+                "Artifact path must remain within the repository vault"
+            ) from exc
+        current = vault_root
+        try:
+            root_stat = current.lstat()
+        except FileNotFoundError as exc:
+            raise FileNotFoundError("Repository vault does not exist") from exc
+        if stat.S_ISLNK(root_stat.st_mode):
+            raise ValueError("Artifact path must be a regular vault file")
+        path_stat = root_stat
+        for part in relative.parts:
+            current = current / part
+            try:
+                path_stat = current.lstat()
+            except FileNotFoundError as exc:
+                raise FileNotFoundError(
+                    f"Artifact file does not exist: {artifact_path}"
+                ) from exc
+            if stat.S_ISLNK(path_stat.st_mode):
+                raise ValueError("Artifact path must be a regular vault file")
+        if not stat.S_ISREG(path_stat.st_mode) or path_stat.st_nlink != 1:
+            raise ValueError("Artifact path must be a single-link regular file")
+        if path_stat.st_size > MAX_AI_ARTIFACT_BYTES:
+            raise ValueError("Artifact file exceeded its size limit")
+
+        flags = (
+            os.O_RDONLY
+            | getattr(os, "O_BINARY", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+        )
+        descriptor = os.open(artifact_path, flags)
+        try:
+            opened = os.fstat(descriptor)
+            identity = (
+                opened.st_dev,
+                opened.st_ino,
+                opened.st_size,
+                opened.st_mtime_ns,
+                opened.st_nlink,
+            )
+            expected_identity = (
+                path_stat.st_dev,
+                path_stat.st_ino,
+                path_stat.st_size,
+                path_stat.st_nlink,
+            )
+            opened_identity = (
+                opened.st_dev,
+                opened.st_ino,
+                opened.st_size,
+                opened.st_nlink,
+            )
+            if opened_identity != expected_identity or not stat.S_ISREG(
+                opened.st_mode
+            ):
+                raise ValueError("Artifact file identity changed while opening")
+            digest = hashlib.sha256()
+            total = 0
+            while True:
+                chunk = os.read(descriptor, 64 * 1024)
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > MAX_AI_ARTIFACT_BYTES:
+                    raise ValueError("Artifact file exceeded its size limit")
+                digest.update(chunk)
+            after_read = os.fstat(descriptor)
+        finally:
+            os.close(descriptor)
+        try:
+            after_path = artifact_path.lstat()
+        except FileNotFoundError as exc:
+            raise ValueError("Artifact file identity changed while hashing") from exc
+        final_identity = (
+            after_read.st_dev,
+            after_read.st_ino,
+            after_read.st_size,
+            after_read.st_mtime_ns,
+            after_read.st_nlink,
+        )
+        final_path_identity = (
+            after_path.st_dev,
+            after_path.st_ino,
+            after_path.st_size,
+            after_path.st_mtime_ns,
+            after_path.st_nlink,
+        )
+        if final_identity != identity or final_path_identity != identity:
+            raise ValueError("Artifact file identity changed while hashing")
+        return artifact_path, digest.hexdigest()
+
+    def _validate_artifact_row(self, row: sqlite3.Row) -> None:
+        try:
+            artifact_path, actual_sha256 = self._stable_artifact_digest(
+                Path(row["path"])
+            )
+        except (FileNotFoundError, OSError, ValueError) as exc:
+            raise ValueError("AI artifact integrity verification failed") from exc
+        if str(artifact_path) != row["path"] or actual_sha256 != row["sha256"]:
+            raise ValueError("AI artifact integrity verification failed")
+
     def _require_active_ai_claim(
         self,
         connection: sqlite3.Connection,
@@ -1846,8 +2292,9 @@ class CareerOpsRepository:
             """
             SELECT 1 FROM ai_tasks
             WHERE id = ? AND status = 'running' AND claim_token = ?
+              AND claim_expires_at > ?
             """,
-            (task_id, claim_token),
+            (task_id, claim_token, utc_now()),
         ).fetchone()
         if row is None:
             raise ValueError("AI task claim is not active")
@@ -1938,6 +2385,15 @@ class CareerOpsRepository:
         )
 
     def _ai_provider_from_row(self, row: sqlite3.Row) -> AiProviderConfig:
+        binding_json = row["availability_binding_json"]
+        binding_sha256 = row["availability_binding_sha256"]
+        binding: dict[str, Any] = {}
+        if binding_json != "{}" or binding_sha256:
+            binding, canonical_json, actual_sha256 = canonical_provider_binding(
+                json.loads(binding_json)
+            )
+            if canonical_json != binding_json or actual_sha256 != binding_sha256:
+                raise ValueError("AI provider configuration binding is invalid")
         return AiProviderConfig(
             id=row["id"],
             provider_kind=row["provider_kind"],
@@ -1947,6 +2403,8 @@ class CareerOpsRepository:
             privacy_mode=PrivacyMode(row["privacy_mode"]),
             endpoint=row["endpoint"],
             model=row["model"],
+            availability_binding=binding,
+            availability_binding_sha256=binding_sha256,
             created_at=row["created_at"],
             updated_at=row["updated_at"],
         )
@@ -1956,6 +2414,15 @@ class CareerOpsRepository:
         row: sqlite3.Row,
         input_artifact_ids: list[str],
     ) -> AiTask:
+        binding_json = row["provider_binding_json"]
+        binding_sha256 = row["provider_binding_sha256"]
+        binding: dict[str, Any] = {}
+        if binding_json != "{}" or binding_sha256:
+            binding, canonical_json, actual_sha256 = canonical_provider_binding(
+                json.loads(binding_json)
+            )
+            if canonical_json != binding_json or actual_sha256 != binding_sha256:
+                raise ValueError("AI task provider binding is invalid")
         return AiTask(
             id=row["id"],
             application_id=row["application_id"],
@@ -1965,7 +2432,10 @@ class CareerOpsRepository:
             input_artifact_ids=input_artifact_ids,
             status=AiTaskStatus(row["status"]),
             privacy_mode=PrivacyMode(row["privacy_mode"]),
+            provider_binding=binding,
+            provider_binding_sha256=binding_sha256,
             started_at=row["started_at"],
+            claim_expires_at=row["claim_expires_at"],
             invocation_started_at=row["invocation_started_at"],
             completed_at=row["completed_at"],
             error_summary=row["error_summary"],

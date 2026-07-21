@@ -115,6 +115,8 @@ class AiProviderConfig:
     privacy_mode: PrivacyMode
     endpoint: str
     model: str
+    availability_binding: JsonDict
+    availability_binding_sha256: str
     created_at: str
     updated_at: str
 
@@ -129,7 +131,10 @@ class AiTask:
     input_artifact_ids: list[str]
     status: AiTaskStatus
     privacy_mode: PrivacyMode
+    provider_binding: JsonDict
+    provider_binding_sha256: str
     started_at: str | None
+    claim_expires_at: str | None
     invocation_started_at: str | None
     completed_at: str | None
     error_summary: str

@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path
 import stat
+from threading import Event, Thread
 from typing import Any
 from uuid import uuid4
 
@@ -36,7 +37,10 @@ from careerops.core.models import (
     AiProviderConfig,
     AiTask,
 )
-from careerops.core.repository import CareerOpsRepository
+from careerops.core.repository import (
+    CareerOpsRepository,
+    canonical_provider_binding,
+)
 from careerops.core.status import PrivacyMode
 
 
@@ -109,6 +113,9 @@ class AiOrchestrator:
         if claim_token is None:
             return self._repository.get_ai_task(task_id)
 
+        heartbeat_stop, heartbeat = self._start_claim_heartbeat(
+            task_id, claim_token
+        )
         artifacts: list[AiArtifact] = []
         findings: list[dict[str, Any]] = []
         try:
@@ -123,6 +130,9 @@ class AiOrchestrator:
                 not config.enabled
                 or provider is None
                 or task.privacy_mode != config.privacy_mode
+                or task.provider_binding_sha256
+                != config.availability_binding_sha256
+                or task.provider_binding != config.availability_binding
             ):
                 raise ProviderUnavailableError("Configured AI provider is unavailable")
             availability = provider.availability()
@@ -254,6 +264,31 @@ class AiOrchestrator:
             )
         except Exception:
             return self._fail_or_return_current(task_id, claim_token, "provider_error")
+        finally:
+            heartbeat_stop.set()
+            heartbeat.join(
+                timeout=max(
+                    1.0, self._repository.claim_heartbeat_interval * 2
+                )
+            )
+
+    def _start_claim_heartbeat(
+        self, task_id: str, claim_token: str
+    ) -> tuple[Event, Thread]:
+        stop = Event()
+
+        def renew() -> None:
+            while not stop.wait(self._repository.claim_heartbeat_interval):
+                if not self._repository.renew_ai_task_claim(task_id, claim_token):
+                    return
+
+        heartbeat = Thread(
+            target=renew,
+            name=f"ai-task-heartbeat-{task_id}",
+            daemon=True,
+        )
+        heartbeat.start()
+        return stop, heartbeat
 
     @staticmethod
     def _availability_matches(
@@ -267,6 +302,12 @@ class AiOrchestrator:
             expected_egress = False
         elif config.privacy_mode == PrivacyMode.CLOUD_EXTERNAL:
             expected_egress = True
+        try:
+            binding, _serialized, binding_sha256 = canonical_provider_binding(
+                AiOrchestrator._availability_binding(availability)
+            )
+        except (TypeError, ValueError):
+            return False
         return (
             availability.available
             and availability.provider_kind == config.provider_kind
@@ -274,11 +315,22 @@ class AiOrchestrator:
             and availability.privacy_mode == config.privacy_mode
             and availability.endpoint == config.endpoint
             and availability.identity_name == config.identity_name
+            and binding == config.availability_binding
+            and binding_sha256 == config.availability_binding_sha256
             and (
                 expected_egress is None
                 or availability.data_leaves_machine is expected_egress
             )
         )
+
+    @staticmethod
+    def _availability_binding(
+        availability: ProviderAvailability,
+    ) -> dict[str, Any]:
+        binding = availability.model_dump(mode="json")
+        binding.pop("available")
+        binding.pop("detail")
+        return binding
 
     def _build_context(self, application_id: str, task_type: str) -> ContextPacket:
         application = self._repository.get_application(application_id)
@@ -374,10 +426,10 @@ class AiOrchestrator:
 
     @staticmethod
     def _read_checked_utf8(path: Path, expected_sha256: str) -> str:
-        text = Path(path).read_text(encoding="utf-8")
-        if hashlib.sha256(text.encode("utf-8")).hexdigest() != expected_sha256:
+        source_bytes = Path(path).read_bytes()
+        if hashlib.sha256(source_bytes).hexdigest() != expected_sha256:
             raise ValueError("Repository source checksum did not match")
-        return text
+        return source_bytes.decode("utf-8")
 
     def _new_attempt_directory(self, task_id: str) -> Path:
         vault_root = self._repository.vault_path.resolve(strict=True)
@@ -624,6 +676,8 @@ class AiOrchestrator:
             "provider_kind": availability.provider_kind,
             "provider_identity_name": availability.identity_name,
             "provider_model": availability.model,
+            "provider_binding": config.availability_binding,
+            "provider_binding_sha256": config.availability_binding_sha256,
         }
 
     def _prepare_success_effect(
