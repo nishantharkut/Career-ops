@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import errno
 import hashlib
 import json
 import os
 from pathlib import Path
 import re
 import stat
+import sys
 from typing import Any
 from uuid import uuid4
 
@@ -384,7 +386,10 @@ def _publish_source_posix(
     child_handle = -1
     source_descriptor = -1
     child_created = False
+    child_identity: tuple[int, int] | None = None
     temporary_name = ""
+    temporary_identity: tuple[int, int] | None = None
+    destination_published = False
     try:
         vault_handle = os.open(vault_root, directory_flags)
         _require_open_directory(vault_handle)
@@ -405,12 +410,14 @@ def _publish_source_posix(
             temporary_name, flags, 0o600, dir_fd=child_handle
         )
         _write_and_sync(source_descriptor, content)
-        os.replace(
+        temporary_stat = os.fstat(source_descriptor)
+        temporary_identity = (temporary_stat.st_dev, temporary_stat.st_ino)
+        _posix_atomic_publish_no_replace(
+            child_handle,
             temporary_name,
             "source.tex",
-            src_dir_fd=child_handle,
-            dst_dir_fd=child_handle,
         )
+        destination_published = True
         source_stat = os.stat(
             "source.tex", dir_fd=child_handle, follow_symlinks=False
         )
@@ -433,20 +440,36 @@ def _publish_source_posix(
         )
     except BaseException as exc:
         if source_descriptor >= 0:
-            try:
-                os.unlink(
-                    "source.tex" if _posix_entry_exists(child_handle, "source.tex")
-                    else temporary_name,
-                    dir_fd=child_handle,
+            if temporary_identity is not None:
+                owned_name = (
+                    "source.tex" if destination_published else temporary_name
                 )
-            except OSError:
-                pass
+                try:
+                    owned_stat = os.stat(
+                        owned_name,
+                        dir_fd=child_handle,
+                        follow_symlinks=False,
+                    )
+                    if (
+                        stat.S_ISREG(owned_stat.st_mode)
+                        and (owned_stat.st_dev, owned_stat.st_ino)
+                        == temporary_identity
+                    ):
+                        os.unlink(owned_name, dir_fd=child_handle)
+                except OSError:
+                    pass
             os.close(source_descriptor)
         if child_handle >= 0:
             os.close(child_handle)
-        if child_created and resumes_handle >= 0:
+        if (
+            child_created
+            and child_identity is not None
+            and resumes_handle >= 0
+        ):
             try:
-                os.rmdir(resume_id, dir_fd=resumes_handle)
+                _posix_remove_owned_directory(
+                    resumes_handle, resume_id, child_identity
+                )
             except OSError:
                 pass
         if resumes_handle >= 0:
@@ -616,13 +639,95 @@ def _require_open_directory(descriptor: int) -> os.stat_result:
     return opened
 
 
-def _posix_entry_exists(directory_handle: int, name: str) -> bool:
-    if directory_handle < 0:
-        return False
+def _posix_atomic_publish_no_replace(
+    directory_handle: int,
+    temporary_name: str,
+    destination_name: str,
+    *,
+    use_renameat2: bool | None = None,
+) -> None:
+    if use_renameat2 is None:
+        use_renameat2 = sys.platform.startswith("linux")
+    if use_renameat2:
+        try:
+            _linux_renameat2_no_replace(
+                directory_handle, temporary_name, destination_name
+            )
+            return
+        except OSError as exc:
+            unsupported = {
+                errno.ENOSYS,
+                errno.EINVAL,
+                getattr(errno, "EOPNOTSUPP", errno.ENOTSUP),
+                errno.ENOTSUP,
+            }
+            if exc.errno not in unsupported:
+                raise
+
+    os.link(
+        temporary_name,
+        destination_name,
+        src_dir_fd=directory_handle,
+        dst_dir_fd=directory_handle,
+        follow_symlinks=False,
+    )
+    os.unlink(temporary_name, dir_fd=directory_handle)
+
+
+def _linux_renameat2_no_replace(
+    directory_handle: int,
+    temporary_name: str,
+    destination_name: str,
+) -> None:
+    import ctypes
+
+    libc = ctypes.CDLL(None, use_errno=True)
     try:
-        os.stat(name, dir_fd=directory_handle, follow_symlinks=False)
-    except FileNotFoundError:
-        return False
+        renameat2 = libc.renameat2
+    except AttributeError as exc:
+        raise OSError(errno.ENOSYS, "renameat2 is unavailable") from exc
+    renameat2.argtypes = (
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_uint,
+    )
+    renameat2.restype = ctypes.c_int
+    result = renameat2(
+        directory_handle,
+        os.fsencode(temporary_name),
+        directory_handle,
+        os.fsencode(destination_name),
+        1,
+    )
+    if result != 0:
+        error_number = ctypes.get_errno()
+        raise OSError(
+            error_number,
+            os.strerror(error_number),
+            destination_name,
+        )
+
+
+def _posix_remove_owned_directory(
+    resumes_handle: int,
+    resume_id: str,
+    expected_identity: tuple[int, int],
+) -> bool:
+    for _attempt in range(2):
+        current = os.stat(
+            resume_id,
+            dir_fd=resumes_handle,
+            follow_symlinks=False,
+        )
+        if (
+            not stat.S_ISDIR(current.st_mode)
+            or stat.S_ISLNK(current.st_mode)
+            or (current.st_dev, current.st_ino) != expected_identity
+        ):
+            return False
+    os.rmdir(resume_id, dir_fd=resumes_handle)
     return True
 
 
@@ -1077,7 +1182,11 @@ def _cleanup_new_directory(
         pass
     if source_removed:
         try:
-            os.rmdir(published.resume_id, dir_fd=published.resumes_handle)
+            _posix_remove_owned_directory(
+                published.resumes_handle,
+                published.resume_id,
+                published.child_identity,
+            )
         except OSError:
             pass
     for handle in (published.resumes_handle, published.vault_handle):

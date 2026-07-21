@@ -1041,6 +1041,98 @@ def test_windows_publication_failure_cleans_owned_directory(
     assert repo.get_application(application.id).selected_resume_version_id == parent.id
 
 
+def test_posix_no_replace_rejects_injected_destination(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from careerops.resumes import drafts as drafts_module
+
+    publication_dir = tmp_path / "posix-publication"
+    publication_dir.mkdir()
+    temporary_path = publication_dir / ".source.tex.tmp-test"
+    destination_path = publication_dir / "source.tex"
+    temporary_path.write_bytes(b"owned resume source")
+    real_link = os.link
+    real_unlink = os.unlink
+
+    def inject_before_link(
+        source: str,
+        destination: str,
+        *,
+        src_dir_fd: int,
+        dst_dir_fd: int,
+        follow_symlinks: bool,
+    ) -> None:
+        assert src_dir_fd == dst_dir_fd == 17
+        assert not follow_symlinks
+        destination_path.write_bytes(b"injected destination")
+        real_link(publication_dir / source, publication_dir / destination)
+
+    def unlink_relative(name: str, *, dir_fd: int) -> None:
+        assert dir_fd == 17
+        real_unlink(publication_dir / name)
+
+    monkeypatch.setattr(drafts_module.os, "link", inject_before_link)
+    monkeypatch.setattr(drafts_module.os, "unlink", unlink_relative)
+
+    with pytest.raises(FileExistsError):
+        drafts_module._posix_atomic_publish_no_replace(
+            17,
+            temporary_path.name,
+            destination_path.name,
+            use_renameat2=False,
+        )
+
+    assert destination_path.read_bytes() == b"injected destination"
+    assert temporary_path.read_bytes() == b"owned resume source"
+
+
+def test_posix_cleanup_rechecks_child_identity_before_rmdir(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from careerops.resumes import drafts as drafts_module
+
+    resumes_dir = tmp_path / "resumes"
+    resumes_dir.mkdir()
+    resume_id = "res_" + ("c" * 32)
+    owned_dir = resumes_dir / resume_id
+    owned_dir.mkdir()
+    child_stat = owned_dir.lstat()
+    child_identity = (child_stat.st_dev, child_stat.st_ino)
+    moved_owned_dir = resumes_dir / "moved-owned-directory"
+    owned_dir.rename(moved_owned_dir)
+    substitute_dir = resumes_dir / resume_id
+    substitute_dir.mkdir()
+    observations = iter((moved_owned_dir.lstat(), substitute_dir.lstat()))
+    rmdir_calls: list[str] = []
+
+    def stat_relative(
+        name: str, *, dir_fd: int, follow_symlinks: bool
+    ) -> os.stat_result:
+        assert name == resume_id
+        assert dir_fd == 23
+        assert not follow_symlinks
+        return next(observations)
+
+    def remove_relative(name: str, *, dir_fd: int) -> None:
+        rmdir_calls.append(name)
+        assert dir_fd == 23
+        substitute_dir.rmdir()
+
+    monkeypatch.setattr(drafts_module.os, "stat", stat_relative)
+    monkeypatch.setattr(drafts_module.os, "rmdir", remove_relative)
+
+    drafts_module._posix_remove_owned_directory(
+        23,
+        resume_id,
+        child_identity,
+    )
+
+    assert rmdir_calls == []
+    assert substitute_dir.is_dir()
+
+
 def test_success_returns_inserted_model_without_post_commit_getter(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
