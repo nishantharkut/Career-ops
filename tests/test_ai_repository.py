@@ -12,6 +12,7 @@ import subprocess
 import sys
 from threading import Barrier, Event
 import time
+from types import SimpleNamespace
 import warnings
 
 import pytest
@@ -731,6 +732,7 @@ def test_ai_artifact_requires_task_attempt_source_path(
             "1",
         )
 
+    escaped.unlink()
     artifact = write_attempt_artifact(
         repo, task.id, first_claim, "context", b"context"
     )
@@ -1163,12 +1165,19 @@ def test_initialize_removes_crash_orphan_published_before_artifact_insert(
     source = attempt_file(repo, task.id, "crash-orphan.json")
     source.write_bytes(b"orphan")
 
-    @contextmanager
-    def crash_before_begin():
-        raise SimulatedCrash
-        yield
+    original_connection = repo.connection
+    connection_calls = 0
 
-    monkeypatch.setattr(repo, "connection", crash_before_begin)
+    @contextmanager
+    def crash_before_insert():
+        nonlocal connection_calls
+        connection_calls += 1
+        if connection_calls == 2:
+            raise SimulatedCrash
+        with original_connection() as connection:
+            yield connection
+
+    monkeypatch.setattr(repo, "connection", crash_before_insert)
     monkeypatch.setattr(
         repo, "_remove_materialized_ai_artifact", lambda _path: None
     )
@@ -1299,17 +1308,20 @@ def test_reconciliation_rechecks_database_before_deleting_post_snapshot_artifact
     continue_reconciliation = Event()
     reconciling = CareerOpsRepository(repo.database_path, repo.vault_path)
     committing = CareerOpsRepository(repo.database_path, repo.vault_path)
-    original_evidence = reconciling._artifact_evidence_for_row
+    original_path_key = reconciling._artifact_path_key
+    paused = False
 
-    def pause_after_snapshot_row(row):
-        evidence = original_evidence(row)
-        if row["id"] == seed.id:
+    def pause_after_sweep_snapshot(path: Path):
+        nonlocal paused
+        key = original_path_key(path)
+        if not paused and Path(path) == seed.path.parent:
+            paused = True
             snapshot_taken.set()
             assert continue_reconciliation.wait(10)
-        return evidence
+        return key
 
     monkeypatch.setattr(
-        reconciling, "_artifact_evidence_for_row", pause_after_snapshot_row
+        reconciling, "_artifact_path_key", pause_after_sweep_snapshot
     )
 
     with ThreadPoolExecutor(max_workers=1) as executor:
@@ -1409,11 +1421,29 @@ def test_reconciliation_waits_for_legacy_copy_database_update(
 ):
     database_path = tmp_path / "careerops.db"
     vault_path = tmp_path / "vault"
-    _task_id, artifact_id, source_path = create_v14_legacy_artifact_database(
+    task_id, artifact_id, source_path = create_v14_legacy_artifact_database(
         database_path, vault_path
     )
     initialize_database(database_path)
     (vault_path / "ai-artifacts").mkdir(parents=True, exist_ok=True)
+    interrupted_target = (
+        vault_path
+        / "ai-artifacts"
+        / task_id
+        / artifact_id
+        / "context.json"
+    )
+    interrupted_target.parent.mkdir(parents=True)
+    interrupted_target.write_bytes(source_path.read_bytes())
+    unrelated_orphan = (
+        vault_path
+        / "ai-artifacts"
+        / task_id
+        / "aia_unrelated_orphan"
+        / "context.json"
+    )
+    unrelated_orphan.parent.mkdir()
+    unrelated_orphan.write_bytes(b"orphan")
     upgrading = CareerOpsRepository(database_path, vault_path)
     reconciling = CareerOpsRepository(database_path, vault_path)
     copied = Event()
@@ -1457,8 +1487,10 @@ def test_reconciliation_waits_for_legacy_copy_database_update(
         reconcile_future.result(timeout=10)
 
     artifact = upgrading.get_ai_artifact(artifact_id)
+    assert artifact.path == interrupted_target.resolve()
     assert artifact.path.read_bytes() == source_path.read_bytes()
     assert source_path.exists()
+    assert not unrelated_orphan.exists()
 
 
 def test_process_termination_releases_artifact_coordination_and_orphan_converges(
@@ -1500,6 +1532,299 @@ with repository._ai_artifact_coordination():
     restarted.initialize()
     assert not orphan_task_root.exists()
     assert (repo.vault_path / ".ai-artifacts.lock").is_file()
+
+
+def test_next_save_cleans_terminated_publishers_orphan_without_initialize(
+    tmp_path: Path,
+):
+    repo = make_repo(tmp_path)
+    application = create_application(repo)
+    provider = create_provider(repo)
+    task = create_task(repo, application.id, provider.id)
+    claim = claim_task(repo, task.id)
+    crashed_source = attempt_file(repo, task.id, "crashed-publication.json")
+    crashed_source.write_bytes(b"crashed publication")
+    script = """
+import os
+from pathlib import Path
+import sys
+from careerops.core.repository import CareerOpsRepository
+
+repository = CareerOpsRepository(Path(sys.argv[1]), Path(sys.argv[2]))
+original_materialize = repository._materialize_ai_artifact
+
+def terminate_after_publication(**kwargs):
+    original_materialize(**kwargs)
+    os._exit(0)
+
+repository._materialize_ai_artifact = terminate_after_publication
+repository.save_ai_artifact(
+    sys.argv[3],
+    sys.argv[4],
+    'context',
+    Path(sys.argv[5]),
+    sys.argv[6],
+    '1',
+)
+"""
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            script,
+            str(repo.database_path),
+            str(repo.vault_path),
+            task.id,
+            claim,
+            str(crashed_source),
+            hashlib.sha256(b"crashed publication").hexdigest(),
+        ],
+        cwd=Path(__file__).parent.parent,
+        check=False,
+        timeout=15,
+    )
+
+    assert result.returncode == 0
+    crashed_paths = list(
+        (repo.vault_path / "ai-artifacts" / task.id).glob("*/context.json")
+    )
+    assert len(crashed_paths) == 1
+    live_source = attempt_file(repo, task.id, "live-publication.json")
+    live_source.write_bytes(b"live publication")
+
+    artifact = repo.save_ai_artifact(
+        task.id,
+        claim,
+        "raw_output",
+        live_source,
+        hashlib.sha256(b"live publication").hexdigest(),
+        "1",
+    )
+
+    assert not crashed_paths[0].exists()
+    assert artifact.path.read_bytes() == b"live publication"
+    assert repo.list_ai_artifacts(task.id) == [artifact]
+
+
+def test_prepublication_sweep_is_lightweight_and_preserves_recorded_artifacts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    repo = make_repo(tmp_path)
+    application = create_application(repo)
+    provider = create_provider(repo)
+    task = create_task(repo, application.id, provider.id)
+    claim = claim_task(repo, task.id)
+    first_source = attempt_file(repo, task.id, "recorded-before-sweep.json")
+    first_source.write_bytes(b"recorded")
+    recorded = repo.save_ai_artifact(
+        task.id,
+        claim,
+        "context",
+        first_source,
+        hashlib.sha256(b"recorded").hexdigest(),
+        "1",
+    )
+    orphan = (
+        repo.vault_path
+        / "ai-artifacts"
+        / task.id
+        / "aia_prepublication_orphan"
+        / "context.json"
+    )
+    orphan.parent.mkdir()
+    orphan.write_bytes(b"orphan")
+    second_source = attempt_file(repo, task.id, "new-after-sweep.json")
+    second_source.write_bytes(b"new")
+    original_digest = repo._stable_artifact_digest
+
+    def reject_recorded_artifact_rehash(path: Path):
+        if Path(os.path.abspath(path)) == recorded.path:
+            raise AssertionError("pre-publication sweep rehashed a valid artifact")
+        return original_digest(path)
+
+    monkeypatch.setattr(
+        repo, "_stable_artifact_digest", reject_recorded_artifact_rehash
+    )
+
+    second = repo.save_ai_artifact(
+        task.id,
+        claim,
+        "raw_output",
+        second_source,
+        hashlib.sha256(b"new").hexdigest(),
+        "1",
+    )
+
+    assert not orphan.exists()
+    assert recorded.path.read_bytes() == b"recorded"
+    assert second.path.read_bytes() == b"new"
+
+
+def test_legacy_upgrade_sweeps_orphans_but_preserves_reserved_target(
+    tmp_path: Path,
+):
+    database_path = tmp_path / "careerops.db"
+    vault_path = tmp_path / "vault"
+    task_id, artifact_id, source_path = create_v14_legacy_artifact_database(
+        database_path, vault_path
+    )
+    initialize_database(database_path)
+    reserved_target = (
+        vault_path
+        / "ai-artifacts"
+        / task_id
+        / artifact_id
+        / "context.json"
+    )
+    reserved_target.parent.mkdir(parents=True)
+    reserved_target.write_bytes(source_path.read_bytes())
+    orphan = (
+        vault_path
+        / "ai-artifacts"
+        / task_id
+        / "aia_legacy_orphan"
+        / "context.json"
+    )
+    orphan.parent.mkdir()
+    orphan.write_bytes(b"orphan")
+    repo = CareerOpsRepository(database_path, vault_path)
+
+    repo._upgrade_legacy_ai_artifacts()
+
+    assert repo.get_ai_artifact(artifact_id).path == reserved_target.resolve()
+    assert reserved_target.read_bytes() == source_path.read_bytes()
+    assert not orphan.exists()
+
+
+def test_process_save_and_initialize_serialize_before_artifact_insert(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    repo = make_repo(tmp_path)
+    application = create_application(repo)
+    provider = create_provider(repo)
+    task = create_task(repo, application.id, provider.id)
+    claim = claim_task(repo, task.id)
+    source = attempt_file(repo, task.id, "process-publication.json")
+    source.write_bytes(b"process publication")
+    script = """
+from pathlib import Path
+import sys
+from careerops.core.repository import CareerOpsRepository
+
+repository = CareerOpsRepository(Path(sys.argv[1]), Path(sys.argv[2]))
+original_materialize = repository._materialize_ai_artifact
+
+def pause_after_publication(**kwargs):
+    result = original_materialize(**kwargs)
+    print('PUBLISHED', flush=True)
+    if sys.stdin.readline().strip() != 'CONTINUE':
+        raise RuntimeError('publisher was not released')
+    return result
+
+repository._materialize_ai_artifact = pause_after_publication
+repository.save_ai_artifact(
+    sys.argv[3],
+    sys.argv[4],
+    'context',
+    Path(sys.argv[5]),
+    sys.argv[6],
+    '1',
+)
+"""
+    process = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            script,
+            str(repo.database_path),
+            str(repo.vault_path),
+            task.id,
+            claim,
+            str(source),
+            hashlib.sha256(b"process publication").hexdigest(),
+        ],
+        cwd=Path(__file__).parent.parent,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    initializing = CareerOpsRepository(repo.database_path, repo.vault_path)
+    coordination_attempted = Event()
+    coordination_acquired = Event()
+    original_coordination = initializing._ai_artifact_coordination
+
+    @contextmanager
+    def observe_initialize_coordination():
+        coordination_attempted.set()
+        with original_coordination():
+            coordination_acquired.set()
+            yield
+
+    monkeypatch.setattr(
+        initializing, "_ai_artifact_coordination", observe_initialize_coordination
+    )
+
+    try:
+        assert process.stdout is not None
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            published_line = executor.submit(process.stdout.readline).result(timeout=15)
+            assert published_line.strip() == "PUBLISHED"
+            initialize_future = executor.submit(initializing.initialize)
+            assert coordination_attempted.wait(10)
+            assert not coordination_acquired.is_set()
+            assert process.stdin is not None
+            process.stdin.write("CONTINUE\n")
+            process.stdin.flush()
+            initialize_future.result(timeout=15)
+        stdout, stderr = process.communicate(timeout=15)
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.communicate(timeout=15)
+
+    assert process.returncode == 0, (stdout, stderr)
+    assert coordination_acquired.is_set()
+    artifacts = repo.list_ai_artifacts(task.id)
+    assert len(artifacts) == 1
+    assert artifacts[0].path.read_bytes() == b"process publication"
+
+
+def test_artifact_coordination_revalidates_lock_identity_after_acquisition(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    repo = make_repo(tmp_path)
+    lock_path = repo.vault_path / ".ai-artifacts.lock"
+    acquired = Event()
+    yielded = False
+    original_acquire = repo._acquire_ai_artifact_file_lock
+    original_lstat = Path.lstat
+
+    def observe_acquisition(descriptor: int) -> None:
+        original_acquire(descriptor)
+        acquired.set()
+
+    def replace_identity_after_acquisition(path: Path):
+        result = original_lstat(path)
+        if acquired.is_set() and path == lock_path:
+            return SimpleNamespace(
+                st_mode=result.st_mode,
+                st_nlink=result.st_nlink,
+                st_dev=result.st_dev,
+                st_ino=result.st_ino + 1,
+                st_size=result.st_size,
+            )
+        return result
+
+    monkeypatch.setattr(repo, "_acquire_ai_artifact_file_lock", observe_acquisition)
+    monkeypatch.setattr(Path, "lstat", replace_identity_after_acquisition)
+
+    with pytest.raises(ValueError, match="coordination path"):
+        with repo._ai_artifact_coordination():
+            yielded = True
+
+    assert not yielded
 
 
 def test_artifact_publication_fsyncs_containing_directories(

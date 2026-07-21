@@ -319,29 +319,17 @@ class CareerOpsRepository:
         descriptor = os.open(lock_path, flags, 0o600)
         acquired = False
         try:
-            path_stat = lock_path.lstat()
-            descriptor_stat = os.fstat(descriptor)
-            if (
-                stat.S_ISLNK(path_stat.st_mode)
-                or not stat.S_ISREG(path_stat.st_mode)
-                or path_stat.st_nlink != 1
-                or descriptor_stat.st_nlink != 1
-                or (path_stat.st_dev, path_stat.st_ino)
-                != (descriptor_stat.st_dev, descriptor_stat.st_ino)
-                or (
-                    prior_stat is not None
-                    and (prior_stat.st_dev, prior_stat.st_ino)
-                    != (descriptor_stat.st_dev, descriptor_stat.st_ino)
-                )
-            ):
-                raise ValueError(
-                    "AI artifact coordination path must be a regular file"
-                )
+            descriptor_stat = self._validate_ai_artifact_coordination_path(
+                lock_path, descriptor, prior_stat
+            )
             if descriptor_stat.st_size == 0:
                 os.write(descriptor, b"\0")
                 os.fsync(descriptor)
             self._acquire_ai_artifact_file_lock(descriptor)
             acquired = True
+            self._validate_ai_artifact_coordination_path(
+                lock_path, descriptor, prior_stat
+            )
             yield
         finally:
             try:
@@ -349,6 +337,28 @@ class CareerOpsRepository:
                     self._release_ai_artifact_file_lock(descriptor)
             finally:
                 os.close(descriptor)
+
+    @staticmethod
+    def _validate_ai_artifact_coordination_path(
+        lock_path: Path, descriptor: int, prior_stat: os.stat_result | None
+    ) -> os.stat_result:
+        path_stat = lock_path.lstat()
+        descriptor_stat = os.fstat(descriptor)
+        if (
+            stat.S_ISLNK(path_stat.st_mode)
+            or not stat.S_ISREG(path_stat.st_mode)
+            or path_stat.st_nlink != 1
+            or descriptor_stat.st_nlink != 1
+            or (path_stat.st_dev, path_stat.st_ino)
+            != (descriptor_stat.st_dev, descriptor_stat.st_ino)
+            or (
+                prior_stat is not None
+                and (prior_stat.st_dev, prior_stat.st_ino)
+                != (descriptor_stat.st_dev, descriptor_stat.st_ino)
+            )
+        ):
+            raise ValueError("AI artifact coordination path must be a regular file")
+        return descriptor_stat
 
     @staticmethod
     def _acquire_ai_artifact_file_lock(descriptor: int) -> None:
@@ -383,6 +393,7 @@ class CareerOpsRepository:
 
     def _upgrade_legacy_ai_artifacts(self) -> None:
         with self._ai_artifact_coordination():
+            self._sweep_ai_artifact_storage_coordinated()
             self._upgrade_legacy_ai_artifacts_coordinated()
 
     def _upgrade_legacy_ai_artifacts_coordinated(self) -> None:
@@ -471,9 +482,14 @@ class CareerOpsRepository:
 
     def _reconcile_ai_artifact_storage(self) -> None:
         with self._ai_artifact_coordination():
+            self._validate_current_ai_artifact_storage()
             self._reconcile_ai_artifact_storage_coordinated()
+            self._validate_current_ai_artifact_storage()
 
     def _reconcile_ai_artifact_storage_coordinated(self) -> None:
+        self._sweep_ai_artifact_storage_coordinated()
+
+    def _sweep_ai_artifact_storage_coordinated(self) -> None:
         with self.connection() as connection:
             rows = connection.execute(
                 "SELECT * FROM ai_artifacts ORDER BY created_at ASC, id ASC"
@@ -486,7 +502,6 @@ class CareerOpsRepository:
             )
             target_directory_key = self._artifact_path_key(target.parent)
             if row["storage_version"] == AI_ARTIFACT_STORAGE_VERSION:
-                self._artifact_evidence_for_row(row)
                 recorded_files[target_directory_key] = self._artifact_path_key(
                     Path(row["path"])
                 )
@@ -523,7 +538,6 @@ class CareerOpsRepository:
             self._remove_ai_artifact_storage_entry_if_unowned(
                 task_entry, empty_directory_only=True
             )
-        self._validate_current_ai_artifact_storage()
 
     def _remove_ai_artifact_storage_entry_if_unowned(
         self, path: Path, *, empty_directory_only: bool = False
@@ -1457,8 +1471,10 @@ class CareerOpsRepository:
             raise ValueError(
                 "Artifact SHA-256 must contain exactly 64 hexadecimal characters"
             )
+        self._require_ai_task_source_path(task_id, Path(os.path.abspath(path)))
         normalized_sha256 = sha256.lower()
         with self._ai_artifact_coordination():
+            self._sweep_ai_artifact_storage_coordinated()
             return self._save_ai_artifact_coordinated(
                 task_id=task_id,
                 claim_token=claim_token,
