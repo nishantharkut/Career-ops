@@ -4,6 +4,7 @@ from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+import errno
 import hashlib
 import json
 import math
@@ -15,6 +16,7 @@ import shutil
 import sqlite3
 import stat
 from threading import Lock
+import time
 from typing import Any, BinaryIO
 from uuid import uuid4
 
@@ -295,7 +297,95 @@ class CareerOpsRepository:
         self._reconcile_ai_artifact_storage()
         self.requeue_interrupted_ai_tasks()
 
+    @contextmanager
+    def _ai_artifact_coordination(self) -> Iterator[None]:
+        vault_root = Path(os.path.abspath(self.vault_path))
+        lock_path = vault_root / ".ai-artifacts.lock"
+        root_stat = vault_root.lstat()
+        if stat.S_ISLNK(root_stat.st_mode) or not stat.S_ISDIR(root_stat.st_mode):
+            raise ValueError("Repository vault path must be a directory")
+        try:
+            prior_stat = lock_path.lstat()
+        except FileNotFoundError:
+            prior_stat = None
+        if prior_stat is not None and (
+            stat.S_ISLNK(prior_stat.st_mode)
+            or not stat.S_ISREG(prior_stat.st_mode)
+            or prior_stat.st_nlink != 1
+        ):
+            raise ValueError("AI artifact coordination path must be a regular file")
+        flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_CLOEXEC", 0)
+        flags |= getattr(os, "O_NOINHERIT", 0) | getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(lock_path, flags, 0o600)
+        acquired = False
+        try:
+            path_stat = lock_path.lstat()
+            descriptor_stat = os.fstat(descriptor)
+            if (
+                stat.S_ISLNK(path_stat.st_mode)
+                or not stat.S_ISREG(path_stat.st_mode)
+                or path_stat.st_nlink != 1
+                or descriptor_stat.st_nlink != 1
+                or (path_stat.st_dev, path_stat.st_ino)
+                != (descriptor_stat.st_dev, descriptor_stat.st_ino)
+                or (
+                    prior_stat is not None
+                    and (prior_stat.st_dev, prior_stat.st_ino)
+                    != (descriptor_stat.st_dev, descriptor_stat.st_ino)
+                )
+            ):
+                raise ValueError(
+                    "AI artifact coordination path must be a regular file"
+                )
+            if descriptor_stat.st_size == 0:
+                os.write(descriptor, b"\0")
+                os.fsync(descriptor)
+            self._acquire_ai_artifact_file_lock(descriptor)
+            acquired = True
+            yield
+        finally:
+            try:
+                if acquired:
+                    self._release_ai_artifact_file_lock(descriptor)
+            finally:
+                os.close(descriptor)
+
+    @staticmethod
+    def _acquire_ai_artifact_file_lock(descriptor: int) -> None:
+        if os.name != "nt":
+            import fcntl
+
+            fcntl.flock(descriptor, fcntl.LOCK_EX)
+            return
+        import msvcrt
+
+        while True:
+            os.lseek(descriptor, 0, os.SEEK_SET)
+            try:
+                msvcrt.locking(descriptor, msvcrt.LK_NBLCK, 1)
+                return
+            except OSError as exc:
+                if exc.errno not in (errno.EACCES, errno.EAGAIN, errno.EDEADLK):
+                    raise
+                time.sleep(0.05)
+
+    @staticmethod
+    def _release_ai_artifact_file_lock(descriptor: int) -> None:
+        if os.name != "nt":
+            import fcntl
+
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+            return
+        import msvcrt
+
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        msvcrt.locking(descriptor, msvcrt.LK_UNLCK, 1)
+
     def _upgrade_legacy_ai_artifacts(self) -> None:
+        with self._ai_artifact_coordination():
+            self._upgrade_legacy_ai_artifacts_coordinated()
+
+    def _upgrade_legacy_ai_artifacts_coordinated(self) -> None:
         with self.connection() as connection:
             rows = connection.execute(
                 "SELECT * FROM ai_artifacts ORDER BY created_at ASC, id ASC"
@@ -380,6 +470,10 @@ class CareerOpsRepository:
                 raise ValueError("legacy AI artifact authority changed during upgrade")
 
     def _reconcile_ai_artifact_storage(self) -> None:
+        with self._ai_artifact_coordination():
+            self._reconcile_ai_artifact_storage_coordinated()
+
+    def _reconcile_ai_artifact_storage_coordinated(self) -> None:
         with self.connection() as connection:
             rows = connection.execute(
                 "SELECT * FROM ai_artifacts ORDER BY created_at ASC, id ASC"
@@ -405,7 +499,7 @@ class CareerOpsRepository:
         for task_entry in list(artifacts_root.iterdir()):
             if task_entry.is_symlink() or not task_entry.is_dir():
                 if task_entry.name.endswith(".tmp"):
-                    task_entry.unlink(missing_ok=True)
+                    self._remove_ai_artifact_storage_entry_if_unowned(task_entry)
                     continue
                 raise ValueError("AI artifact storage contains an invalid entry")
             for artifact_entry in list(task_entry.iterdir()):
@@ -421,21 +515,77 @@ class CareerOpsRepository:
                             == recorded_files[directory_key]
                         ):
                             continue
-                        if child.is_symlink() or not child.is_dir():
-                            child.unlink(missing_ok=True)
-                        else:
-                            shutil.rmtree(child)
+                        self._remove_ai_artifact_storage_entry_if_unowned(child)
                     continue
                 if directory_key in protected_legacy_directories:
                     continue
-                if artifact_entry.is_symlink() or not artifact_entry.is_dir():
-                    artifact_entry.unlink(missing_ok=True)
-                else:
-                    shutil.rmtree(artifact_entry)
+                self._remove_ai_artifact_storage_entry_if_unowned(artifact_entry)
+            self._remove_ai_artifact_storage_entry_if_unowned(
+                task_entry, empty_directory_only=True
+            )
+        self._validate_current_ai_artifact_storage()
+
+    def _remove_ai_artifact_storage_entry_if_unowned(
+        self, path: Path, *, empty_directory_only: bool = False
+    ) -> bool:
+        if self._ai_artifact_storage_entry_is_db_protected(path):
+            return False
+        if empty_directory_only:
             try:
-                task_entry.rmdir()
+                path.rmdir()
             except OSError:
-                pass
+                return False
+            return True
+        if path.is_symlink() or not path.is_dir():
+            path.unlink(missing_ok=True)
+        else:
+            shutil.rmtree(path)
+        return True
+
+    def _ai_artifact_storage_entry_is_db_protected(self, path: Path) -> bool:
+        candidate = Path(os.path.abspath(path))
+        artifacts_root = Path(os.path.abspath(self.vault_path / "ai-artifacts"))
+        try:
+            candidate.relative_to(artifacts_root)
+        except ValueError as exc:
+            raise ValueError(
+                "AI artifact cleanup path must remain within owned storage"
+            ) from exc
+        with self.connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT id, task_id, artifact_type, path, storage_version
+                FROM ai_artifacts
+                """
+            ).fetchall()
+        candidate_key = self._artifact_path_key(candidate)
+        for row in rows:
+            if row["storage_version"] == AI_ARTIFACT_STORAGE_VERSION:
+                protected_path = Path(row["path"])
+            elif row["storage_version"] == 1:
+                protected_path = self._ai_artifact_storage_path(
+                    row["task_id"], row["id"], row["artifact_type"]
+                )
+            else:
+                raise ValueError("AI artifact storage version is invalid")
+            protected = Path(os.path.abspath(protected_path))
+            protected_key = self._artifact_path_key(protected)
+            if candidate_key == protected_key or candidate_key in {
+                self._artifact_path_key(parent) for parent in protected.parents
+            }:
+                return True
+        return False
+
+    def _validate_current_ai_artifact_storage(self) -> None:
+        with self.connection() as connection:
+            rows = connection.execute(
+                "SELECT * FROM ai_artifacts ORDER BY created_at ASC, id ASC"
+            ).fetchall()
+        for row in rows:
+            if row["storage_version"] == AI_ARTIFACT_STORAGE_VERSION:
+                self._artifact_evidence_for_row(row)
+            elif row["storage_version"] != 1:
+                raise ValueError("AI artifact storage version is invalid")
 
     @staticmethod
     def _artifact_path_key(path: Path) -> str:
@@ -1308,13 +1458,33 @@ class CareerOpsRepository:
                 "Artifact SHA-256 must contain exactly 64 hexadecimal characters"
             )
         normalized_sha256 = sha256.lower()
+        with self._ai_artifact_coordination():
+            return self._save_ai_artifact_coordinated(
+                task_id=task_id,
+                claim_token=claim_token,
+                artifact_type=artifact_type,
+                path=path,
+                sha256=normalized_sha256,
+                schema_version=schema_version,
+            )
+
+    def _save_ai_artifact_coordinated(
+        self,
+        *,
+        task_id: str,
+        claim_token: str,
+        artifact_type: str,
+        path: Path,
+        sha256: str,
+        schema_version: str,
+    ) -> AiArtifact:
         artifact_id = new_id("aia")
         artifact_path, file_evidence = self._materialize_ai_artifact(
             task_id=task_id,
             artifact_id=artifact_id,
             artifact_type=artifact_type,
             source_path=path,
-            expected_sha256=normalized_sha256,
+            expected_sha256=sha256,
         )
         inserted_artifact: AiArtifact | None = None
         try:
@@ -1335,7 +1505,7 @@ class CareerOpsRepository:
                         claim_token,
                         artifact_type,
                         str(artifact_path),
-                        normalized_sha256,
+                        sha256,
                         schema_version,
                         AI_ARTIFACT_STORAGE_VERSION,
                         now,

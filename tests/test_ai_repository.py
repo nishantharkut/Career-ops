@@ -8,6 +8,8 @@ import json
 import os
 from pathlib import Path
 import sqlite3
+import subprocess
+import sys
 from threading import Barrier, Event
 import time
 import warnings
@@ -1263,6 +1265,241 @@ def test_initialize_never_deletes_a_tampered_database_recorded_artifact(
         assert connection.execute(
             "SELECT COUNT(*) FROM ai_artifacts WHERE id = ?", (artifact.id,)
         ).fetchone()[0] == 1
+
+
+def test_reconciliation_rechecks_database_before_deleting_post_snapshot_artifact(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    repo = make_repo(tmp_path)
+    application = create_application(repo)
+    provider = create_provider(repo)
+    task = create_task(repo, application.id, provider.id)
+    claim = claim_task(repo, task.id)
+    seed_source = attempt_file(repo, task.id, "seed.json")
+    seed_source.write_bytes(b"seed")
+    seed = repo.save_ai_artifact(
+        task.id,
+        claim,
+        "context",
+        seed_source,
+        hashlib.sha256(b"seed").hexdigest(),
+        "1",
+    )
+    late_artifact_id = "aia_committed_after_snapshot"
+    late_path = (
+        repo.vault_path
+        / "ai-artifacts"
+        / task.id
+        / late_artifact_id
+        / "raw_output.json"
+    )
+    late_path.parent.mkdir()
+    late_path.write_bytes(b"committed")
+    snapshot_taken = Event()
+    continue_reconciliation = Event()
+    reconciling = CareerOpsRepository(repo.database_path, repo.vault_path)
+    committing = CareerOpsRepository(repo.database_path, repo.vault_path)
+    original_evidence = reconciling._artifact_evidence_for_row
+
+    def pause_after_snapshot_row(row):
+        evidence = original_evidence(row)
+        if row["id"] == seed.id:
+            snapshot_taken.set()
+            assert continue_reconciliation.wait(10)
+        return evidence
+
+    monkeypatch.setattr(
+        reconciling, "_artifact_evidence_for_row", pause_after_snapshot_row
+    )
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(reconciling._reconcile_ai_artifact_storage)
+        assert snapshot_taken.wait(10)
+        with committing.connection() as connection:
+            connection.execute(
+                """
+                INSERT INTO ai_artifacts (
+                    id, task_id, claim_token, artifact_type, path, sha256,
+                    schema_version, storage_version, created_at
+                ) VALUES (?, ?, ?, 'raw_output', ?, ?, '1', 2, ?)
+                """,
+                (
+                    late_artifact_id,
+                    task.id,
+                    claim,
+                    str(late_path.resolve()),
+                    hashlib.sha256(b"committed").hexdigest(),
+                    "2026-07-21T00:00:00+00:00",
+                ),
+            )
+        continue_reconciliation.set()
+        future.result(timeout=10)
+
+    assert committing.get_ai_artifact(late_artifact_id).path == late_path.resolve()
+    assert late_path.read_bytes() == b"committed"
+
+
+def test_reconciliation_waits_for_published_artifact_insert(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    repo = make_repo(tmp_path)
+    application = create_application(repo)
+    provider = create_provider(repo)
+    task = create_task(repo, application.id, provider.id)
+    claim = claim_task(repo, task.id)
+    source = attempt_file(repo, task.id, "coordinated.json")
+    source.write_bytes(b"coordinated")
+    publishing = CareerOpsRepository(repo.database_path, repo.vault_path)
+    reconciling = CareerOpsRepository(repo.database_path, repo.vault_path)
+    published = Event()
+    allow_insert = Event()
+    reconciliation_attempted = Event()
+    reconciliation_acquired = Event()
+    original_materialize = publishing._materialize_ai_artifact
+    original_coordination = reconciling._ai_artifact_coordination
+
+    def pause_after_publication(**kwargs):
+        result = original_materialize(**kwargs)
+        published.set()
+        assert allow_insert.wait(10)
+        return result
+
+    @contextmanager
+    def observe_reconciliation_coordination():
+        reconciliation_attempted.set()
+        with original_coordination():
+            reconciliation_acquired.set()
+            yield
+
+    monkeypatch.setattr(
+        publishing, "_materialize_ai_artifact", pause_after_publication
+    )
+    monkeypatch.setattr(
+        reconciling,
+        "_ai_artifact_coordination",
+        observe_reconciliation_coordination,
+    )
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        publish_future = executor.submit(
+            publishing.save_ai_artifact,
+            task.id,
+            claim,
+            "context",
+            source,
+            hashlib.sha256(b"coordinated").hexdigest(),
+            "1",
+        )
+        assert published.wait(10)
+        reconcile_future = executor.submit(
+            reconciling._reconcile_ai_artifact_storage
+        )
+        assert reconciliation_attempted.wait(10)
+        assert not reconciliation_acquired.is_set()
+        allow_insert.set()
+        artifact = publish_future.result(timeout=10)
+        reconcile_future.result(timeout=10)
+
+    assert reconciliation_acquired.is_set()
+    assert publishing.get_ai_artifact(artifact.id) == artifact
+
+
+def test_reconciliation_waits_for_legacy_copy_database_update(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    database_path = tmp_path / "careerops.db"
+    vault_path = tmp_path / "vault"
+    _task_id, artifact_id, source_path = create_v14_legacy_artifact_database(
+        database_path, vault_path
+    )
+    initialize_database(database_path)
+    (vault_path / "ai-artifacts").mkdir(parents=True, exist_ok=True)
+    upgrading = CareerOpsRepository(database_path, vault_path)
+    reconciling = CareerOpsRepository(database_path, vault_path)
+    copied = Event()
+    allow_update = Event()
+    reconciliation_attempted = Event()
+    reconciliation_acquired = Event()
+    original_commit = upgrading._commit_legacy_ai_artifact_upgrade
+    original_coordination = reconciling._ai_artifact_coordination
+
+    def pause_before_update(*args, **kwargs):
+        copied.set()
+        assert allow_update.wait(10)
+        return original_commit(*args, **kwargs)
+
+    @contextmanager
+    def observe_reconciliation_coordination():
+        reconciliation_attempted.set()
+        with original_coordination():
+            reconciliation_acquired.set()
+            yield
+
+    monkeypatch.setattr(
+        upgrading, "_commit_legacy_ai_artifact_upgrade", pause_before_update
+    )
+    monkeypatch.setattr(
+        reconciling,
+        "_ai_artifact_coordination",
+        observe_reconciliation_coordination,
+    )
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        upgrade_future = executor.submit(upgrading._upgrade_legacy_ai_artifacts)
+        assert copied.wait(10)
+        reconcile_future = executor.submit(
+            reconciling._reconcile_ai_artifact_storage
+        )
+        assert reconciliation_attempted.wait(10)
+        assert not reconciliation_acquired.is_set()
+        allow_update.set()
+        upgrade_future.result(timeout=10)
+        reconcile_future.result(timeout=10)
+
+    artifact = upgrading.get_ai_artifact(artifact_id)
+    assert artifact.path.read_bytes() == source_path.read_bytes()
+    assert source_path.exists()
+
+
+def test_process_termination_releases_artifact_coordination_and_orphan_converges(
+    tmp_path: Path,
+):
+    repo = make_repo(tmp_path)
+    script = """
+import os
+from pathlib import Path
+import sys
+from careerops.core.repository import CareerOpsRepository
+
+repository = CareerOpsRepository(Path(sys.argv[1]), Path(sys.argv[2]))
+orphan = Path(sys.argv[2]) / 'ai-artifacts' / 'ait_crashed' / 'aia_crashed'
+with repository._ai_artifact_coordination():
+    orphan.mkdir(parents=True)
+    (orphan / 'context.json').write_bytes(b'orphan')
+    os._exit(0)
+"""
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            script,
+            str(repo.database_path),
+            str(repo.vault_path),
+        ],
+        cwd=Path(__file__).parent.parent,
+        check=False,
+        timeout=15,
+    )
+
+    assert result.returncode == 0
+    orphan_task_root = repo.vault_path / "ai-artifacts" / "ait_crashed"
+    assert orphan_task_root.exists()
+    restarted = CareerOpsRepository(repo.database_path, repo.vault_path)
+    restarted.initialize()
+    restarted.initialize()
+    assert not orphan_task_root.exists()
+    assert (repo.vault_path / ".ai-artifacts.lock").is_file()
 
 
 def test_artifact_publication_fsyncs_containing_directories(
