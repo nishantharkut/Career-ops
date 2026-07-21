@@ -104,15 +104,21 @@ class RequirementsUpdateRequest(ApiRequest):
         normalized = _normalize_json(value, depth=0, budget=[0])
         if not isinstance(normalized, dict):
             raise ValueError("user_corrected must be an object")
+        persisted_shape = {
+            "raw_ai": {},
+            "deterministic": {},
+            "user_corrected": normalized,
+            "uncertainty": {},
+        }
         serialized = json.dumps(
-            normalized,
+            persisted_shape,
             ensure_ascii=False,
             allow_nan=False,
             separators=(",", ":"),
             sort_keys=True,
         )
         if len(serialized.encode("utf-8")) > MAX_PERSISTED_JSON_BYTES:
-            raise ValueError("user_corrected exceeds the persisted JSON size limit")
+            raise ValueError("requirements exceed the persisted JSON size limit")
         return normalized
 
 

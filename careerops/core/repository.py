@@ -50,6 +50,10 @@ from careerops.core.status import (
 )
 
 
+class PersistedJsonSizeError(ValueError):
+    """Canonical repository JSON exceeded the storage limit."""
+
+
 SECRET_PATTERNS = (
     (
         re.compile(
@@ -226,7 +230,7 @@ def persisted_json(value: Any) -> tuple[Any, str]:
     except Exception:
         raise ValueError("Persisted payload was not valid JSON") from None
     if len(serialized.encode("utf-8")) > MAX_PERSISTED_JSON_BYTES:
-        raise ValueError("Persisted JSON payload exceeded its size limit")
+        raise PersistedJsonSizeError("Persisted JSON payload exceeded its size limit")
     return safe_value, serialized
 
 

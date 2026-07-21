@@ -1,12 +1,33 @@
 from __future__ import annotations
 
+from dataclasses import dataclass, field
 import math
 from queue import Empty, Full, Queue
 from threading import Event, Lock, Thread
+import time
 from uuid import uuid4
 
 from careerops.ai.orchestrator import AiOrchestrator
 from careerops.core.repository import CareerOpsRepository
+
+
+@dataclass
+class _RunnerGeneration:
+    number: int
+    stop: Event
+    queue: Queue[str]
+    scheduled: set[str] = field(default_factory=set)
+    scheduled_lock: Lock = field(default_factory=Lock)
+    supervisor: Thread | None = None
+    workers: list[Thread] = field(default_factory=list)
+
+    @property
+    def threads(self) -> list[Thread]:
+        supervisor = [self.supervisor] if self.supervisor is not None else []
+        return [*self.workers, *supervisor]
+
+    def has_live_threads(self) -> bool:
+        return any(thread.is_alive() for thread in self.threads)
 
 
 class AiTaskRunner:
@@ -21,125 +42,189 @@ class AiTaskRunner:
         interval = float(poll_interval_seconds)
         if not math.isfinite(interval) or interval <= 0:
             raise ValueError("Task poll interval must be finite and positive")
-        if not isinstance(worker_count, int) or isinstance(worker_count, bool) or worker_count < 1:
+        if (
+            not isinstance(worker_count, int)
+            or isinstance(worker_count, bool)
+            or worker_count < 1
+        ):
             raise ValueError("Task worker count must be a positive integer")
         self._repository = repository
         self._orchestrator = orchestrator
         self._poll_interval_seconds = interval
         self._worker_count = worker_count
-        self._queue: Queue[str | None] = Queue(maxsize=max(worker_count * 4, 1))
-        self._scheduled: set[str] = set()
-        self._scheduled_lock = Lock()
+        self._queue_size = max(worker_count * 4, 1)
         self._state_lock = Lock()
-        self._stop = Event()
-        self._running = False
-        self._supervisor: Thread | None = None
-        self._workers: list[Thread] = []
+        self._generation: _RunnerGeneration | None = None
+        self._next_generation = 1
         self.thread_name_prefix = f"careerops-ai-runner-{uuid4().hex[:10]}-"
 
     @property
     def is_running(self) -> bool:
         with self._state_lock:
-            return self._running
+            generation = self._generation
+            return generation is not None and self._is_generation_healthy(generation)
 
-    def start(self) -> None:
+    def start(self) -> bool:
         with self._state_lock:
-            if self._running:
-                return
-            self._stop.clear()
-            self._running = True
-            self._workers = [
+            current = self._generation
+            if current is not None:
+                if current.has_live_threads():
+                    if self._is_generation_healthy(current):
+                        return True
+                    current.stop.set()
+                    return False
+                self._generation = None
+
+            generation = _RunnerGeneration(
+                number=self._next_generation,
+                stop=Event(),
+                queue=Queue(maxsize=self._queue_size),
+            )
+            self._next_generation += 1
+            generation.workers = [
                 Thread(
                     target=self._worker_loop,
-                    name=f"{self.thread_name_prefix}worker-{index + 1}",
+                    args=(generation,),
+                    name=(
+                        f"{self.thread_name_prefix}worker-g{generation.number}-"
+                        f"{index + 1}"
+                    ),
                     daemon=True,
                 )
                 for index in range(self._worker_count)
             ]
-            self._supervisor = Thread(
+            generation.supervisor = Thread(
                 target=self._supervisor_loop,
-                name=f"{self.thread_name_prefix}supervisor",
+                args=(generation,),
+                name=f"{self.thread_name_prefix}supervisor-g{generation.number}",
                 daemon=True,
             )
-            threads = [*self._workers, self._supervisor]
-        for thread in threads:
-            thread.start()
-
-    def stop(self) -> None:
-        with self._state_lock:
-            if not self._running:
-                return
-            self._running = False
-            self._stop.set()
-            supervisor = self._supervisor
-            workers = list(self._workers)
-        if supervisor is not None:
-            supervisor.join(timeout=max(1.0, self._poll_interval_seconds * 2))
-        for _worker in workers:
+            self._generation = generation
+            threads = generation.threads
             try:
-                self._queue.put_nowait(None)
-            except Full:
-                break
-        for worker in workers:
-            worker.join(timeout=1.0)
-        with self._scheduled_lock:
-            self._scheduled.clear()
-        with self._state_lock:
-            self._supervisor = None
-            self._workers = []
+                for thread in threads:
+                    thread.start()
+            except BaseException as exc:
+                generation.stop.set()
+                start_error: BaseException | None = exc
+            else:
+                start_error = None
 
-    def submit(self, task_id: str) -> bool:
+        if start_error is not None:
+            self._join_generation(generation)
+            self._discard_drained_generation(generation)
+            raise start_error
+
         if not self.is_running:
-            self._run_task(task_id)
-            return True
-        with self._scheduled_lock:
-            if task_id in self._scheduled:
-                return False
-            self._scheduled.add(task_id)
-        try:
-            self._queue.put_nowait(task_id)
-        except Full:
-            with self._scheduled_lock:
-                self._scheduled.discard(task_id)
+            generation.stop.set()
+            self._join_generation(generation)
+            self._discard_drained_generation(generation)
             return False
         return True
 
-    def _supervisor_loop(self) -> None:
-        while not self._stop.is_set():
-            self._poll_once()
-            self._stop.wait(self._poll_interval_seconds)
+    def stop(self) -> None:
+        with self._state_lock:
+            generation = self._generation
+            if generation is None:
+                return
+            generation.stop.set()
 
-    def _poll_once(self) -> None:
+        self._join_generation(generation)
+        self._discard_drained_generation(generation)
+
+    def submit(self, task_id: str) -> bool:
+        with self._state_lock:
+            generation = self._generation
+            if generation is None:
+                run_synchronously = True
+            elif not generation.has_live_threads():
+                self._generation = None
+                run_synchronously = True
+            elif not self._is_generation_healthy(generation):
+                return False
+            else:
+                run_synchronously = False
+
+        if run_synchronously:
+            self._run_task(task_id)
+            return True
+        return self._submit_to_generation(generation, task_id)
+
+    def _is_generation_healthy(self, generation: _RunnerGeneration) -> bool:
+        return (
+            not generation.stop.is_set()
+            and len(generation.workers) == self._worker_count
+            and all(worker.is_alive() for worker in generation.workers)
+            and generation.supervisor is not None
+            and generation.supervisor.is_alive()
+        )
+
+    def _join_generation(self, generation: _RunnerGeneration) -> None:
+        timeout = max(1.0, self._poll_interval_seconds * 2)
+        deadline = time.monotonic() + timeout
+        for thread in generation.threads:
+            if thread.ident is None:
+                continue
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            thread.join(timeout=remaining)
+
+    def _discard_drained_generation(self, generation: _RunnerGeneration) -> None:
+        with self._state_lock:
+            if self._generation is generation and not generation.has_live_threads():
+                self._generation = None
+
+    def _submit_to_generation(
+        self, generation: _RunnerGeneration, task_id: str
+    ) -> bool:
+        if generation.stop.is_set():
+            return False
+        with generation.scheduled_lock:
+            if generation.stop.is_set() or task_id in generation.scheduled:
+                return False
+            generation.scheduled.add(task_id)
+        try:
+            generation.queue.put_nowait(task_id)
+        except Full:
+            with generation.scheduled_lock:
+                generation.scheduled.discard(task_id)
+            return False
+        return True
+
+    def _supervisor_loop(self, generation: _RunnerGeneration) -> None:
+        while not generation.stop.is_set():
+            self._poll_once(generation)
+            generation.stop.wait(self._poll_interval_seconds)
+
+    def _poll_once(self, generation: _RunnerGeneration) -> None:
         try:
             self._repository.requeue_interrupted_ai_tasks()
         except Exception:
             pass
         try:
             pending_ids = self._repository.list_pending_ai_task_ids(
-                limit=self._queue.maxsize
+                limit=generation.queue.maxsize
             )
         except Exception:
             return
         for task_id in pending_ids:
-            if self._stop.is_set():
+            if generation.stop.is_set():
                 return
-            self.submit(task_id)
+            self._submit_to_generation(generation, task_id)
 
-    def _worker_loop(self) -> None:
-        while not self._stop.is_set():
+    def _worker_loop(self, generation: _RunnerGeneration) -> None:
+        while not generation.stop.is_set():
             try:
-                task_id = self._queue.get(timeout=0.1)
+                task_id = generation.queue.get(timeout=0.1)
             except Empty:
                 continue
-            if task_id is None:
-                self._queue.task_done()
-                return
             try:
                 self._run_task(task_id)
             finally:
-                with self._scheduled_lock:
-                    self._scheduled.discard(task_id)
-                self._queue.task_done()
+                with generation.scheduled_lock:
+                    generation.scheduled.discard(task_id)
+                generation.queue.task_done()
 
     def _run_task(self, task_id: str) -> None:
         try:

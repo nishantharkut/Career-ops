@@ -92,6 +92,33 @@ def ascii_requirements_with_size(target_size: int) -> dict[str, str]:
     return value
 
 
+def grouped_requirements(user_corrected: object) -> dict[str, object]:
+    return {
+        "raw_ai": {},
+        "deterministic": {},
+        "user_corrected": user_corrected,
+        "uncertainty": {},
+    }
+
+
+def ascii_requirements_with_grouped_size(target_size: int) -> dict[str, str]:
+    wrapper_overhead = canonical_json_size(grouped_requirements({})) - 2
+    return ascii_requirements_with_size(target_size - wrapper_overhead)
+
+
+def existing_requirements_with_size(
+    target_size: int, *, user_corrected: dict[str, object] | None = None
+) -> dict[str, object]:
+    value = grouped_requirements(user_corrected or {})
+    raw_ai = {"padding": ""}
+    value["raw_ai"] = raw_ai
+    remaining = target_size - canonical_json_size(value)
+    assert remaining >= 0
+    raw_ai["padding"] = "x" * remaining
+    assert canonical_json_size(value) == target_size
+    return value
+
+
 def test_repository_user_corrections_are_transactional_and_preserve_provenance(tmp_path: Path):
     repo = make_repo(tmp_path)
     application = create_application(repo)
@@ -313,12 +340,25 @@ def test_requirements_api_only_updates_user_corrected_and_rejects_unknown_fields
 @pytest.mark.parametrize(
     ("user_corrected", "expected_status"),
     [
-        (ascii_requirements_with_size(MAX_PERSISTED_JSON_BYTES - 1), 404),
-        (ascii_requirements_with_size(MAX_PERSISTED_JSON_BYTES + 1), 422),
+        (
+            ascii_requirements_with_grouped_size(MAX_PERSISTED_JSON_BYTES),
+            404,
+        ),
+        (
+            ascii_requirements_with_grouped_size(MAX_PERSISTED_JSON_BYTES + 1),
+            422,
+        ),
+        (ascii_requirements_with_size(255_999), 422),
         ({f"field_{index:02d}": "€" * 4_000 for index in range(21)}, 404),
         ({f"field_{index:02d}": "€" * 4_000 for index in range(22)}, 422),
     ],
-    ids=["ascii-under", "ascii-over", "unicode-under", "unicode-over"],
+    ids=[
+        "grouped-at-limit",
+        "grouped-over-limit",
+        "raw-255999-over-grouped-limit",
+        "unicode-under",
+        "unicode-over",
+    ],
 )
 def test_requirements_request_enforces_canonical_utf8_byte_limit(
     tmp_path: Path,
@@ -333,6 +373,45 @@ def test_requirements_request_enforces_canonical_utf8_byte_limit(
     )
 
     assert response.status_code == expected_status
+
+
+def test_requirements_api_maps_preserved_group_size_overflow_to_generic_422(
+    tmp_path: Path,
+):
+    repo = make_repo(tmp_path)
+    application = create_application(repo)
+    corrected = {"label": "€"}
+    empty_size = canonical_json_size(grouped_requirements({}))
+    corrected_size = canonical_json_size(grouped_requirements(corrected))
+    existing_size = MAX_PERSISTED_JSON_BYTES - (corrected_size - empty_size) + 1
+    existing = existing_requirements_with_size(existing_size)
+    with repo.connection() as connection:
+        connection.execute(
+            "UPDATE jd_snapshots SET extracted_requirements_json = ? WHERE id = ?",
+            (
+                json.dumps(
+                    existing,
+                    ensure_ascii=False,
+                    allow_nan=False,
+                    separators=(",", ":"),
+                    sort_keys=True,
+                ),
+                application.jd_snapshot_id,
+            ),
+        )
+    client = TestClient(create_app(repo, provider_registry={}))
+
+    response = client.put(
+        f"/applications/{application.id}/requirements",
+        json={"user_corrected": corrected},
+    )
+
+    assert response.status_code == 422
+    assert response.json() == {"detail": "Requirements payload is too large"}
+    assert (
+        repo.get_jd_snapshot(application.jd_snapshot_id).extracted_requirements_json
+        == existing
+    )
 
 
 @pytest.mark.parametrize("terminal_state", ["approved", "submitted"])

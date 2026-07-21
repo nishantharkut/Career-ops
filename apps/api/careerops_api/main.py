@@ -63,6 +63,7 @@ from careerops.core.models import (
 from careerops.core.repository import (
     ApplicationPacketSnapshot,
     CareerOpsRepository,
+    PersistedJsonSizeError,
     redact,
 )
 from careerops.gates.risk import evaluate_risks
@@ -560,6 +561,10 @@ def create_app(
             )
         except KeyError as exc:
             raise HTTPException(status_code=404, detail="Application not found") from exc
+        except PersistedJsonSizeError as exc:
+            raise HTTPException(
+                status_code=422, detail="Requirements payload is too large"
+            ) from exc
         except ValueError as exc:
             raise HTTPException(status_code=409, detail="Requirements cannot be changed") from exc
         return _requirements_payload(snapshot.extracted_requirements_json)
@@ -832,11 +837,6 @@ _PUBLIC_PROVIDER_BINDING_FIELDS = frozenset(
         "isolation_evidence_sha256",
     }
 )
-_PRIVATE_PUBLIC_KEYS = frozenset(
-    {"executable", "executable_path", "codex_home", "runtime_handle"}
-)
-
-
 def _sanitize_public_json(value: Any, *, provider_binding: bool = False) -> Any:
     if isinstance(value, Mapping):
         sanitized: dict[str, Any] = {}
@@ -846,18 +846,20 @@ def _sanitize_public_json(value: Any, *, provider_binding: bool = False) -> Any:
             normalized_key = key.casefold()
             if provider_binding and normalized_key not in _PUBLIC_PROVIDER_BINDING_FIELDS:
                 continue
-            if normalized_key in _PRIVATE_PUBLIC_KEYS or (
-                "isolation" in normalized_key and "signature" in normalized_key
-            ):
-                continue
             sanitized[key] = _sanitize_public_json(
                 inner,
-                provider_binding=normalized_key
-                in {"provider_binding", "availability_binding"},
+                provider_binding=(
+                    provider_binding
+                    or normalized_key
+                    in {"provider_binding", "availability_binding"}
+                ),
             )
         return sanitized
     if isinstance(value, (list, tuple)):
-        return [_sanitize_public_json(item) for item in value]
+        return [
+            _sanitize_public_json(item, provider_binding=provider_binding)
+            for item in value
+        ]
     return value
 
 

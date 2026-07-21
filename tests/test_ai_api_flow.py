@@ -14,6 +14,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 import apps.api.careerops_api.main as api_main
+import apps.api.careerops_api.task_runner as task_runner_module
 from apps.api.careerops_api.main import BasicAuthConfig, create_app
 from careerops.ai.contracts import (
     InvocationMetadata,
@@ -238,6 +239,26 @@ def wait_for_task_status(
     )
 
 
+def wait_until(predicate: Any, *, timeout: float = 5) -> None:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return
+        time.sleep(0.01)
+    raise AssertionError("Condition was not met before timeout")
+
+
+def runner_threads(runner: Any, *, kind: str | None = None) -> list[Any]:
+    prefix = runner.thread_name_prefix
+    if kind is not None:
+        prefix = f"{prefix}{kind}"
+    return [
+        thread
+        for thread in enumerate_threads()
+        if thread.name.startswith(prefix)
+    ]
+
+
 def test_task_runner_retries_transient_claim_failure_while_service_is_alive(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
@@ -344,6 +365,145 @@ def test_task_runner_deduplicates_api_handoff_and_supervisor_poll(
     assert provider.calls == 1
 
 
+def test_task_runner_restart_uses_fresh_generation_after_delayed_supervisor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    repo = make_repo(tmp_path)
+    app = create_app(
+        repo,
+        provider_registry={},
+        task_poll_interval_seconds=0.01,
+        task_worker_count=2,
+    )
+    runner = app.state.task_runner
+    poll_entered = Event()
+    release_poll = Event()
+    original_requeue = repo.requeue_interrupted_ai_tasks
+
+    def delayed_requeue() -> int:
+        poll_entered.set()
+        assert release_poll.wait(timeout=2)
+        return original_requeue()
+
+    monkeypatch.setattr(repo, "requeue_interrupted_ai_tasks", delayed_requeue)
+    runner.start()
+    assert poll_entered.wait(timeout=2)
+    try:
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            stopped = executor.submit(runner.stop)
+            wait_until(lambda: not runner_threads(runner, kind="worker"))
+            release_poll.set()
+            stopped.result(timeout=2)
+
+        assert not runner.is_running
+        assert not runner_threads(runner)
+
+        runner.start()
+        wait_until(lambda: len(runner_threads(runner)) == 3)
+        assert runner.is_running
+        assert len(runner_threads(runner, kind="worker")) == 2
+        assert all(thread.daemon for thread in runner_threads(runner))
+    finally:
+        release_poll.set()
+        runner.stop()
+
+    assert not runner.is_running
+    assert not runner_threads(runner)
+
+
+def test_task_runner_refuses_restart_and_submit_until_blocked_generation_drains(
+    tmp_path: Path,
+):
+    from careerops.ai.orchestrator import AiOrchestrator
+
+    repo = make_repo(tmp_path)
+    application = create_application(repo)
+    status = availability()
+    config = create_provider_config(repo, status)
+    entered = Event()
+    release = Event()
+    provider = ControlledProvider(status, entered=entered, release=release)
+    orchestrator = AiOrchestrator(repo, {config.id: provider})
+    app = create_app(
+        repo,
+        provider_registry={config.id: provider},
+        task_poll_interval_seconds=0.01,
+        task_worker_count=1,
+    )
+    runner = app.state.task_runner
+    first = orchestrator.enqueue(application.id, "analyze_jd", config.id)
+    second = None
+
+    runner.start()
+    try:
+        assert runner.submit(first.id)
+        assert entered.wait(timeout=2)
+        runner.stop()
+        assert not runner.is_running
+        assert len(runner_threads(runner, kind="worker")) == 1
+
+        second = orchestrator.enqueue(application.id, "analyze_jd", config.id)
+        restart_result = runner.start()
+        submit_result = runner.submit(second.id)
+
+        assert restart_result is False
+        assert submit_result is False
+        assert not runner.is_running
+        assert len(runner_threads(runner, kind="worker")) <= 1
+        assert provider.calls == 1
+
+        release.set()
+        wait_for_task_status(repo, first.id, "completed")
+        wait_until(lambda: not runner_threads(runner))
+
+        assert runner.start() is True
+        wait_for_task_status(repo, second.id, "completed")
+        assert provider.calls == 2
+        assert len(runner_threads(runner, kind="worker")) <= 1
+    finally:
+        release.set()
+        runner.stop()
+
+    assert second is not None
+    assert repo.get_ai_task(second.id).status.value == "completed"
+    assert not runner_threads(runner)
+
+
+def test_task_runner_partial_thread_start_failure_stops_started_generation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    repo = make_repo(tmp_path)
+    runner = create_app(
+        repo,
+        provider_registry={},
+        task_poll_interval_seconds=0.01,
+        task_worker_count=2,
+    ).state.task_runner
+    original_start = task_runner_module.Thread.start
+    runner_start_calls = 0
+
+    def fail_second_runner_thread(thread: Any) -> None:
+        nonlocal runner_start_calls
+        if thread.name.startswith(runner.thread_name_prefix):
+            runner_start_calls += 1
+            if runner_start_calls == 2:
+                raise RuntimeError("injected thread start failure")
+        original_start(thread)
+
+    monkeypatch.setattr(task_runner_module.Thread, "start", fail_second_runner_thread)
+    try:
+        with pytest.raises(RuntimeError, match="injected thread start failure"):
+            runner.start()
+        wait_until(lambda: not runner_threads(runner))
+        assert not runner.is_running
+        monkeypatch.setattr(task_runner_module.Thread, "start", original_start)
+        assert runner.start() is True
+        assert runner.is_running
+    finally:
+        monkeypatch.setattr(task_runner_module.Thread, "start", original_start)
+        runner.stop()
+
+
 def test_task_runner_lifespan_stops_daemon_threads_cleanly(tmp_path: Path):
     repo = make_repo(tmp_path)
     app = create_app(
@@ -356,26 +516,15 @@ def test_task_runner_lifespan_stops_daemon_threads_cleanly(tmp_path: Path):
     with TestClient(app):
         runner = app.state.task_runner
         assert runner.is_running
-        runner_threads = [
-            thread
-            for thread in enumerate_threads()
-            if thread.name.startswith(runner.thread_name_prefix)
-        ]
-        assert len(runner_threads) == 3
-        assert all(thread.daemon for thread in runner_threads)
+        active_threads = runner_threads(runner)
+        assert len(active_threads) == 3
+        assert all(thread.daemon for thread in active_threads)
 
     assert not runner.is_running
-    assert not any(
-        thread.name.startswith(runner.thread_name_prefix)
-        for thread in enumerate_threads()
-    )
+    assert not runner_threads(runner)
 
     with TestClient(app):
-        restarted_threads = [
-            thread
-            for thread in enumerate_threads()
-            if thread.name.startswith(runner.thread_name_prefix)
-        ]
+        restarted_threads = runner_threads(runner)
         assert runner.is_running
         assert len(restarted_threads) == 3
         assert all(thread.daemon for thread in restarted_threads)
@@ -1005,15 +1154,15 @@ def test_public_packet_artifacts_and_versions_recursively_sanitize_provenance(
         for private_value in (
             "C:/private/bin/codex.exe",
             "C:/private/CODEX_HOME",
-            "C:/private/nested-home",
             "private-runtime-instance",
             "private-runtime-handle",
-            "private-nested-handle",
             "private-issuer",
             "private-signature",
-            "private-nested-signature",
         ):
             assert private_value not in serialized
+        assert "C:/private/nested-home" in serialized
+        assert "private-nested-handle" in serialized
+        assert "private-nested-signature" in serialized
         assert "gpt-fixture" in serialized
         assert "codex2" in serialized
         assert "local_private" in serialized
@@ -1031,6 +1180,52 @@ def test_public_packet_artifacts_and_versions_recursively_sanitize_provenance(
     assert stored_report.fit == fit
     assert stored_report.risks == risks
     assert stored_version.snapshot["provenance"] == provenance
+
+
+def test_public_sanitizer_only_filters_actual_provider_bindings():
+    payload = {
+        "candidate_content": {
+            "executable": "candidate-described executable",
+            "codex_home": "candidate-described codex home",
+            "runtime_handle": "candidate-described runtime handle",
+            "isolation_authority_signature": "candidate-described signature",
+        },
+        "deep": [
+            {
+                "provider_binding": {
+                    "provider_kind": "codex",
+                    "model": "gpt-fixture",
+                    "identity_name": "codex2",
+                    "executable": "C:/private/codex.exe",
+                    "codex_home": "C:/private/CODEX_HOME",
+                    "runtime_handle": "private-runtime-handle",
+                    "isolation_evidence_signature": "private-signature",
+                    "unexpected": "private-binding-internal",
+                }
+            },
+            {
+                "availability_binding": {
+                    "provider_kind": "ollama",
+                    "model": "fixture",
+                    "runtime_handle": "private-availability-handle",
+                    "isolation_authority_signature": "private-availability-signature",
+                }
+            },
+        ],
+    }
+
+    sanitized = api_main._sanitize_public_json(payload)
+
+    assert sanitized["candidate_content"] == payload["candidate_content"]
+    assert sanitized["deep"][0]["provider_binding"] == {
+        "provider_kind": "codex",
+        "model": "gpt-fixture",
+        "identity_name": "codex2",
+    }
+    assert sanitized["deep"][1]["availability_binding"] == {
+        "provider_kind": "ollama",
+        "model": "fixture",
+    }
 
 
 def test_artifact_downloads_are_bound_to_latest_packet_and_verify_integrity(tmp_path: Path):
