@@ -71,6 +71,8 @@ CODEX_IDENTITIES = frozenset({"codex2", "codex"})
 MAX_PERSISTED_JSON_BYTES = 256_000
 MAX_PROVIDER_BINDING_BYTES = 32_768
 MAX_AI_ARTIFACT_BYTES = 16_000_000
+# Allow one heartbeat interval and SQLite's full five-second writer wait.
+MIN_AI_TASK_CLAIM_LEASE_SECONDS = 15.0
 AI_ARTIFACT_TYPES = frozenset(
     {"context", "raw_output", "validated_output", "draft_text"}
 )
@@ -226,8 +228,8 @@ class CareerOpsRepository:
         *,
         claim_lease_seconds: float = 30.0,
     ):
-        if claim_lease_seconds <= 0:
-            raise ValueError("AI task claim lease must be positive")
+        if claim_lease_seconds < MIN_AI_TASK_CLAIM_LEASE_SECONDS:
+            raise ValueError("AI task claim lease must be at least 15 seconds")
         self.database_path = Path(database_path)
         self.vault_path = Path(vault_path)
         self.claim_lease_seconds = float(claim_lease_seconds)
@@ -1211,6 +1213,25 @@ class CareerOpsRepository:
                 (now, now),
             )
         return cursor.rowcount
+
+    def requeue_expired_ai_task_claim(
+        self, task_id: str, claim_token: str
+    ) -> bool:
+        with self.connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            now = utc_now()
+            cursor = connection.execute(
+                """
+                UPDATE ai_tasks
+                SET status = 'pending', started_at = NULL, completed_at = NULL,
+                    error_summary = '', claim_token = NULL,
+                    claim_expires_at = NULL, updated_at = ?
+                WHERE id = ? AND status = 'running' AND claim_token = ?
+                  AND (claim_expires_at IS NULL OR claim_expires_at <= ?)
+                """,
+                (now, task_id, claim_token, now),
+            )
+        return cursor.rowcount == 1
 
     def save_ai_artifact(
         self,

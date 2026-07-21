@@ -25,6 +25,25 @@ def make_repo(tmp_path: Path) -> CareerOpsRepository:
     return repo
 
 
+def test_repository_rejects_claim_lease_below_sqlite_contention_floor(
+    tmp_path: Path,
+):
+    with pytest.raises(ValueError, match="at least 15 seconds"):
+        CareerOpsRepository(
+            tmp_path / "careerops.db",
+            tmp_path / "vault",
+            claim_lease_seconds=14.999,
+        )
+
+    repository = CareerOpsRepository(
+        tmp_path / "careerops.db",
+        tmp_path / "vault",
+        claim_lease_seconds=15,
+    )
+
+    assert repository.claim_lease_seconds == 15
+
+
 def create_legacy_ai_database(database_path: Path, version: int) -> None:
     fixture_dir = Path(__file__).parent / "fixtures"
     with closing(sqlite3.connect(database_path)) as connection:
@@ -492,7 +511,7 @@ def test_lock_delayed_finalization_rejects_expired_claim(tmp_path: Path):
     repo = CareerOpsRepository(
         tmp_path / "careerops.db",
         tmp_path / "vault",
-        claim_lease_seconds=0.08,
+        claim_lease_seconds=15,
     )
     repo.initialize()
     application = create_application(repo)
@@ -501,8 +520,10 @@ def test_lock_delayed_finalization_rejects_expired_claim(tmp_path: Path):
     claim = claim_task(repo, task.id)
     assert repo.begin_ai_task_invocation(task.id, claim) is True
     write_attempt_artifact(repo, task.id, claim, "context", b"context")
+    finalization_started = Event()
 
     def finalize():
+        finalization_started.set()
         return repo.finalize_ai_task_attempt(
             task_id=task.id,
             claim_token=claim,
@@ -516,7 +537,11 @@ def test_lock_delayed_finalization_rejects_expired_claim(tmp_path: Path):
     with repo.connection() as blocker, ThreadPoolExecutor(max_workers=1) as pool:
         blocker.execute("BEGIN IMMEDIATE")
         future = pool.submit(finalize)
-        time.sleep(0.14)
+        assert finalization_started.wait(2)
+        blocker.execute(
+            "UPDATE ai_tasks SET claim_expires_at = ? WHERE id = ?",
+            ("1970-01-01T00:00:00+00:00", task.id),
+        )
         blocker.commit()
         with pytest.raises(ValueError, match="claim"):
             future.result(timeout=2)
@@ -677,17 +702,22 @@ def test_claim_lease_starts_after_waiting_for_write_lock(tmp_path: Path):
     repo = CareerOpsRepository(
         tmp_path / "careerops.db",
         tmp_path / "vault",
-        claim_lease_seconds=0.08,
+        claim_lease_seconds=15,
     )
     repo.initialize()
     application = create_application(repo)
     provider = create_provider(repo)
     task = create_task(repo, application.id, provider.id)
+    claim_started = Event()
+
+    def claim_after_signal():
+        claim_started.set()
+        return repo.claim_ai_task(task.id)
 
     with repo.connection() as blocker, ThreadPoolExecutor(max_workers=1) as pool:
         blocker.execute("BEGIN IMMEDIATE")
-        future = pool.submit(repo.claim_ai_task, task.id)
-        time.sleep(0.14)
+        future = pool.submit(claim_after_signal)
+        assert claim_started.wait(2)
         release_floor = datetime.now(UTC)
         blocker.commit()
         claim = future.result(timeout=2)
@@ -706,7 +736,7 @@ def test_lock_delayed_renewal_and_invocation_cannot_revive_expired_claim(
         repo = CareerOpsRepository(
             operation_root / "careerops.db",
             operation_root / "vault",
-            claim_lease_seconds=0.08,
+            claim_lease_seconds=15,
         )
         repo.initialize()
         application = create_application(repo)
@@ -718,11 +748,20 @@ def test_lock_delayed_renewal_and_invocation_cannot_revive_expired_claim(
             if operation == "renew"
             else repo.begin_ai_task_invocation
         )
+        operation_started = Event()
+
+        def run_operation():
+            operation_started.set()
+            return callback(task.id, claim)
 
         with repo.connection() as blocker, ThreadPoolExecutor(max_workers=1) as pool:
             blocker.execute("BEGIN IMMEDIATE")
-            future = pool.submit(callback, task.id, claim)
-            time.sleep(0.14)
+            future = pool.submit(run_operation)
+            assert operation_started.wait(2)
+            blocker.execute(
+                "UPDATE ai_tasks SET claim_expires_at = ? WHERE id = ?",
+                ("1970-01-01T00:00:00+00:00", task.id),
+            )
             blocker.commit()
             assert future.result(timeout=2) is False
 
@@ -735,7 +774,7 @@ def test_lock_delayed_terminal_transition_rejects_expired_claim(
     repo = CareerOpsRepository(
         tmp_path / terminal_method / "careerops.db",
         tmp_path / terminal_method / "vault",
-        claim_lease_seconds=0.08,
+        claim_lease_seconds=15,
     )
     repo.initialize()
     application = create_application(repo)
@@ -751,11 +790,20 @@ def test_lock_delayed_terminal_transition_rejects_expired_claim(
         ),
         "fail": lambda: repo.fail_ai_task(task.id, claim, "provider_error"),
     }[terminal_method]
+    transition_started = Event()
+
+    def run_transition():
+        transition_started.set()
+        return callback()
 
     with repo.connection() as blocker, ThreadPoolExecutor(max_workers=1) as pool:
         blocker.execute("BEGIN IMMEDIATE")
-        future = pool.submit(callback)
-        time.sleep(0.14)
+        future = pool.submit(run_transition)
+        assert transition_started.wait(2)
+        blocker.execute(
+            "UPDATE ai_tasks SET claim_expires_at = ? WHERE id = ?",
+            ("1970-01-01T00:00:00+00:00", task.id),
+        )
         blocker.commit()
         with pytest.raises(ValueError, match="claim"):
             future.result(timeout=2)
@@ -767,18 +815,27 @@ def test_lock_delayed_recovery_observes_expiry_after_lock_wait(tmp_path: Path):
     repo = CareerOpsRepository(
         tmp_path / "careerops.db",
         tmp_path / "vault",
-        claim_lease_seconds=0.08,
+        claim_lease_seconds=15,
     )
     repo.initialize()
     application = create_application(repo)
     provider = create_provider(repo)
     task = create_task(repo, application.id, provider.id)
     claim_task(repo, task.id)
+    recovery_started = Event()
+
+    def recover_after_signal():
+        recovery_started.set()
+        return repo.requeue_interrupted_ai_tasks()
 
     with repo.connection() as blocker, ThreadPoolExecutor(max_workers=1) as pool:
         blocker.execute("BEGIN IMMEDIATE")
-        future = pool.submit(repo.requeue_interrupted_ai_tasks)
-        time.sleep(0.14)
+        future = pool.submit(recover_after_signal)
+        assert recovery_started.wait(2)
+        blocker.execute(
+            "UPDATE ai_tasks SET claim_expires_at = ? WHERE id = ?",
+            ("1970-01-01T00:00:00+00:00", task.id),
+        )
         blocker.commit()
         assert future.result(timeout=2) == 1
 
@@ -1184,7 +1241,7 @@ def test_expired_claim_requeues_but_invocation_fence_survives(tmp_path: Path):
     repo = CareerOpsRepository(
         tmp_path / "careerops.db",
         tmp_path / "vault",
-        claim_lease_seconds=0.1,
+        claim_lease_seconds=15,
     )
     repo.initialize()
     application = create_application(repo)
@@ -1193,7 +1250,7 @@ def test_expired_claim_requeues_but_invocation_fence_survives(tmp_path: Path):
     first_claim = claim_task(repo, task.id)
     assert repo.begin_ai_task_invocation(task.id, first_claim) is True
 
-    time.sleep(0.2)
+    expire_claim(repo, task.id)
     assert repo.requeue_interrupted_ai_tasks() == 1
     second_claim = claim_task(repo, task.id)
 
@@ -1572,7 +1629,7 @@ def test_finalization_rejects_artifact_from_stale_claim(tmp_path: Path):
     repo = CareerOpsRepository(
         tmp_path / "careerops.db",
         tmp_path / "vault",
-        claim_lease_seconds=0.1,
+        claim_lease_seconds=15,
     )
     repo.initialize()
     application = create_application(repo)
@@ -1589,7 +1646,7 @@ def test_finalization_rejects_artifact_from_stale_claim(tmp_path: Path):
         hashlib.sha256(b"stale").hexdigest(),
         "1",
     )
-    time.sleep(0.2)
+    expire_claim(repo, task.id)
     assert repo.requeue_interrupted_ai_tasks() == 1
     second_claim = claim_task(repo, task.id)
     assert repo.begin_ai_task_invocation(task.id, second_claim) is True

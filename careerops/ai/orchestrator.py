@@ -777,6 +777,7 @@ class AiOrchestrator:
         try:
             return self._repository.fail_ai_task(task_id, claim_token, category)
         except ValueError:
+            self._repository.requeue_expired_ai_task_claim(task_id, claim_token)
             return self._repository.get_ai_task(task_id)
 
 

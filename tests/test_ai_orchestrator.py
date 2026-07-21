@@ -351,7 +351,7 @@ def test_heartbeat_renewal_exception_fails_closed(tmp_path: Path, monkeypatch):
     repo = CareerOpsRepository(
         tmp_path / "careerops.db",
         tmp_path / "vault",
-        claim_lease_seconds=0.15,
+        claim_lease_seconds=15,
     )
     repo.initialize()
     application = create_application(repo)
@@ -365,6 +365,11 @@ def test_heartbeat_renewal_exception_fails_closed(tmp_path: Path, monkeypatch):
     def wait_for_renewal(_request: Any, _calls: int) -> None:
         assert renewal_failed.wait(2)
 
+    monkeypatch.setattr(
+        type(repo),
+        "claim_heartbeat_interval",
+        property(lambda _repository: 0.05),
+    )
     monkeypatch.setattr(repo, "renew_ai_task_claim", raise_renewal_error)
     provider = ScriptedProvider(availability(), on_run=wait_for_renewal)
     orchestrator = AiOrchestrator(repo, {config.id: provider})
@@ -386,13 +391,14 @@ def test_run_waits_for_blocked_heartbeat_thread_before_returning(
     repo = CareerOpsRepository(
         tmp_path / "careerops.db",
         tmp_path / "vault",
-        claim_lease_seconds=0.15,
+        claim_lease_seconds=15,
     )
     repo.initialize()
     application = create_application(repo)
     config = create_provider_config(repo)
     renewal_entered = Event()
     release_renewal = Event()
+    provider_returned = Event()
 
     def blocked_renewal(_task_id: str, _claim_token: str) -> bool:
         renewal_entered.set()
@@ -401,7 +407,13 @@ def test_run_waits_for_blocked_heartbeat_thread_before_returning(
 
     def wait_for_heartbeat(_request: Any, _calls: int) -> None:
         assert renewal_entered.wait(2)
+        provider_returned.set()
 
+    monkeypatch.setattr(
+        type(repo),
+        "claim_heartbeat_interval",
+        property(lambda _repository: 0.05),
+    )
     monkeypatch.setattr(repo, "renew_ai_task_claim", blocked_renewal)
     provider = ScriptedProvider(availability(), on_run=wait_for_heartbeat)
     orchestrator = AiOrchestrator(repo, {config.id: provider})
@@ -410,19 +422,93 @@ def test_run_waits_for_blocked_heartbeat_thread_before_returning(
     with ThreadPoolExecutor(max_workers=1) as pool:
         future = pool.submit(orchestrator.run, task.id)
         assert renewal_entered.wait(2)
-        time.sleep(1.4)
+        assert provider_returned.wait(2)
         try:
             assert future.done() is False
         finally:
             release_renewal.set()
         result = future.result(timeout=3)
 
-    assert result.status == "running"
-    assert repo.list_application_versions(application.id) == []
+    assert result.status == "completed"
+    assert len(repo.list_application_versions(application.id)) == 1
     assert not any(
         thread.name == f"ai-task-heartbeat-{task.id}" and thread.is_alive()
         for thread in __import__("threading").enumerate()
     )
+
+
+def test_expired_contended_heartbeat_requeues_without_reinvoking_provider(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    from careerops.ai.orchestrator import AiOrchestrator
+
+    repo = CareerOpsRepository(
+        tmp_path / "careerops.db",
+        tmp_path / "vault",
+        claim_lease_seconds=15,
+    )
+    repo.initialize()
+    application = create_application(repo)
+    config = create_provider_config(repo)
+    provider_started = Event()
+    release_provider = Event()
+    contend_renewal = Event()
+    renewal_entered = Event()
+    renewal_finished = Event()
+    renewal_results: list[bool] = []
+    original_renew = repo.renew_ai_task_claim
+
+    monkeypatch.setattr(
+        type(repo),
+        "claim_heartbeat_interval",
+        property(lambda _repository: 0.05),
+    )
+
+    def renew_under_contention(task_id: str, claim_token: str) -> bool:
+        contended = contend_renewal.is_set()
+        if contended:
+            renewal_entered.set()
+        renewed = original_renew(task_id, claim_token)
+        if contended:
+            renewal_results.append(renewed)
+            renewal_finished.set()
+        return renewed
+
+    def wait_in_provider(_request: Any, _calls: int) -> None:
+        provider_started.set()
+        assert release_provider.wait(10)
+
+    monkeypatch.setattr(repo, "renew_ai_task_claim", renew_under_contention)
+    provider = ScriptedProvider(availability(), on_run=wait_in_provider)
+    orchestrator = AiOrchestrator(repo, {config.id: provider})
+    task = orchestrator.enqueue(application.id, "analyze_jd", config.id)
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(orchestrator.run, task.id)
+        assert provider_started.wait(5)
+        try:
+            with repo.connection() as blocker:
+                blocker.execute("BEGIN IMMEDIATE")
+                contend_renewal.set()
+                assert renewal_entered.wait(5)
+                blocker.execute(
+                    "UPDATE ai_tasks SET claim_expires_at = ? WHERE id = ?",
+                    ("1970-01-01T00:00:00+00:00", task.id),
+                )
+                blocker.commit()
+                assert renewal_finished.wait(5)
+        finally:
+            release_provider.set()
+        interrupted = future.result(timeout=5)
+
+    recovered = orchestrator.run(task.id)
+
+    assert renewal_results == [False]
+    assert interrupted.status == "pending"
+    assert recovered.status == "failed"
+    assert recovered.error_summary == "provider_error"
+    assert provider.calls == 1
+    assert repo.list_application_versions(application.id) == []
 
 
 def test_enqueue_requires_task_prerequisites_and_compatible_egress(tmp_path: Path):
@@ -1050,25 +1136,42 @@ def test_requeue_invalidates_stale_attempt_without_reinvoking_provider(tmp_path:
     assert repo.list_application_versions(application.id) == []
 
 
-def test_live_orchestrator_renews_claim_while_provider_runs(tmp_path: Path):
+def test_live_orchestrator_renews_claim_while_provider_runs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
     from careerops.ai.orchestrator import AiOrchestrator
 
     repo = CareerOpsRepository(
         tmp_path / "careerops.db",
         tmp_path / "vault",
-        claim_lease_seconds=0.15,
+        claim_lease_seconds=15,
     )
     repo.initialize()
     application = create_application(repo)
     config = create_provider_config(repo)
     provider_started = Event()
     release_provider = Event()
+    claim_renewed = Event()
+    original_renew = repo.renew_ai_task_claim
+
+    monkeypatch.setattr(
+        type(repo),
+        "claim_heartbeat_interval",
+        property(lambda _repository: 0.05),
+    )
+
+    def record_renewal(task_id: str, claim_token: str) -> bool:
+        renewed = original_renew(task_id, claim_token)
+        if renewed:
+            claim_renewed.set()
+        return renewed
 
     def wait_in_provider(_request: Any, _calls: int) -> None:
         provider_started.set()
         assert release_provider.wait(5)
 
     provider = ScriptedProvider(availability(), on_run=wait_in_provider)
+    monkeypatch.setattr(repo, "renew_ai_task_claim", record_renewal)
     orchestrator = AiOrchestrator(repo, {config.id: provider})
     task = orchestrator.enqueue(application.id, "analyze_jd", config.id)
     recovery = CareerOpsRepository(repo.database_path, repo.vault_path)
@@ -1076,7 +1179,7 @@ def test_live_orchestrator_renews_claim_while_provider_runs(tmp_path: Path):
     with ThreadPoolExecutor(max_workers=1) as executor:
         future = executor.submit(orchestrator.run, task.id)
         assert provider_started.wait(5)
-        time.sleep(0.4)
+        assert claim_renewed.wait(5)
         assert recovery.requeue_interrupted_ai_tasks() == 0
         release_provider.set()
         result = future.result(timeout=5)
