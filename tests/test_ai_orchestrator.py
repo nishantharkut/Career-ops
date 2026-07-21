@@ -23,6 +23,7 @@ from careerops.ai.providers.base import (
     ProviderUnavailableError,
     build_provider_result,
 )
+from careerops.ai.context import load_prompt_template
 from careerops.core.repository import CareerOpsRepository
 from careerops.core.status import PrivacyMode
 
@@ -268,14 +269,17 @@ def select_resume(repo: CareerOpsRepository, application_id: str, text: str = "P
     source_dir = repo.vault_path / "resumes" / "sources"
     source_dir.mkdir(parents=True, exist_ok=True)
     tex_path = source_dir / f"resume-{application_id}.tex"
+    pdf_path = source_dir / f"resume-{application_id}.pdf"
     tex_path.write_text(text, encoding="utf-8")
+    pdf_bytes = b"%PDF-1.4\nfixture resume"
+    pdf_path.write_bytes(pdf_bytes)
     resume = repo.create_resume_version(
         name="Current resume",
         role_family="software",
         tex_path=tex_path,
         tex_sha256=hashlib.sha256(text.encode("utf-8")).hexdigest(),
-        pdf_path=source_dir / f"resume-{application_id}.pdf",
-        pdf_sha256="a" * 64,
+        pdf_path=pdf_path,
+        pdf_sha256=hashlib.sha256(pdf_bytes).hexdigest(),
     )
     repo.select_resume(application_id, resume.id)
     return resume
@@ -285,13 +289,17 @@ def test_repository_blocks_only_the_active_claim_and_audits_it(tmp_path: Path):
     repo = make_repo(tmp_path)
     application = create_application(repo)
     config = create_provider_config(repo)
+    prompt = load_prompt_template("analyze_jd")
     task = repo.create_ai_task(
         application_id=application.id,
         task_type="analyze_jd",
         provider_config_id=config.id,
-        prompt_template_id="analyze_jd_v1",
+        prompt_template_id=prompt.id,
+        prompt_sha256=prompt.sha256,
         input_artifact_ids=[],
         privacy_mode="local_private",
+        expected_provider_binding=config.availability_binding,
+        expected_provider_binding_sha256=config.availability_binding_sha256,
     )
     claim_token = repo.start_ai_task(task.id)
     assert repo.begin_ai_task_invocation(task.id, claim_token) is True
@@ -332,8 +340,89 @@ def test_enqueue_persists_pending_task_without_running_provider(tmp_path: Path):
     assert repo.get_ai_task(task.id).status == "pending"
     assert task.provider_config_id == config.id
     assert task.prompt_template_id == "analyze_jd_v1"
+    assert task.prompt_sha256 == load_prompt_template("analyze_jd").sha256
     assert task.privacy_mode == PrivacyMode.LOCAL_PRIVATE
     assert provider.calls == 0
+
+
+def test_heartbeat_renewal_exception_fails_closed(tmp_path: Path, monkeypatch):
+    from careerops.ai.orchestrator import AiOrchestrator
+
+    repo = CareerOpsRepository(
+        tmp_path / "careerops.db",
+        tmp_path / "vault",
+        claim_lease_seconds=0.15,
+    )
+    repo.initialize()
+    application = create_application(repo)
+    config = create_provider_config(repo)
+    renewal_failed = Event()
+
+    def raise_renewal_error(_task_id: str, _claim_token: str) -> bool:
+        renewal_failed.set()
+        raise RuntimeError("renewal transport detail secret=do-not-store")
+
+    def wait_for_renewal(_request: Any, _calls: int) -> None:
+        assert renewal_failed.wait(2)
+
+    monkeypatch.setattr(repo, "renew_ai_task_claim", raise_renewal_error)
+    provider = ScriptedProvider(availability(), on_run=wait_for_renewal)
+    orchestrator = AiOrchestrator(repo, {config.id: provider})
+    task = orchestrator.enqueue(application.id, "analyze_jd", config.id)
+
+    result = orchestrator.run(task.id)
+
+    assert result.status == "failed"
+    assert result.error_summary == "provider_error"
+    assert provider.calls == 1
+    assert repo.list_application_versions(application.id) == []
+
+
+def test_run_waits_for_blocked_heartbeat_thread_before_returning(
+    tmp_path: Path, monkeypatch
+):
+    from careerops.ai.orchestrator import AiOrchestrator
+
+    repo = CareerOpsRepository(
+        tmp_path / "careerops.db",
+        tmp_path / "vault",
+        claim_lease_seconds=0.15,
+    )
+    repo.initialize()
+    application = create_application(repo)
+    config = create_provider_config(repo)
+    renewal_entered = Event()
+    release_renewal = Event()
+
+    def blocked_renewal(_task_id: str, _claim_token: str) -> bool:
+        renewal_entered.set()
+        assert release_renewal.wait(5)
+        return True
+
+    def wait_for_heartbeat(_request: Any, _calls: int) -> None:
+        assert renewal_entered.wait(2)
+
+    monkeypatch.setattr(repo, "renew_ai_task_claim", blocked_renewal)
+    provider = ScriptedProvider(availability(), on_run=wait_for_heartbeat)
+    orchestrator = AiOrchestrator(repo, {config.id: provider})
+    task = orchestrator.enqueue(application.id, "analyze_jd", config.id)
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(orchestrator.run, task.id)
+        assert renewal_entered.wait(2)
+        time.sleep(1.4)
+        try:
+            assert future.done() is False
+        finally:
+            release_renewal.set()
+        result = future.result(timeout=3)
+
+    assert result.status == "running"
+    assert repo.list_application_versions(application.id) == []
+    assert not any(
+        thread.name == f"ai-task-heartbeat-{task.id}" and thread.is_alive()
+        for thread in __import__("threading").enumerate()
+    )
 
 
 def test_enqueue_requires_task_prerequisites_and_compatible_egress(tmp_path: Path):
@@ -352,6 +441,42 @@ def test_enqueue_requires_task_prerequisites_and_compatible_egress(tmp_path: Pat
     provider.status = availability()
     with pytest.raises(ValueError, match="resume"):
         orchestrator.enqueue(application.id, "analyze_fit", config.id)
+    assert repo.list_ai_tasks(application.id) == []
+
+
+def test_enqueue_rejects_provider_reregistration_before_atomic_insert(
+    tmp_path: Path, monkeypatch
+):
+    from careerops.ai.orchestrator import AiOrchestrator
+
+    repo = make_repo(tmp_path)
+    application = create_application(repo)
+    original_status = availability(reasoning_effort="medium")
+    config = create_provider_config(repo, binding_status=original_status)
+    provider = AvailabilityOnlyProvider(original_status)
+    orchestrator = AiOrchestrator(repo, {config.id: provider})
+    original_create = repo.create_ai_task
+
+    def reregister_then_create(**values):
+        changed = availability(reasoning_effort="high")
+        repo.upsert_ai_provider_config(
+            provider_kind="mock",
+            display_name="changed runtime",
+            privacy_mode="local_private",
+            endpoint="",
+            identity_name="",
+            model="fixture-v1",
+            enabled=True,
+            availability_binding=provider_binding_values(changed),
+        )
+        return original_create(**values)
+
+    monkeypatch.setattr(repo, "create_ai_task", reregister_then_create)
+
+    with pytest.raises(ValueError, match="changed during enqueue"):
+        orchestrator.enqueue(application.id, "analyze_jd", config.id)
+
+    assert provider.calls == 0
     assert repo.list_ai_tasks(application.id) == []
 
 
@@ -1169,6 +1294,7 @@ def test_analyze_fit_creates_normal_report_with_complete_provenance(tmp_path: Pa
         "provider_model": "fixture-v1",
         "provider_binding": config.availability_binding,
         "provider_binding_sha256": config.availability_binding_sha256,
+        "provider_config_id": config.id,
     }
     assert updated_application.approval_id is None
     assert updated_application.submission_state == "not_submitted"
@@ -1215,6 +1341,37 @@ def test_analyze_jd_preserves_user_corrections_in_provenance_groups(tmp_path: Pa
     assert requirements["raw_ai"]["required_skills"] == ["Python"]
     assert requirements["raw_ai"]["provenance"]["ai_task_id"] == task.id
     assert requirements["uncertainty"]["items"] == []
+
+
+def test_analyze_jd_invalidates_stale_fit_report_atomically(tmp_path: Path):
+    from careerops.ai.orchestrator import AiOrchestrator
+
+    repo = make_repo(tmp_path)
+    application = create_application(repo)
+    resume = select_resume(repo, application.id, "Python developer")
+    report = repo.save_report(
+        application_id=application.id,
+        resume_version_id=resume.id,
+        jd_snapshot_id=application.jd_snapshot_id,
+        fit={"score": 90},
+        risks={"blockers": [], "warnings": []},
+    )
+    config = create_provider_config(repo)
+    provider = ScriptedProvider(availability())
+    orchestrator = AiOrchestrator(repo, {config.id: provider})
+    task = orchestrator.enqueue(application.id, "analyze_jd", config.id)
+
+    completed = orchestrator.run(task.id)
+
+    updated = repo.get_application(application.id)
+    assert completed.status == "completed"
+    assert updated.latest_report_id is None
+    assert updated.status == "needs_resume_update"
+    assert repo.get_report(report.id).id == report.id
+    version = repo.list_application_versions(application.id)[-1]
+    assert version.snapshot["side_effect"]["invalidated_report_id"] == report.id
+    with pytest.raises(ValueError, match="current application report"):
+        repo.approve_application(application.id, report.id, "Reviewed")
 
 
 def test_analyze_jd_cannot_mutate_an_approved_packet(tmp_path: Path):

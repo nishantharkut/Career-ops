@@ -71,6 +71,10 @@ CODEX_IDENTITIES = frozenset({"codex2", "codex"})
 MAX_PERSISTED_JSON_BYTES = 256_000
 MAX_PROVIDER_BINDING_BYTES = 32_768
 MAX_AI_ARTIFACT_BYTES = 16_000_000
+AI_ARTIFACT_TYPES = frozenset(
+    {"context", "raw_output", "validated_output", "draft_text"}
+)
+AI_ARTIFACT_SCHEMA_VERSIONS = frozenset({"1"})
 PROVIDER_BINDING_FIELDS = (
     "provider_kind",
     "model",
@@ -174,6 +178,18 @@ def persisted_json(value: Any) -> tuple[Any, str]:
     return safe_value, serialized
 
 
+def without_provenance(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return {
+            key: without_provenance(inner)
+            for key, inner in value.items()
+            if key != "provenance"
+        }
+    if isinstance(value, (list, tuple)):
+        return [without_provenance(inner) for inner in value]
+    return value
+
+
 def canonical_provider_binding(
     value: Mapping[str, Any],
 ) -> tuple[dict[str, Any], str, str]:
@@ -233,6 +249,7 @@ class CareerOpsRepository:
             "application-versions",
         ):
             (self.vault_path / directory).mkdir(parents=True, exist_ok=True)
+        self.requeue_interrupted_ai_tasks()
 
     def upsert_ai_provider(
         self,
@@ -338,11 +355,24 @@ class CareerOpsRepository:
         task_type: str,
         provider_config_id: str,
         prompt_template_id: str,
+        prompt_sha256: str,
         input_artifact_ids: list[str],
         privacy_mode: str,
+        expected_provider_binding: Mapping[str, Any],
+        expected_provider_binding_sha256: str,
     ) -> AiTask:
         task_type = finite_value(AiTaskType, task_type, "task type")
         privacy_mode = finite_value(PrivacyMode, privacy_mode, "privacy mode")
+        if (
+            not SHA256_PATTERN.fullmatch(prompt_sha256)
+            or prompt_sha256.lower() != prompt_sha256
+        ):
+            raise ValueError("AI prompt SHA-256 was invalid")
+        expected_binding, expected_binding_json, expected_binding_sha = (
+            canonical_provider_binding(expected_provider_binding)
+        )
+        if expected_binding_sha != expected_provider_binding_sha256:
+            raise ValueError("Expected AI provider binding checksum was invalid")
         seen_artifact_ids: set[str] = set()
         for artifact_id in input_artifact_ids:
             if not isinstance(artifact_id, str):
@@ -351,9 +381,9 @@ class CareerOpsRepository:
                 raise ValueError(f"duplicate input artifact ID: {artifact_id}")
             seen_artifact_ids.add(artifact_id)
         task_id = new_id("ait")
-        now = utc_now()
         with self.connection() as connection:
             connection.execute("BEGIN IMMEDIATE")
+            now = utc_now()
             provider = connection.execute(
                 "SELECT * FROM ai_provider_configs WHERE id = ?",
                 (provider_config_id,),
@@ -377,6 +407,12 @@ class CareerOpsRepository:
                 or binding_sha256 != provider["availability_binding_sha256"]
             ):
                 raise ValueError("AI provider configuration binding is invalid")
+            if (
+                binding != expected_binding
+                or binding_json != expected_binding_json
+                or binding_sha256 != expected_binding_sha
+            ):
+                raise ValueError("AI provider configuration changed during enqueue")
             if input_artifact_ids:
                 placeholders = ", ".join("?" for _ in input_artifact_ids)
                 rows = connection.execute(
@@ -411,10 +447,11 @@ class CareerOpsRepository:
                 """
                 INSERT INTO ai_tasks (
                     id, application_id, task_type, provider_config_id,
-                    prompt_template_id, input_artifact_ids_json, status, privacy_mode,
+                    prompt_template_id, prompt_sha256, input_artifact_ids_json,
+                    status, privacy_mode,
                     provider_binding_json, provider_binding_sha256, started_at,
                     completed_at, error_summary, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     task_id,
@@ -422,6 +459,7 @@ class CareerOpsRepository:
                     task_type,
                     provider_config_id,
                     prompt_template_id,
+                    prompt_sha256,
                     json.dumps(input_artifact_ids),
                     "pending",
                     privacy_mode,
@@ -487,13 +525,14 @@ class CareerOpsRepository:
         ]
 
     def claim_ai_task(self, task_id: str) -> str | None:
-        now = utc_now()
-        expires_at = (
-            datetime.fromisoformat(now)
-            + timedelta(seconds=self.claim_lease_seconds)
-        ).isoformat(timespec="microseconds")
         claim_token = secrets.token_urlsafe(32)
         with self.connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            now = utc_now()
+            expires_at = (
+                datetime.fromisoformat(now)
+                + timedelta(seconds=self.claim_lease_seconds)
+            ).isoformat(timespec="microseconds")
             cursor = connection.execute(
                 """
                 UPDATE ai_tasks
@@ -513,9 +552,9 @@ class CareerOpsRepository:
         return claim_token
 
     def begin_ai_task_invocation(self, task_id: str, claim_token: str) -> bool:
-        now = utc_now()
         with self.connection() as connection:
             connection.execute("BEGIN IMMEDIATE")
+            now = utc_now()
             cursor = connection.execute(
                 """
                 UPDATE ai_tasks
@@ -523,6 +562,21 @@ class CareerOpsRepository:
                 WHERE id = ? AND status = 'running' AND claim_token = ?
                   AND invocation_started_at IS NULL
                   AND claim_expires_at > ?
+                  AND length(prompt_sha256) = 64
+                  AND lower(prompt_sha256) = prompt_sha256
+                  AND prompt_sha256 NOT GLOB '*[^0-9a-f]*'
+                  AND provider_binding_sha256 != ''
+                  AND EXISTS (
+                    SELECT 1
+                    FROM ai_provider_configs AS config
+                    WHERE config.id = ai_tasks.provider_config_id
+                      AND config.enabled = 1
+                      AND config.privacy_mode = ai_tasks.privacy_mode
+                      AND config.availability_binding_json
+                          = ai_tasks.provider_binding_json
+                      AND config.availability_binding_sha256
+                          = ai_tasks.provider_binding_sha256
+                  )
                 """,
                 (now, now, task_id, claim_token, now),
             )
@@ -539,12 +593,13 @@ class CareerOpsRepository:
         return False
 
     def renew_ai_task_claim(self, task_id: str, claim_token: str) -> bool:
-        now = utc_now()
-        expires_at = (
-            datetime.fromisoformat(now)
-            + timedelta(seconds=self.claim_lease_seconds)
-        ).isoformat(timespec="microseconds")
         with self.connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            now = utc_now()
+            expires_at = (
+                datetime.fromisoformat(now)
+                + timedelta(seconds=self.claim_lease_seconds)
+            ).isoformat(timespec="microseconds")
             cursor = connection.execute(
                 """
                 UPDATE ai_tasks
@@ -557,9 +612,14 @@ class CareerOpsRepository:
         return cursor.rowcount == 1
 
     def complete_ai_task(self, task_id: str, claim_token: str) -> AiTask:
-        before = self.get_ai_task(task_id)
-        now = utc_now()
         with self.connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            now = utc_now()
+            before = connection.execute(
+                "SELECT * FROM ai_tasks WHERE id = ?", (task_id,)
+            ).fetchone()
+            if before is None:
+                raise KeyError("No AI task with that ID")
             cursor = connection.execute(
                 """
                 UPDATE ai_tasks
@@ -578,16 +638,21 @@ class CareerOpsRepository:
                 "ai_task.completed",
                 "ai_task",
                 task_id,
-                before.__dict__,
+                dict(before),
                 {"status": "completed", "completed_at": now},
             )
         return self.get_ai_task(task_id)
 
     def fail_ai_task(self, task_id: str, claim_token: str, error_summary: str) -> AiTask:
-        before = self.get_ai_task(task_id)
-        now = utc_now()
         safe_error = provider_error_category(error_summary)
         with self.connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            now = utc_now()
+            before = connection.execute(
+                "SELECT * FROM ai_tasks WHERE id = ?", (task_id,)
+            ).fetchone()
+            if before is None:
+                raise KeyError("No AI task with that ID")
             cursor = connection.execute(
                 """
                 UPDATE ai_tasks
@@ -605,7 +670,7 @@ class CareerOpsRepository:
                 "ai_task.failed",
                 "ai_task",
                 task_id,
-                before.__dict__,
+                dict(before),
                 {"status": "failed", "completed_at": now, "error_summary": safe_error},
             )
         return self.get_ai_task(task_id)
@@ -613,10 +678,15 @@ class CareerOpsRepository:
     def block_ai_task(
         self, task_id: str, claim_token: str, error_summary: str
     ) -> AiTask:
-        before = self.get_ai_task(task_id)
-        now = utc_now()
         safe_error = provider_error_category(error_summary)
         with self.connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            now = utc_now()
+            before = connection.execute(
+                "SELECT * FROM ai_tasks WHERE id = ?", (task_id,)
+            ).fetchone()
+            if before is None:
+                raise KeyError("No AI task with that ID")
             cursor = connection.execute(
                 """
                 UPDATE ai_tasks
@@ -635,7 +705,7 @@ class CareerOpsRepository:
                 "ai_task.blocked",
                 "ai_task",
                 task_id,
-                before.__dict__,
+                dict(before),
                 {
                     "status": "blocked",
                     "completed_at": now,
@@ -653,11 +723,8 @@ class CareerOpsRepository:
         error_summary: str,
         expected_jd_snapshot_id: str,
         expected_resume_version_id: str | None,
-        artifacts: Sequence[Mapping[str, Any]],
-        provenance: Mapping[str, Any],
         findings: Sequence[Mapping[str, Any]],
         success_payload: Mapping[str, Any] | None = None,
-        version_side_effect: Mapping[str, Any] | None = None,
     ) -> AiTask:
         if terminal_status not in {
             AiTaskStatus.COMPLETED.value,
@@ -669,12 +736,13 @@ class CareerOpsRepository:
             if terminal_status == AiTaskStatus.COMPLETED.value
             else provider_error_category(error_summary)
         )
-        safe_success, _ = persisted_json(dict(success_payload or {}))
-        persisted_json(dict(version_side_effect or {}))
-        now = utc_now()
+        safe_success, _ = persisted_json(
+            without_provenance(dict(success_payload or {}))
+        )
 
         with self.connection() as connection:
             connection.execute("BEGIN IMMEDIATE")
+            now = utc_now()
             task = connection.execute(
                 "SELECT * FROM ai_tasks WHERE id = ?", (task_id,)
             ).fetchone()
@@ -687,6 +755,36 @@ class CareerOpsRepository:
                 or task["claim_expires_at"] <= now
             ):
                 raise ValueError("AI task claim is not active")
+            provider = connection.execute(
+                "SELECT * FROM ai_provider_configs WHERE id = ?",
+                (task["provider_config_id"],),
+            ).fetchone()
+            if provider is None or not provider["enabled"]:
+                raise ValueError("AI task provider authority is unavailable")
+            if (
+                not SHA256_PATTERN.fullmatch(task["prompt_sha256"])
+                or task["prompt_sha256"].lower() != task["prompt_sha256"]
+            ):
+                raise ValueError("AI task prompt authority is invalid")
+            task_binding, task_binding_json, task_binding_sha256 = (
+                canonical_provider_binding(json.loads(task["provider_binding_json"]))
+            )
+            provider_binding, provider_binding_json, provider_binding_sha256 = (
+                canonical_provider_binding(
+                    json.loads(provider["availability_binding_json"])
+                )
+            )
+            if (
+                task_binding_json != task["provider_binding_json"]
+                or task_binding_sha256 != task["provider_binding_sha256"]
+                or provider_binding_json != provider["availability_binding_json"]
+                or provider_binding_sha256
+                != provider["availability_binding_sha256"]
+                or task_binding != provider_binding
+                or task_binding_sha256 != provider_binding_sha256
+                or task["privacy_mode"] != provider["privacy_mode"]
+            ):
+                raise ValueError("AI task provider authority changed")
             artifact_rows = connection.execute(
                 """
                 SELECT * FROM ai_artifacts
@@ -695,25 +793,8 @@ class CareerOpsRepository:
                 """,
                 (task_id, claim_token),
             ).fetchall()
-            artifacts_by_id = {
-                artifact["id"]: artifact for artifact in artifact_rows
-            }
-            seen_artifact_ids: set[str] = set()
-            for supplied in artifacts:
-                artifact_id = supplied.get("id")
-                if not isinstance(artifact_id, str) or artifact_id in seen_artifact_ids:
-                    raise ValueError("AI task artifact metadata was invalid")
-                seen_artifact_ids.add(artifact_id)
-                artifact = artifacts_by_id.get(artifact_id)
-                if (
-                    artifact is None
-                    or supplied.get("artifact_type") != artifact["artifact_type"]
-                    or supplied.get("sha256") != artifact["sha256"]
-                ):
-                    raise ValueError("AI task artifact is not owned by this attempt")
+            for artifact in artifact_rows:
                 self._validate_artifact_row(artifact)
-            if seen_artifact_ids != set(artifacts_by_id):
-                raise ValueError("AI task artifact list was incomplete")
             safe_artifacts = [
                 {
                     "artifact_type": artifact["artifact_type"],
@@ -728,23 +809,45 @@ class CareerOpsRepository:
             }
             if len(checksums) != len(artifact_rows):
                 raise ValueError("AI task artifact types must be unique per attempt")
-            derived_provenance = dict(provenance)
-            supplied_context = derived_provenance.pop("context_sha256", None)
-            supplied_outputs = derived_provenance.pop("output_checksums", None)
-            expected_context = checksums.get("context", "")
+            required_artifacts = {"context", "raw_output", "validated_output"}
+            if (
+                terminal_status == AiTaskStatus.COMPLETED.value
+                and task["task_type"] == AiTaskType.DRAFT_COVER_LETTER.value
+            ):
+                required_artifacts.add("draft_text")
+            if (
+                terminal_status == AiTaskStatus.BLOCKED.value
+                and safe_error == "invalid_output"
+            ):
+                allowed_artifact_sets = (
+                    {"context"},
+                    {"context", "raw_output"},
+                )
+            else:
+                allowed_artifact_sets = (required_artifacts,)
+            if set(checksums) not in allowed_artifact_sets:
+                raise ValueError("AI task required artifacts were incomplete")
             expected_outputs = {
                 key: checksums[key]
                 for key in ("raw_output", "validated_output")
                 if key in checksums
             }
-            if (
-                supplied_context not in (None, expected_context)
-                or supplied_outputs not in (None, expected_outputs)
-            ):
-                raise ValueError("AI task artifact provenance did not match")
-            derived_provenance["context_sha256"] = expected_context
-            derived_provenance["output_checksums"] = expected_outputs
-            safe_provenance, _ = persisted_json(derived_provenance)
+            safe_provenance, _ = persisted_json(
+                {
+                    "ai_task_id": task["id"],
+                    "context_sha256": checksums["context"],
+                    "output_checksums": expected_outputs,
+                    "privacy_mode": task["privacy_mode"],
+                    "prompt_sha256": task["prompt_sha256"],
+                    "prompt_template_id": task["prompt_template_id"],
+                    "provider_binding": task_binding,
+                    "provider_binding_sha256": task_binding_sha256,
+                    "provider_config_id": provider["id"],
+                    "provider_identity_name": provider["identity_name"],
+                    "provider_kind": provider["provider_kind"],
+                    "provider_model": provider["model"],
+                }
+            )
             application = connection.execute(
                 "SELECT * FROM applications WHERE id = ?",
                 (task["application_id"],),
@@ -862,6 +965,33 @@ class CareerOpsRepository:
                         """,
                         (serialized, expected_jd_snapshot_id),
                     )
+                    invalidated_report_id = application["latest_report_id"]
+                    if invalidated_report_id is not None:
+                        invalidated_status = (
+                            ApplicationStatus.NEEDS_RESUME_UPDATE.value
+                            if application["selected_resume_version_id"] is not None
+                            else ApplicationStatus.DRAFT.value
+                        )
+                        connection.execute(
+                            """
+                            UPDATE applications
+                            SET latest_report_id = NULL, status = ?, updated_at = ?
+                            WHERE id = ?
+                            """,
+                            (invalidated_status, now, application["id"]),
+                        )
+                        self._write_audit(
+                            connection,
+                            "application.report_invalidated_by_jd_analysis",
+                            "application",
+                            application["id"],
+                            {"latest_report_id": invalidated_report_id},
+                            {
+                                "ai_task_id": task_id,
+                                "latest_report_id": None,
+                                "status": invalidated_status,
+                            },
+                        )
                     self._write_audit(
                         connection,
                         "jd_snapshot.ai_requirements_updated",
@@ -878,7 +1008,10 @@ class CareerOpsRepository:
                             "updated_at": now,
                         },
                     )
-                    side_effect = {"jd_snapshot_id": expected_jd_snapshot_id}
+                    side_effect = {
+                        "invalidated_report_id": invalidated_report_id,
+                        "jd_snapshot_id": expected_jd_snapshot_id,
+                    }
                 elif task["task_type"] == AiTaskType.ANALYZE_FIT.value:
                     if expected_resume_version_id is None:
                         raise ValueError("A selected resume is required for this AI task")
@@ -1063,8 +1196,9 @@ class CareerOpsRepository:
         return self.get_ai_task(task_id)
 
     def requeue_interrupted_ai_tasks(self) -> int:
-        now = utc_now()
         with self.connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            now = utc_now()
             cursor = connection.execute(
                 """
                 UPDATE ai_tasks
@@ -1087,38 +1221,47 @@ class CareerOpsRepository:
         sha256: str,
         schema_version: str,
     ) -> AiArtifact:
+        self._validate_ai_artifact_metadata(artifact_type, schema_version)
         if not SHA256_PATTERN.fullmatch(sha256):
             raise ValueError(
                 "Artifact SHA-256 must contain exactly 64 hexadecimal characters"
             )
         normalized_sha256 = sha256.lower()
         artifact_path, actual_sha256 = self._stable_artifact_digest(path)
+        self._require_ai_task_artifact_path(task_id, artifact_path)
         if actual_sha256 != normalized_sha256:
             raise ValueError("Artifact checksum does not match file bytes")
 
         artifact_id = new_id("aia")
-        now = utc_now()
         with self.connection() as connection:
             connection.execute("BEGIN IMMEDIATE")
+            now = utc_now()
             self._require_active_ai_claim(connection, task_id, claim_token)
-            connection.execute(
-                """
-                INSERT INTO ai_artifacts (
-                    id, task_id, claim_token, artifact_type, path, sha256,
-                    schema_version, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    artifact_id,
-                    task_id,
-                    claim_token,
-                    artifact_type,
-                    str(artifact_path),
-                    normalized_sha256,
-                    schema_version,
-                    now,
-                ),
-            )
+            try:
+                connection.execute(
+                    """
+                    INSERT INTO ai_artifacts (
+                        id, task_id, claim_token, artifact_type, path, sha256,
+                        schema_version, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        artifact_id,
+                        task_id,
+                        claim_token,
+                        artifact_type,
+                        str(artifact_path),
+                        normalized_sha256,
+                        schema_version,
+                        now,
+                    ),
+                )
+            except sqlite3.IntegrityError as exc:
+                if "ai_artifacts.path" in str(exc):
+                    raise ValueError(
+                        "AI artifact physical path is already owned"
+                    ) from exc
+                raise
         return self.get_ai_artifact(artifact_id)
 
     def get_ai_artifact(self, artifact_id: str) -> AiArtifact:
@@ -1160,7 +1303,6 @@ class CareerOpsRepository:
         if decision != FindingDecision.PENDING.value:
             raise ValueError("AI findings must start with a pending decision")
         finding_id = new_id("aif")
-        now = utc_now()
         safe_finding, _ = persisted_json(
             {
                 "claim_text": claim_text,
@@ -1172,6 +1314,7 @@ class CareerOpsRepository:
         _safe_payload, payload_json = persisted_json(safe_finding["payload"])
         with self.connection() as connection:
             connection.execute("BEGIN IMMEDIATE")
+            now = utc_now()
             self._require_active_ai_claim(connection, task_id, claim_token)
             connection.execute(
                 """
@@ -1457,9 +1600,9 @@ class CareerOpsRepository:
             raise ValueError("AI task ID and claim token must be provided together")
         safe_snapshot, snapshot_json = persisted_json(snapshot)
         version_id = new_id("appv")
-        now = utc_now()
         with self.connection() as connection:
             connection.execute("BEGIN IMMEDIATE")
+            now = utc_now()
             if ai_task_id is not None and claim_token is not None:
                 self._require_active_ai_claim(connection, ai_task_id, claim_token)
                 owner = connection.execute(
@@ -1532,9 +1675,9 @@ class CareerOpsRepository:
         raw_ai: dict[str, Any],
         uncertainty: dict[str, Any],
     ) -> JobDescriptionSnapshot:
-        now = utc_now()
         with self.connection() as connection:
             connection.execute("BEGIN IMMEDIATE")
+            now = utc_now()
             self._require_active_ai_claim(connection, task_id, claim_token)
             task = connection.execute(
                 "SELECT application_id, task_type FROM ai_tasks WHERE id = ?",
@@ -1590,6 +1733,33 @@ class CareerOpsRepository:
                 """,
                 (serialized, snapshot_id),
             )
+            invalidated_report_id = application["latest_report_id"]
+            if invalidated_report_id is not None:
+                invalidated_status = (
+                    ApplicationStatus.NEEDS_RESUME_UPDATE.value
+                    if application["selected_resume_version_id"] is not None
+                    else ApplicationStatus.DRAFT.value
+                )
+                connection.execute(
+                    """
+                    UPDATE applications
+                    SET latest_report_id = NULL, status = ?, updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (invalidated_status, now, application["id"]),
+                )
+                self._write_audit(
+                    connection,
+                    "application.report_invalidated_by_jd_analysis",
+                    "application",
+                    application["id"],
+                    {"latest_report_id": invalidated_report_id},
+                    {
+                        "ai_task_id": task_id,
+                        "latest_report_id": None,
+                        "status": invalidated_status,
+                    },
+                )
             self._write_audit(
                 connection,
                 "jd_snapshot.ai_requirements_updated",
@@ -1751,9 +1921,32 @@ class CareerOpsRepository:
         parse_status: str,
         page_count: int | None,
     ) -> ResumeVersion:
-        resume = self.get_resume_version(resume_version_id)
-        now = utc_now()
         with self.connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            now = utc_now()
+            resume = connection.execute(
+                "SELECT * FROM resume_versions WHERE id = ?",
+                (resume_version_id,),
+            ).fetchone()
+            if resume is None:
+                raise KeyError("No resume version with that ID")
+            protected = connection.execute(
+                """
+                SELECT 1 FROM applications
+                WHERE selected_resume_version_id = ?
+                  AND (
+                    approval_id IS NOT NULL
+                    OR submission_state != ?
+                    OR submitted_at IS NOT NULL
+                  )
+                LIMIT 1
+                """,
+                (resume_version_id, SubmissionState.NOT_SUBMITTED.value),
+            ).fetchone()
+            if protected is not None:
+                raise ValueError(
+                    "Cannot change a resume selected by an approved or submitted application"
+                )
             connection.execute(
                 """
                 UPDATE resume_versions
@@ -1776,7 +1969,7 @@ class CareerOpsRepository:
                 "resume.render_updated",
                 "resume_version",
                 resume_version_id,
-                resume.__dict__,
+                dict(resume),
                 {
                     "pdf_path": str(pdf_path) if pdf_path else None,
                     "pdf_sha256": pdf_sha256,
@@ -1788,16 +1981,34 @@ class CareerOpsRepository:
         return self.get_resume_version(resume_version_id)
 
     def select_resume(self, application_id: str, resume_version_id: str) -> Application:
-        application = self.get_application(application_id)
-        self.get_resume_version(resume_version_id)
-        status = (
-            ApplicationStatus.NEEDS_RESUME_UPDATE
-            if application.approval_id or application.latest_report_id
-            else application.status
-        )
-        now = utc_now()
-        before = application.__dict__
         with self.connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            now = utc_now()
+            application = connection.execute(
+                "SELECT * FROM applications WHERE id = ?", (application_id,)
+            ).fetchone()
+            resume = connection.execute(
+                "SELECT id FROM resume_versions WHERE id = ?", (resume_version_id,)
+            ).fetchone()
+            if application is None:
+                raise KeyError("No application with that ID")
+            if resume is None:
+                raise KeyError("No resume version with that ID")
+            if (
+                application["submission_state"]
+                != SubmissionState.NOT_SUBMITTED.value
+                or application["submitted_at"] is not None
+            ):
+                raise ValueError(
+                    "Cannot change the selected resume after it was submitted"
+                )
+            if application["selected_resume_version_id"] == resume_version_id:
+                return self._application_from_row(application)
+            status = (
+                ApplicationStatus.NEEDS_RESUME_UPDATE
+                if application["approval_id"] or application["latest_report_id"]
+                else ApplicationStatus(application["status"])
+            )
             connection.execute(
                 """
                 UPDATE applications
@@ -1812,7 +2023,7 @@ class CareerOpsRepository:
                 "application.resume_selected",
                 "application",
                 application_id,
-                before,
+                dict(application),
                 {"selected_resume_version_id": resume_version_id, "status": status.value},
             )
         return self.get_application(application_id)
@@ -1831,7 +2042,6 @@ class CareerOpsRepository:
         if (ai_task_id is None) != (claim_token is None):
             raise ValueError("AI task ID and claim token must be provided together")
         report_id = new_id("rep")
-        now = utc_now()
         blockers = risks.get("blockers", [])
         warnings = risks.get("warnings", [])
         if not isinstance(blockers, list) or not isinstance(warnings, list):
@@ -1845,6 +2055,7 @@ class CareerOpsRepository:
         )
         with self.connection() as connection:
             connection.execute("BEGIN IMMEDIATE")
+            now = utc_now()
             application = connection.execute(
                 "SELECT * FROM applications WHERE id = ?", (application_id,)
             ).fetchone()
@@ -1915,9 +2126,9 @@ class CareerOpsRepository:
         self, application_id: str, report_id: str, note: str
     ) -> Approval:
         approval_id = new_id("apr")
-        now = utc_now()
         with self.connection() as connection:
             connection.execute("BEGIN IMMEDIATE")
+            now = utc_now()
             application, report, resume = self._approval_packet_rows(
                 connection, application_id, report_id
             )
@@ -1966,9 +2177,9 @@ class CareerOpsRepository:
         return self.get_approval(approval_id)
 
     def mark_submitted_manual(self, application_id: str, note: str) -> Application:
-        now = utc_now()
         with self.connection() as connection:
             connection.execute("BEGIN IMMEDIATE")
+            now = utc_now()
             application = self._submission_packet_row(connection, application_id)
             connection.execute(
                 """
@@ -2039,6 +2250,7 @@ class CareerOpsRepository:
             raise ValueError("Selected JD differs from report JD")
         if not resume["pdf_sha256"]:
             raise ValueError("Selected resume has no PDF checksum")
+        self._verify_resume_pdf_row(resume)
         if (
             application["approval_id"] is not None
             or application["submission_state"] != SubmissionState.NOT_SUBMITTED.value
@@ -2085,7 +2297,26 @@ class CareerOpsRepository:
             or report["jd_snapshot_id"] != application["jd_snapshot_id"]
         ):
             raise ValueError("Approved application packet changed before submission")
+        self._verify_resume_pdf_row(resume)
         return application
+
+    def _verify_resume_pdf_row(self, resume: sqlite3.Row) -> None:
+        pdf_path = resume["pdf_path"]
+        expected_sha256 = resume["pdf_sha256"]
+        if (
+            not pdf_path
+            or not expected_sha256
+            or not SHA256_PATTERN.fullmatch(expected_sha256)
+        ):
+            raise ValueError("Selected resume PDF integrity verification failed")
+        try:
+            _path, actual_sha256 = self._stable_artifact_digest(Path(pdf_path))
+        except (FileNotFoundError, OSError, ValueError) as exc:
+            raise ValueError(
+                "Selected resume PDF integrity verification failed"
+            ) from exc
+        if actual_sha256 != expected_sha256.lower():
+            raise ValueError("Selected resume PDF integrity verification failed")
 
     def get_application(self, application_id: str) -> Application:
         row = self._one("SELECT * FROM applications WHERE id = ?", (application_id,))
@@ -2205,13 +2436,14 @@ class CareerOpsRepository:
             raise ValueError("Artifact path must be a single-link regular file")
         if path_stat.st_size > MAX_AI_ARTIFACT_BYTES:
             raise ValueError("Artifact file exceeded its size limit")
+        canonical_path = Path(os.path.realpath(artifact_path))
 
         flags = (
             os.O_RDONLY
             | getattr(os, "O_BINARY", 0)
             | getattr(os, "O_NOFOLLOW", 0)
         )
-        descriptor = os.open(artifact_path, flags)
+        descriptor = os.open(canonical_path, flags)
         try:
             opened = os.fstat(descriptor)
             identity = (
@@ -2251,7 +2483,7 @@ class CareerOpsRepository:
         finally:
             os.close(descriptor)
         try:
-            after_path = artifact_path.lstat()
+            after_path = canonical_path.lstat()
         except FileNotFoundError as exc:
             raise ValueError("Artifact file identity changed while hashing") from exc
         final_identity = (
@@ -2270,9 +2502,12 @@ class CareerOpsRepository:
         )
         if final_identity != identity or final_path_identity != identity:
             raise ValueError("Artifact file identity changed while hashing")
-        return artifact_path, digest.hexdigest()
+        return canonical_path, digest.hexdigest()
 
     def _validate_artifact_row(self, row: sqlite3.Row) -> None:
+        self._validate_ai_artifact_metadata(
+            row["artifact_type"], row["schema_version"]
+        )
         try:
             artifact_path, actual_sha256 = self._stable_artifact_digest(
                 Path(row["path"])
@@ -2281,6 +2516,35 @@ class CareerOpsRepository:
             raise ValueError("AI artifact integrity verification failed") from exc
         if str(artifact_path) != row["path"] or actual_sha256 != row["sha256"]:
             raise ValueError("AI artifact integrity verification failed")
+        self._require_ai_task_artifact_path(row["task_id"], artifact_path)
+
+    @staticmethod
+    def _validate_ai_artifact_metadata(
+        artifact_type: str, schema_version: str
+    ) -> None:
+        if (
+            artifact_type not in AI_ARTIFACT_TYPES
+            or schema_version not in AI_ARTIFACT_SCHEMA_VERSIONS
+        ):
+            raise ValueError("AI artifact metadata was invalid")
+
+    def _require_ai_task_artifact_path(
+        self, task_id: str, artifact_path: Path
+    ) -> None:
+        vault_root = Path(os.path.abspath(self.vault_path))
+        try:
+            relative = artifact_path.relative_to(vault_root)
+        except ValueError as exc:
+            raise ValueError("AI artifact path must be under its task attempt") from exc
+        parts = relative.parts
+        if (
+            len(parts) < 4
+            or parts[0] != "ai-tasks"
+            or parts[1] != task_id
+            or not parts[2].startswith("attempt-")
+            or len(parts[2]) == len("attempt-")
+        ):
+            raise ValueError("AI artifact path must be under its task attempt")
 
     def _require_active_ai_claim(
         self,
@@ -2429,6 +2693,7 @@ class CareerOpsRepository:
             task_type=AiTaskType(row["task_type"]),
             provider_config_id=row["provider_config_id"],
             prompt_template_id=row["prompt_template_id"],
+            prompt_sha256=row["prompt_sha256"],
             input_artifact_ids=input_artifact_ids,
             status=AiTaskStatus(row["status"]),
             privacy_mode=PrivacyMode(row["privacy_mode"]),

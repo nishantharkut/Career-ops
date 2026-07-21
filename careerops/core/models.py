@@ -128,6 +128,7 @@ class AiTask:
     task_type: AiTaskType
     provider_config_id: str
     prompt_template_id: str
+    prompt_sha256: str
     input_artifact_ids: list[str]
     status: AiTaskStatus
     privacy_mode: PrivacyMode

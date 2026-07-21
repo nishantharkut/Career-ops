@@ -1,3 +1,4 @@
+import hashlib
 from pathlib import Path
 
 from careerops.core.repository import CareerOpsRepository
@@ -62,12 +63,15 @@ def test_selecting_new_resume_invalidates_existing_approval(tmp_path: Path):
         source_url="https://example.com/google",
         jd_text="C++ systems internship.",
     )
+    first_pdf = repo.vault_path / "resumes" / "google.pdf"
+    first_pdf.write_bytes(b"%PDF-1.4\ngoogle")
     first_resume = repo.create_resume_version(
         name="Google resume",
         role_family="software",
         tex_path=tmp_path / "google.tex",
         tex_sha256="b" * 64,
-        pdf_sha256="c" * 64,
+        pdf_path=first_pdf,
+        pdf_sha256=hashlib.sha256(first_pdf.read_bytes()).hexdigest(),
     )
     second_resume = repo.create_resume_version(
         name="Systems resume",

@@ -20,6 +20,7 @@ from typing import Any
 import careerops.ai.contracts as ai_contracts
 import careerops.ai.providers.codex as codex_provider_module
 import careerops.ai.providers.ollama as ollama_provider_module
+from careerops.ai.context import load_prompt_template
 from pydantic import ValidationError
 import pytest
 
@@ -1882,13 +1883,17 @@ def test_provider_result_privacy_enum_persists_to_provider_and_task(
         enabled=True,
         availability_binding=provider_binding_from_result(result),
     )
+    prompt = load_prompt_template("analyze_fit")
     task = repo.create_ai_task(
         application_id=application.id,
         task_type="analyze_fit",
         provider_config_id=config.id,
-        prompt_template_id="analyze_fit_v1",
+        prompt_template_id=prompt.id,
+        prompt_sha256=prompt.sha256,
         input_artifact_ids=[],
         privacy_mode=result.privacy_mode,
+        expected_provider_binding=config.availability_binding,
+        expected_provider_binding_sha256=config.availability_binding_sha256,
     )
 
     assert repo.get_ai_provider(config.id).privacy_mode is expected_privacy
@@ -2654,13 +2659,17 @@ def test_hardened_codex_result_privacy_persists_to_repository(tmp_path: Path):
         enabled=True,
         availability_binding=provider_binding_from_result(result),
     )
+    prompt = load_prompt_template("analyze_fit")
     task = repo.create_ai_task(
         application_id=application.id,
         task_type="analyze_fit",
         provider_config_id=config.id,
-        prompt_template_id="analyze_fit_v1",
+        prompt_template_id=prompt.id,
+        prompt_sha256=prompt.sha256,
         input_artifact_ids=[],
         privacy_mode=result.privacy_mode,
+        expected_provider_binding=config.availability_binding,
+        expected_provider_binding_sha256=config.availability_binding_sha256,
     )
 
     assert repo.get_ai_provider(config.id).privacy_mode is PrivacyMode.CLOUD_EXTERNAL

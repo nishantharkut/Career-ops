@@ -1,5 +1,6 @@
 from collections.abc import Callable
 import json
+import os
 import sqlite3
 
 
@@ -57,6 +58,7 @@ def _add_ai_evidence_and_version_tables(connection: sqlite3.Connection) -> None:
             ),
             provider_config_id TEXT NOT NULL REFERENCES ai_provider_configs(id),
             prompt_template_id TEXT NOT NULL,
+            prompt_sha256 TEXT NOT NULL DEFAULT '',
             input_artifact_ids_json TEXT NOT NULL,
             status TEXT NOT NULL CHECK (
                 status IN ('pending', 'running', 'completed', 'blocked', 'failed')
@@ -523,6 +525,7 @@ def _repair_ai_orchestration_migrations(connection: sqlite3.Connection) -> None:
 
 
 def _add_provider_availability_bindings(connection: sqlite3.Connection) -> None:
+    connection.execute("DROP TRIGGER IF EXISTS validate_ai_task_authority_immutable")
     provider_columns = _column_names(connection, "ai_provider_configs")
     if "availability_binding_json" not in provider_columns:
         connection.execute(
@@ -668,6 +671,79 @@ def _add_provider_availability_bindings(connection: sqlite3.Connection) -> None:
         )
 
 
+def _add_ai_prompt_and_artifact_authority(connection: sqlite3.Connection) -> None:
+    if "prompt_sha256" not in _column_names(connection, "ai_tasks"):
+        connection.execute(
+            "ALTER TABLE ai_tasks ADD COLUMN prompt_sha256 TEXT NOT NULL DEFAULT ''"
+        )
+
+    path_expression = "path COLLATE NOCASE" if os.name == "nt" else "path"
+    connection.execute(
+        f"""
+        UPDATE ai_artifacts
+        SET path = path || '.quarantined-' || id || '-' || rowid
+        WHERE rowid NOT IN (
+            SELECT MIN(rowid)
+            FROM ai_artifacts
+            GROUP BY {path_expression}
+        )
+        """
+    )
+    connection.execute("DROP INDEX IF EXISTS idx_ai_artifacts_unique_path")
+    index_expression = "path COLLATE NOCASE" if os.name == "nt" else "path"
+    connection.execute(
+        "CREATE UNIQUE INDEX idx_ai_artifacts_unique_path "
+        f"ON ai_artifacts({index_expression})"
+    )
+
+    for operation in ("INSERT", "UPDATE"):
+        connection.execute(
+            f"DROP TRIGGER IF EXISTS validate_ai_artifact_metadata_{operation.lower()}"
+        )
+        connection.execute(
+            f"""
+            CREATE TRIGGER validate_ai_artifact_metadata_{operation.lower()}
+            BEFORE {operation} ON ai_artifacts
+            WHEN NEW.artifact_type NOT IN (
+                'context', 'raw_output', 'validated_output', 'draft_text'
+            ) OR NEW.schema_version != '1'
+            BEGIN
+                SELECT RAISE(ABORT, 'invalid AI artifact metadata');
+            END
+            """
+        )
+
+    connection.execute("DROP TRIGGER IF EXISTS validate_ai_task_authority_insert")
+    connection.execute(
+        """
+        CREATE TRIGGER validate_ai_task_authority_insert
+        BEFORE INSERT ON ai_tasks
+        WHEN length(NEW.prompt_sha256) != 64
+          OR lower(NEW.prompt_sha256) != NEW.prompt_sha256
+          OR NEW.prompt_sha256 GLOB '*[^0-9a-f]*'
+        BEGIN
+            SELECT RAISE(ABORT, 'invalid AI task prompt authority');
+        END
+        """
+    )
+    connection.execute("DROP TRIGGER IF EXISTS validate_ai_task_authority_immutable")
+    connection.execute(
+        """
+        CREATE TRIGGER validate_ai_task_authority_immutable
+        BEFORE UPDATE ON ai_tasks
+        WHEN NEW.provider_config_id != OLD.provider_config_id
+          OR NEW.prompt_template_id != OLD.prompt_template_id
+          OR NEW.prompt_sha256 != OLD.prompt_sha256
+          OR NEW.privacy_mode != OLD.privacy_mode
+          OR NEW.provider_binding_json != OLD.provider_binding_json
+          OR NEW.provider_binding_sha256 != OLD.provider_binding_sha256
+        BEGIN
+            SELECT RAISE(ABORT, 'AI task authority is immutable');
+        END
+        """
+    )
+
+
 MIGRATIONS: tuple[tuple[int, Migration], ...] = (
     (1, _add_application_role_type),
     (2, _add_application_submitted_at),
@@ -682,6 +758,7 @@ MIGRATIONS: tuple[tuple[int, Migration], ...] = (
     (11, _add_provider_identity),
     (12, _repair_ai_orchestration_migrations),
     (13, _add_provider_availability_bindings),
+    (14, _add_ai_prompt_and_artifact_authority),
 )
 
 LATEST_SCHEMA_VERSION = MIGRATIONS[-1][0]

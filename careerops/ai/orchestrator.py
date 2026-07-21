@@ -95,6 +95,9 @@ class AiOrchestrator:
         availability = provider.availability()
         if not self._availability_matches(config, availability):
             raise ValueError("AI provider metadata does not match its configuration")
+        checked_binding, _binding_json, checked_binding_sha256 = (
+            canonical_provider_binding(self._availability_binding(availability))
+        )
 
         application = self._repository.get_application(application_id)
         template = load_prompt_template(task_type)
@@ -104,8 +107,11 @@ class AiOrchestrator:
             task_type=task_type,
             provider_config_id=config.id,
             prompt_template_id=template.id,
+            prompt_sha256=template.sha256,
             input_artifact_ids=list(input_artifact_ids),
             privacy_mode=config.privacy_mode.value,
+            expected_provider_binding=checked_binding,
+            expected_provider_binding_sha256=checked_binding_sha256,
         )
 
     def run(self, task_id: str) -> AiTask:
@@ -113,8 +119,10 @@ class AiOrchestrator:
         if claim_token is None:
             return self._repository.get_ai_task(task_id)
 
-        heartbeat_stop, heartbeat = self._start_claim_heartbeat(
-            task_id, claim_token
+        heartbeat_stop, heartbeat, heartbeat_errors, heartbeat_lost = (
+            self._start_claim_heartbeat(
+                task_id, claim_token
+            )
         )
         artifacts: list[AiArtifact] = []
         findings: list[dict[str, Any]] = []
@@ -142,7 +150,10 @@ class AiOrchestrator:
                 )
 
             template = load_prompt_template(task.task_type.value)
-            if template.id != task.prompt_template_id:
+            if (
+                template.id != task.prompt_template_id
+                or template.sha256 != task.prompt_sha256
+            ):
                 raise RuntimeError("AI prompt template did not match the task")
             context = self._build_context(task.application_id, task.task_type.value)
             expected_jd_snapshot_id, expected_resume_version_id = (
@@ -177,15 +188,25 @@ class AiOrchestrator:
                     )
                 result = provider.run(request)
             except ProviderOutputError:
+                self._finish_claim_heartbeat(
+                    heartbeat_stop,
+                    heartbeat,
+                    heartbeat_errors,
+                    heartbeat_lost,
+                )
                 return self._block_invalid_output(
                     task,
                     claim_token,
-                    config,
-                    availability,
                     expected_jd_snapshot_id,
                     expected_resume_version_id,
-                    artifacts,
                 )
+
+            self._finish_claim_heartbeat(
+                heartbeat_stop,
+                heartbeat,
+                heartbeat_errors,
+                heartbeat_lost,
+            )
 
             self._validate_result_metadata(config, availability, result)
             raw_bytes = self._provider_raw_bytes(result)
@@ -226,13 +247,10 @@ class AiOrchestrator:
 
             target_status = "completed" if verification.safe else "blocked"
             success_payload: dict[str, Any] = {}
-            version_side_effect: dict[str, Any] = {}
             if verification.safe and verification.output is not None:
-                success_payload, version_side_effect = self._prepare_success_effect(
+                success_payload = self._prepare_success_effect(
                     task,
                     claim_token,
-                    config,
-                    availability,
                     request.task_dir,
                     verification.output,
                     artifacts,
@@ -242,14 +260,10 @@ class AiOrchestrator:
                 task,
                 claim_token,
                 target_status,
-                config,
-                availability,
                 expected_jd_snapshot_id,
                 expected_resume_version_id,
-                artifacts,
                 findings,
                 success_payload,
-                version_side_effect,
                 "" if verification.safe else (
                     "invalid_output"
                     if verification.output is None
@@ -266,20 +280,27 @@ class AiOrchestrator:
             return self._fail_or_return_current(task_id, claim_token, "provider_error")
         finally:
             heartbeat_stop.set()
-            heartbeat.join(
-                timeout=max(
-                    1.0, self._repository.claim_heartbeat_interval * 2
-                )
-            )
+            heartbeat.join()
 
     def _start_claim_heartbeat(
         self, task_id: str, claim_token: str
-    ) -> tuple[Event, Thread]:
+    ) -> tuple[Event, Thread, list[BaseException], Event]:
         stop = Event()
+        errors: list[BaseException] = []
+        lost = Event()
 
         def renew() -> None:
             while not stop.wait(self._repository.claim_heartbeat_interval):
-                if not self._repository.renew_ai_task_claim(task_id, claim_token):
+                try:
+                    renewed = self._repository.renew_ai_task_claim(
+                        task_id, claim_token
+                    )
+                except BaseException as exc:
+                    errors.append(exc)
+                    lost.set()
+                    return
+                if not renewed:
+                    lost.set()
                     return
 
         heartbeat = Thread(
@@ -288,7 +309,19 @@ class AiOrchestrator:
             daemon=True,
         )
         heartbeat.start()
-        return stop, heartbeat
+        return stop, heartbeat, errors, lost
+
+    @staticmethod
+    def _finish_claim_heartbeat(
+        stop: Event,
+        heartbeat: Thread,
+        errors: Sequence[BaseException],
+        lost: Event,
+    ) -> None:
+        stop.set()
+        heartbeat.join()
+        if heartbeat.is_alive() or errors or lost.is_set():
+            raise RuntimeError("AI task claim heartbeat failed")
 
     @staticmethod
     def _availability_matches(
@@ -453,7 +486,10 @@ class AiOrchestrator:
         attempt_dir: Path,
     ) -> ProviderRequest:
         template = load_prompt_template(task.task_type.value)
-        if hashlib.sha256(prompt_bytes).hexdigest() != template.sha256:
+        if (
+            hashlib.sha256(prompt_bytes).hexdigest() != template.sha256
+            or template.sha256 != task.prompt_sha256
+        ):
             raise ValueError("AI prompt checksum did not match")
         schema_bytes = self._canonical_json_bytes(
             output_schema_for_task(task.task_type.value)
@@ -587,11 +623,8 @@ class AiOrchestrator:
         self,
         task: AiTask,
         claim_token: str,
-        config: AiProviderConfig,
-        availability: ProviderAvailability,
         expected_jd_snapshot_id: str,
         expected_resume_version_id: str | None,
-        artifacts: list[AiArtifact],
     ) -> AiTask:
         finding = self._verifier_finding_spec(
             VerifierFinding(
@@ -605,13 +638,9 @@ class AiOrchestrator:
             task,
             claim_token,
             "blocked",
-            config,
-            availability,
             expected_jd_snapshot_id,
             expected_resume_version_id,
-            artifacts,
             [finding],
-            {},
             {},
             "invalid_output",
         )
@@ -621,24 +650,12 @@ class AiOrchestrator:
         task: AiTask,
         claim_token: str,
         status: str,
-        config: AiProviderConfig,
-        availability: ProviderAvailability,
         expected_jd_snapshot_id: str,
         expected_resume_version_id: str | None,
-        artifacts: Sequence[AiArtifact],
         findings: Sequence[Mapping[str, Any]],
         success_payload: Mapping[str, Any],
-        version_side_effect: Mapping[str, Any],
         error_summary: str,
     ) -> AiTask:
-        artifact_values = [
-            {
-                "artifact_type": item.artifact_type,
-                "id": item.id,
-                "sha256": item.sha256,
-            }
-            for item in artifacts
-        ]
         return self._repository.finalize_ai_task_attempt(
             task_id=task.id,
             claim_token=claim_token,
@@ -646,92 +663,49 @@ class AiOrchestrator:
             error_summary=error_summary,
             expected_jd_snapshot_id=expected_jd_snapshot_id,
             expected_resume_version_id=expected_resume_version_id,
-            artifacts=artifact_values,
-            provenance=self._provenance(task, config, availability, artifacts),
             findings=findings,
             success_payload=success_payload,
-            version_side_effect=version_side_effect,
         )
-
-    def _provenance(
-        self,
-        task: AiTask,
-        config: AiProviderConfig,
-        availability: ProviderAvailability,
-        artifacts: Sequence[AiArtifact],
-    ) -> dict[str, Any]:
-        checksums = {item.artifact_type: item.sha256 for item in artifacts}
-        template = load_prompt_template(task.task_type.value)
-        return {
-            "ai_task_id": task.id,
-            "context_sha256": checksums.get("context", ""),
-            "output_checksums": {
-                key: checksums[key]
-                for key in ("raw_output", "validated_output")
-                if key in checksums
-            },
-            "privacy_mode": config.privacy_mode.value,
-            "prompt_sha256": template.sha256,
-            "prompt_template_id": template.id,
-            "provider_kind": availability.provider_kind,
-            "provider_identity_name": availability.identity_name,
-            "provider_model": availability.model,
-            "provider_binding": config.availability_binding,
-            "provider_binding_sha256": config.availability_binding_sha256,
-        }
 
     def _prepare_success_effect(
         self,
         task: AiTask,
         claim_token: str,
-        config: AiProviderConfig,
-        availability: ProviderAvailability,
         attempt_dir: Path,
         output: TaskOutput,
         artifacts: list[AiArtifact],
         findings: list[dict[str, Any]],
-    ) -> tuple[dict[str, Any], dict[str, Any]]:
-        provenance = self._provenance(task, config, availability, artifacts)
+    ) -> dict[str, Any]:
         if isinstance(output, AnalyzeJdOutput):
             raw_ai = {
                 "normalized_company": output.normalized_company,
                 "normalized_location": output.normalized_location,
                 "normalized_title": output.normalized_title,
                 "preferred_skills": list(output.preferred_skills),
-                "provenance": provenance,
                 "required_skills": list(output.required_skills),
                 "responsibilities": list(output.responsibilities),
                 "keywords": list(output.keywords),
             }
-            return (
-                {
-                    "raw_ai": raw_ai,
-                    "uncertainty": {
-                        "items": list(output.uncertainties),
-                        "provenance": provenance,
-                    },
+            return {
+                "raw_ai": raw_ai,
+                "uncertainty": {
+                    "items": list(output.uncertainties),
                 },
-                {},
-            )
+            }
 
         if isinstance(output, AnalyzeFitOutput):
-            return (
-                {
-                    "fit": {
-                        "gaps": list(output.gaps),
-                        "matches": list(output.matches),
-                        "provenance": provenance,
-                        "recommendations": list(output.recommendations),
-                        "score": output.score,
-                    },
-                    "risks": {
-                        "blockers": [],
-                        "provenance": provenance,
-                        "warnings": list(output.risks),
-                    },
+            return {
+                "fit": {
+                    "gaps": list(output.gaps),
+                    "matches": list(output.matches),
+                    "recommendations": list(output.recommendations),
+                    "score": output.score,
                 },
-                {},
-            )
+                "risks": {
+                    "blockers": [],
+                    "warnings": list(output.risks),
+                },
+            }
 
         if isinstance(output, ResumeEditsOutput):
             for index, suggestion in enumerate(output.suggestions):
@@ -751,7 +725,7 @@ class AiOrchestrator:
                         },
                     }
                 )
-            return {}, {}
+            return {}
 
         if isinstance(output, CoverLetterOutput):
             draft_bytes = output.plain_text.encode("utf-8")
@@ -766,10 +740,7 @@ class AiOrchestrator:
                 "1",
             )
             artifacts.append(draft)
-            return {}, {
-                "draft_text_artifact_id": draft.id,
-                "draft_text_sha256": draft.sha256,
-            }
+            return {}
 
         if isinstance(output, ClaimReviewOutput):
             states = {
@@ -796,7 +767,7 @@ class AiOrchestrator:
                         },
                     }
                 )
-            return {}, {}
+            return {}
 
         raise ValueError("AI task output did not match its task type")
 
