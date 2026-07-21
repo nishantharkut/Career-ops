@@ -10,13 +10,15 @@ import secrets
 import unicodedata
 from threading import Lock
 from types import MappingProxyType
-from typing import Any, Iterable, Mapping, NoReturn
+from typing import Any, Iterable, Mapping, NoReturn, Sequence
+from urllib.parse import urlsplit, urlunsplit
 
 from careerops.ai.contracts import (
     ALLOWED_TASK_TYPES,
     TaskType,
     output_schema_for_task,
 )
+from careerops.gates.risk import SECRET_PATTERN
 
 
 MAX_SOURCE_CHARACTERS = 80_000
@@ -45,6 +47,7 @@ VERIFICATION_STATES = frozenset(
 PRIVACY_LEVELS = frozenset({"public", "private", "sensitive"})
 
 _IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+_URL_PATTERN = re.compile(r"(?i)https?://[^\s<>\"']+")
 _PROMPT_PATHS: dict[str, str] = {
     "analyze_jd": "analyze_jd_v1.txt",
     "analyze_fit": "analyze_fit_v1.txt",
@@ -257,6 +260,39 @@ def _source_string(value: Any, *, allow_empty: bool = False) -> str:
     return value
 
 
+def _sanitize_url(match: re.Match[str]) -> str:
+    raw = match.group(0)
+    suffix = ""
+    while raw and raw[-1] in ".,);]}":
+        suffix = raw[-1] + suffix
+        raw = raw[:-1]
+    try:
+        parsed = urlsplit(raw)
+        netloc = parsed.netloc.rsplit("@", 1)[-1]
+        sanitized = urlunsplit((parsed.scheme, netloc, parsed.path, "", ""))
+    except ValueError:
+        sanitized = "[redacted url]"
+    return sanitized + suffix
+
+
+def _provider_text(
+    value: str,
+    restricted_material: Sequence[str],
+) -> str:
+    text = unicodedata.normalize("NFKC", value)
+    for restricted in sorted(set(restricted_material), key=len, reverse=True):
+        normalized = unicodedata.normalize("NFKC", restricted)
+        if normalized:
+            text = re.sub(
+                re.escape(normalized),
+                "[redacted restricted material]",
+                text,
+                flags=re.IGNORECASE,
+            )
+    text = _URL_PATTERN.sub(_sanitize_url, text)
+    return SECRET_PATTERN.sub("[redacted credential]", text)
+
+
 def _identifier(value: Any) -> str:
     value = _source_string(value)
     if not _IDENTIFIER.fullmatch(value):
@@ -264,24 +300,34 @@ def _identifier(value: Any) -> str:
     return value
 
 
-def _job_description(value: Any) -> dict[str, str]:
+def _job_description(
+    value: Any,
+    restricted_material: Sequence[str] = (),
+) -> dict[str, str]:
     item = _mapping(value)
     if item is None:
         raise ContextBuildError("Context input was invalid")
     return {
         "snapshot_id": _identifier(item.get("snapshot_id")),
-        "text": _source_string(item.get("text"), allow_empty=True),
+        "text": _provider_text(
+            _source_string(item.get("text"), allow_empty=True), restricted_material
+        ),
     }
 
 
-def _resume(value: Any) -> dict[str, str]:
+def _resume(value: Any, restricted_material: Sequence[str] = ()) -> dict[str, str]:
     item = _mapping(value)
     if item is None:
         raise ContextBuildError("Context input was invalid")
     return {
         "version_id": _identifier(item.get("version_id")),
-        "source_kind": _source_string(item.get("source_kind", "latex")),
-        "source_text": _source_string(item.get("source_text"), allow_empty=True),
+        "source_kind": _provider_text(
+            _source_string(item.get("source_kind", "latex")), restricted_material
+        ),
+        "source_text": _provider_text(
+            _source_string(item.get("source_text"), allow_empty=True),
+            restricted_material,
+        ),
     }
 
 
@@ -426,7 +472,45 @@ def _rejected_claims(values: Iterable[Any]) -> list[dict[str, str]]:
     )
 
 
-def _preferences(values: Mapping[str, Any]) -> dict[str, str]:
+def _restricted_material(
+    facts: Sequence[Mapping[str, str]],
+    evidence: Sequence[Mapping[str, str]],
+    rejected: Sequence[Mapping[str, str]],
+) -> tuple[str, ...]:
+    values = [
+        fact["value"]
+        for fact in facts
+        if fact["privacy_level"] != "public"
+        or fact["verification_state"] in {"rejected", "private_do_not_publish"}
+    ]
+    values.extend(
+        item["summary"]
+        for item in evidence
+        if item["privacy_level"] != "public"
+        or item["verification_state"] in {"rejected", "private_do_not_publish"}
+    )
+    values.extend(item[field] for item in rejected for field in ("text", "reason"))
+    return tuple(value for value in values if value)
+
+
+def _provider_records(
+    records: Sequence[Mapping[str, str]],
+    restricted_material: Sequence[str],
+    *fields: str,
+) -> list[dict[str, str]]:
+    result: list[dict[str, str]] = []
+    for source in records:
+        item = dict(source)
+        for field in fields:
+            item[field] = _provider_text(item[field], restricted_material)
+        result.append(item)
+    return result
+
+
+def _preferences(
+    values: Mapping[str, Any],
+    restricted_material: Sequence[str] = (),
+) -> dict[str, str]:
     if not isinstance(values, Mapping):
         raise ContextBuildError("Context input was invalid")
     result: dict[str, str] = {}
@@ -435,7 +519,9 @@ def _preferences(values: Mapping[str, Any]) -> dict[str, str]:
         normalized_key = _source_string(key)
         if not _IDENTIFIER.fullmatch(normalized_key):
             raise ContextBuildError("Context input was invalid")
-        result[normalized_key] = _source_string(values[key], allow_empty=True)
+        result[normalized_key] = _provider_text(
+            _source_string(values[key], allow_empty=True), restricted_material
+        )
     return result
 
 
@@ -476,6 +562,9 @@ class ContextPacketBuilder:
             normalization_failed = False
         if normalization_failed:
             raise ContextBuildError("Context input was invalid")
+        restricted_material = _restricted_material(
+            all_facts, all_evidence, all_rejected
+        )
         packet: dict[str, Any] = {
             "context_version": CONTEXT_VERSION,
             "task_type": task_type,
@@ -490,34 +579,43 @@ class ContextPacketBuilder:
 
         try:
             if task_type == "review_claims":
-                packet["confirmed_profile_facts"] = _review_profile_facts(fact_values)
-                packet["linked_evidence"] = _evidence(
-                    evidence_values, include_all_states=False
+                packet["confirmed_profile_facts"] = _provider_records(
+                    _review_profile_facts(fact_values), restricted_material, "value"
+                )
+                packet["linked_evidence"] = _provider_records(
+                    _evidence(evidence_values, include_all_states=False),
+                    restricted_material,
+                    "summary",
                 )
                 packet["rejected_claims"] = []
             else:
                 if job_description is None:
                     raise ContextBuildError("Selected job description is required")
-                packet["job_description"] = _job_description(job_description)
+                packet["job_description"] = _job_description(
+                    job_description, restricted_material
+                )
 
             if task_type not in {"analyze_jd", "review_claims"}:
                 if resume is None:
                     raise ContextBuildError("Selected resume is required")
-                packet["selected_resume"] = _resume(resume)
-                packet["confirmed_profile_facts"] = _profile_facts(
-                    fact_values, include_all_states=False
+                packet["selected_resume"] = _resume(resume, restricted_material)
+                packet["confirmed_profile_facts"] = _provider_records(
+                    _profile_facts(fact_values, include_all_states=False),
+                    restricted_material,
+                    "value",
                 )
-                packet["linked_evidence"] = _evidence(
-                    evidence_values, include_all_states=False
+                packet["linked_evidence"] = _provider_records(
+                    _evidence(evidence_values, include_all_states=False),
+                    restricted_material,
+                    "summary",
                 )
                 packet["rejected_claims"] = []
 
             if task_type in {"suggest_resume_edits", "draft_cover_letter"}:
                 packet["writing_preferences"] = _preferences(
-                    writing_preferences if writing_preferences is not None else {}
+                    writing_preferences if writing_preferences is not None else {},
+                    restricted_material,
                 )
-        except ContextBuildError:
-            raise
         except Exception:
             failed = True
         else:
@@ -663,22 +761,41 @@ def validate_context_packet(
     verification_facts = verification["confirmed_profile_facts"]
     verification_evidence = verification["linked_evidence"]
     verification_rejected = verification["rejected_claims"]
+    restricted_material = _restricted_material(
+        verification_facts, verification_evidence, verification_rejected
+    )
     if expected_task_type == "analyze_jd":
         if verification_facts or verification_evidence:
             return None
     elif expected_task_type == "review_claims":
         if (
             payload["confirmed_profile_facts"]
-            != _review_profile_facts(verification_facts)
+            != _provider_records(
+                _review_profile_facts(verification_facts),
+                restricted_material,
+                "value",
+            )
             or payload["linked_evidence"]
-            != _evidence(verification_evidence, include_all_states=False)
+            != _provider_records(
+                _evidence(verification_evidence, include_all_states=False),
+                restricted_material,
+                "summary",
+            )
         ):
             return None
     elif (
         payload["confirmed_profile_facts"]
-        != _profile_facts(verification_facts, include_all_states=False)
+        != _provider_records(
+            _profile_facts(verification_facts, include_all_states=False),
+            restricted_material,
+            "value",
+        )
         or payload["linked_evidence"]
-        != _evidence(verification_evidence, include_all_states=False)
+        != _provider_records(
+            _evidence(verification_evidence, include_all_states=False),
+            restricted_material,
+            "summary",
+        )
     ):
         return None
 

@@ -27,12 +27,19 @@ class RiskReport:
         }
 
 
-METRIC_PATTERN = re.compile(r"(\d+%|\d+\+|\b\d+\s+regression\b)", re.IGNORECASE)
+METRIC_PATTERN = re.compile(
+    r"(?<![\w.])(?:[$\u20b9\u20ac\u00a3]\s*)?\d[\d,]*(?:\.\d+)?"
+    r"(?:\s*(?:%|\+|x|regressions?|years?|months?|weeks?|days?|hours?))?",
+    re.IGNORECASE,
+)
 SECRET_PATTERN = re.compile(
-    r"(?i)(?:(?:password|secret|token)\s*[:=]\s*\S+|"
+    r"(?i)(?:(?:password|secret|token)\s*[:=]\s*"
+    r"(?!(?:environment(?:\s+variable)?|env(?:ironment)?|redacted|variable)\b|\$)"
+    r"\S+|"
     r"a\s*p\s*i[\s_-]*k\s*e\s*y\s*[:=]\s*"
     r"(?!(?:environment(?:\s+variable)?|env(?:ironment)?|redacted|variable)\b|\$)"
-    r"\S+)"
+    r"\S+|authorization\s*:\s*bearer\s+"
+    r"(?!(?:environment(?:\s+variable)?|redacted)\b|\$)\S+)"
 )
 NDA_TERMS = (
     "cdi testing",

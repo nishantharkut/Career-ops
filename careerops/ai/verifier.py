@@ -93,23 +93,29 @@ _INJECTION_PATTERN = re.compile(
     r"\b(?:output|return|respond\s+with)\b.{0,80}\binstead\b)"
 )
 _SOURCE_DIRECTIVE_PATTERN = re.compile(
-    r"(?i)(?:^|[.!?]\s+)(?:do\s+not|don't|never|please|always)\s+"
-    r"(?:claim|include|list|output|report|return|say|state)\b"
+    r"(?i)(?:(?:^|[.!?]\s+)(?:claim|include|list|output|state)\s+(?=[a-z])|"
+    r"\b(?:do\s+not|don't|never|please|kindly|always)\s+"
+    r"(?:claim|include|list|output|report|return|say|state)\b|"
+    r"\byou\s+should\s+(?:claim|include|list|output|report|return|say|state)\b|"
+    r"\bmake\s+sure\s+to\s+"
+    r"(?:claim|include|list|output|report|return|say|state)\b)"
 )
 _INSTRUCTION_PATTERNS = (_INJECTION_PATTERN, _SOURCE_DIRECTIVE_PATTERN)
 _NEGATION_PATTERN = re.compile(
     r"(?i)\b(?:cannot|can't|did\s+not|didn't|do\s+not|don't|does\s+not|"
-    r"doesn't|is\s+not|isn't|lacks?|lacking|never|no|not|unfamiliar|without)\b"
+    r"doesn't|is\s+not|isn't|inexperienced|lacks?|lacking|neither|never|"
+    r"no|not|unfamiliar|without)\b"
 )
 _OPTIONAL_MODALITY_PATTERN = re.compile(
     r"(?i)\b(?:may|might|nice\s+to\s+have|optional|preferred|"
-    r"(?:would\s+be|is)\s+a\s+plus|a\s+plus|bonus)\b"
+    r"(?:would\s+be|is)\s+a\s+plus|a\s+plus|beneficial|bonus|"
+    r"if\s+available|valued)\b"
 )
 _REQUIRED_MODALITY_PATTERN = re.compile(
-    r"(?i)\b(?:mandatory|must|required|requirement)\b"
+    r"(?i)\b(?:critical|essential|mandatory|must|necessary|required|requirement)\b"
 )
 _SOURCE_CLAUSE_SPLIT_PATTERN = re.compile(
-    r"(?i)\s*(?:[,;]|\bbut\b|\bhowever\b)\s*"
+    r"(?i)\s*(?:[,;]|\band\b|\bbut\b|\bhowever\b)\s*"
 )
 _NON_FACTUAL_SENTENCE_PATTERNS = (
     re.compile(r"(?i)^dear [a-z][a-z .'-]*,?$"),
@@ -266,6 +272,19 @@ _METRIC_WRAPPER_LEXEMES = frozenset(
         "your",
     }
 )
+_METRIC_RELATION_NOUNS = frozenset(
+    {
+        "accounts",
+        "documents",
+        "models",
+        "payments",
+        "processes",
+        "records",
+        "requests",
+        "transactions",
+        "users",
+    }
+)
 _LOW_SIGNAL_LEXEMES = frozenset(
     {
         "a",
@@ -307,6 +326,21 @@ _RESTRICTED_LEXEME_EQUIVALENTS = {
     "migrating": "migrate",
     "migration": "migrate",
     "migrations": "migrate",
+    "confidential": "confidential",
+    "directed": "manage",
+    "directing": "manage",
+    "managed": "manage",
+    "managing": "manage",
+    "operated": "manage",
+    "operating": "manage",
+    "sensitive": "confidential",
+    "transaction": "payment",
+    "transactions": "payment",
+    "transfer": "migrate",
+    "transfers": "migrate",
+    "customer": "client",
+    "customers": "client",
+    "clients": "client",
     "payments": "payment",
     "served": "serve",
     "serving": "serve",
@@ -329,6 +363,8 @@ _GENERIC_ENTITY_LEXEMES = frozenset(
         "india",
         "java",
         "javascript",
+        "learning",
+        "machine",
         "migration",
         "project",
         "python",
@@ -706,6 +742,17 @@ def _statement_supported(statement: str, evidence: Sequence[_Evidence]) -> bool:
     )
 
 
+def _authoritative_claim_supported(
+    statement: str,
+    evidence: Sequence[_Evidence],
+) -> bool:
+    publishable = tuple(item for item in evidence if item.publishable)
+    normalized = _normalized_text(statement)
+    return any(
+        normalized == _normalized_text(item.summary) for item in publishable
+    ) or _statement_supported(statement, publishable)
+
+
 def _sentences(text: str) -> tuple[str, ...] | None:
     sentences: list[str] = []
     for match in _SENTENCE_PATTERN.finditer(text):
@@ -797,16 +844,33 @@ def _trusted_source_segments(
             return None
         rejected_any = False
         for sentence in sentences:
-            clauses = tuple(
+            split_clauses = tuple(
                 clause
                 for clause in _SOURCE_CLAUSE_SPLIT_PATTERN.split(sentence)
                 if clause.strip()
-            ) or (sentence,)
+            )
+            clauses = (
+                split_clauses
+                if len(split_clauses) > 1
+                and all(
+                    any(
+                        pattern.search(_normalized_text(clause))
+                        for pattern in (
+                            _NEGATION_PATTERN,
+                            _OPTIONAL_MODALITY_PATTERN,
+                            _REQUIRED_MODALITY_PATTERN,
+                        )
+                    )
+                    for clause in split_clauses
+                )
+                else (sentence,)
+            )
+            if _contains_injection(sentence):
+                rejected_any = True
+                continue
             for clause in clauses:
                 normalized = _normalized_text(clause)
-                if _contains_injection(clause):
-                    rejected_any = True
-                elif not _NEGATION_PATTERN.search(normalized) and not (
+                if not _NEGATION_PATTERN.search(normalized) and not (
                     exclude_optional
                     and _OPTIONAL_MODALITY_PATTERN.search(normalized)
                 ):
@@ -855,6 +919,40 @@ def _analysis_statement_supported(
     return False
 
 
+def _field_value_supported(
+    field: str,
+    value: str,
+    sources: Sequence[str],
+) -> bool | None:
+    segments = _trusted_source_segments(sources)
+    if segments is None:
+        return None
+    literal = re.escape(_normalized_text(value)).replace(r"\ ", r"\s+")
+    patterns = {
+        "title": (
+            re.compile(rf"(?i)^\s*{literal}\s+(?:at|role|position|opening)\b"),
+            re.compile(
+                rf"(?i)\b(?:role|position|title)\s*[:=-]\s*(?:an?\s+)?{literal}\b"
+            ),
+            re.compile(rf"(?i)\b(?:hiring|seeking)\s+(?:an?\s+)?{literal}\b"),
+        ),
+        "company": (
+            re.compile(
+                rf"(?i)\b(?:company|employer|organization)\s*[:=-]\s*{literal}\b"
+            ),
+            re.compile(rf"(?i)\bat\s+{literal}(?:\s+in\b|[.,]|$)"),
+        ),
+        "location": (
+            re.compile(rf"(?i)\b(?:based|located)\s+in\s+{literal}\b"),
+            re.compile(rf"(?i)\blocation\s*[:=-]\s*{literal}\b"),
+            re.compile(rf"(?i)\bat\s+.+?\s+in\s+{literal}(?:[.,]|$)"),
+        ),
+    }.get(field)
+    if patterns is None:
+        return False
+    return any(pattern.search(_normalized_text(segment)) for pattern in patterns for segment in segments)
+
+
 def _resume_reason_supported(
     reason: str,
     sources: Sequence[str],
@@ -878,8 +976,6 @@ def _resume_reason_supported(
 
 
 def _metric_statement_matches(statement: str, source: str) -> bool:
-    if _relationship_matches(statement, source):
-        return True
     statement_metrics = tuple(
         match.casefold()
         for match in METRIC_PATTERN.findall(_normalize_text(statement))
@@ -888,8 +984,16 @@ def _metric_statement_matches(statement: str, source: str) -> bool:
         match.casefold()
         for match in METRIC_PATTERN.findall(_normalize_text(source))
     )
-    if not statement_metrics or statement_metrics != source_metrics:
+    if not statement_metrics:
+        return _relationship_matches(statement, source)
+    if statement_metrics != source_metrics:
         return False
+    statement_lexemes = set(_lexemes(statement) or ())
+    source_lexemes = set(_lexemes(source) or ())
+    if (source_lexemes - statement_lexemes) & _METRIC_RELATION_NOUNS:
+        return False
+    if _relationship_matches(statement, source):
+        return True
     return _metric_relation_lexemes(statement) == _metric_relation_lexemes(source)
 
 
@@ -1306,6 +1410,12 @@ def _material_overlap(
     blocked_counts = Counter(blocked_tokens)
     overlap = sum((text_counts & blocked_counts).values())
     blocked_size = sum(blocked_counts.values())
+    if (
+        overlap >= 1
+        and _NEGATION_PATTERN.search(_normalized_text(blocked))
+        and not _NEGATION_PATTERN.search(_normalized_text(text))
+    ):
+        return True
     if overlap == blocked_size:
         return True
     if blocked_size >= 2 and overlap >= 2 and overlap * 4 >= blocked_size * 3:
@@ -1372,7 +1482,9 @@ def _verify_analysis(
     strict_job_grounding = _trusted_source_lexemes(
         job_sources, exclude_optional=True
     )
-    candidate_grounding = _trusted_source_lexemes(candidate_sources)
+    candidate_grounding = _trusted_source_lexemes(
+        candidate_sources, exclude_optional=True
+    )
     if (
         job_grounding is None
         or strict_job_grounding is None
@@ -1413,15 +1525,15 @@ def _verify_analysis(
     metric_checks: list[bool] = []
     if isinstance(output, AnalyzeJdOutput):
         normalized_fields = (
-            output.normalized_title,
-            output.normalized_company,
-            output.normalized_location,
+            ("title", output.normalized_title),
+            ("company", output.normalized_company),
+            ("location", output.normalized_location),
         )
         support_checks.extend(
-            _analysis_statement_supported(value, job_grounding)
+            _field_value_supported(field, value, job_sources)
             if _normalized_text(value) not in {"not specified", "unknown", "unspecified"}
             else True
-            for value in normalized_fields
+            for field, value in normalized_fields
         )
         strict_extracted = output.responsibilities + output.required_skills
         descriptive_extracted = output.preferred_skills + output.keywords
@@ -1727,14 +1839,14 @@ def _factual_sentences(text: str) -> tuple[str, ...] | None:
 
 def _cover_role_reference_support(
     sentence: str,
-    job_grounding: Sequence[Sequence[str]],
+    job_sources: Sequence[str],
 ) -> tuple[bool, bool | None]:
     normalized = _normalized_text(sentence.rstrip(".!?"))
     match = _COVER_ROLE_REFERENCE_PATTERN.fullmatch(normalized)
     if match is None:
         return False, False
     descriptor = match.group("role")
-    if not job_grounding and descriptor in _GENERIC_COVER_ROLE_DESCRIPTORS:
+    if not job_sources and descriptor in _GENERIC_COVER_ROLE_DESCRIPTORS:
         return True, True
     variants = {descriptor}
     if descriptor.endswith(" engineering"):
@@ -1742,7 +1854,7 @@ def _cover_role_reference_support(
     elif descriptor == "engineering":
         variants.add("engineer")
     checks = tuple(
-        _analysis_statement_supported(variant, job_grounding)
+        _field_value_supported("title", variant, job_sources)
         for variant in variants
     )
     return True, None if any(value is None for value in checks) else any(checks)
@@ -1804,7 +1916,8 @@ def verify_cover_letter(
         job = _mapping(context_data.get("job_description"))
         if job is None or type(job.get("text")) is not str:
             return _result(task_type, None, [_finding("schema_invalid")])
-        job_grounding = _trusted_source_lexemes((job["text"],))
+        job_sources = (job["text"],)
+        job_grounding = _trusted_source_lexemes(job_sources)
         if job_grounding is None:
             return _result(task_type, None, [_finding("schema_invalid")])
     else:
@@ -1819,6 +1932,7 @@ def verify_cover_letter(
         context_private = ()
         injection_sources = ()
         source_instruction_sources = ()
+        job_sources = ()
         job_grounding = ()
 
     records = _evidence_records(evidence_values)
@@ -1853,7 +1967,7 @@ def verify_cover_letter(
         return _result(task_type, None, [_finding("schema_invalid")])
     for sentence in factual_sentences:
         is_role_reference, role_support = _cover_role_reference_support(
-            sentence, job_grounding
+            sentence, job_sources
         )
         if is_role_reference and role_support is None:
             return _result(task_type, None, [_finding("schema_invalid")])
@@ -1986,7 +2100,9 @@ def verify_claim_review(
         )
         findings.extend(reference_findings)
         claim_supported = _statement_supported(claim.text, resolved)
-        authoritative_claim_supported = _statement_supported(claim.text, records)
+        authoritative_claim_supported = _authoritative_claim_supported(
+            claim.text, records
+        )
         claim_private = (
             claim.privacy_level != "public"
             or claim.verification_state == "private_do_not_publish"
