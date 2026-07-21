@@ -7,7 +7,10 @@ function message(error: unknown): string {
 }
 
 export function useApplicationPacket(applicationId: string | null) {
-  const [packet, setPacket] = useState<ApplicationPacket | null>(null);
+  const [loadedPacket, setLoadedPacket] = useState<{
+    applicationId: string;
+    packet: ApplicationPacket;
+  } | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
   const controller = useRef<AbortController | null>(null);
@@ -20,7 +23,7 @@ export function useApplicationPacket(applicationId: string | null) {
     controller.current?.abort();
     const requestGeneration = ++generation.current;
     if (!targetId) {
-      setPacket(null);
+      setLoadedPacket(null);
       setError("");
       setLoading(false);
       return null;
@@ -37,7 +40,7 @@ export function useApplicationPacket(applicationId: string | null) {
         targetId === currentApplicationId.current &&
         !nextController.signal.aborted
       ) {
-        setPacket(nextPacket);
+        setLoadedPacket({ applicationId: targetId, packet: nextPacket });
         return nextPacket;
       }
     } catch (loadError) {
@@ -46,7 +49,7 @@ export function useApplicationPacket(applicationId: string | null) {
         targetId === currentApplicationId.current &&
         !nextController.signal.aborted
       ) {
-        setPacket(null);
+        setLoadedPacket(null);
         setError(message(loadError));
       }
     } finally {
@@ -62,12 +65,13 @@ export function useApplicationPacket(applicationId: string | null) {
   }, []);
 
   useEffect(() => {
-    setPacket(null);
     void load(applicationId);
     return () => controller.current?.abort();
   }, [applicationId, load]);
 
   const reload = useCallback(() => load(applicationId), [applicationId, load]);
+  const packet =
+    loadedPacket?.applicationId === applicationId ? loadedPacket.packet : null;
 
   return { packet, loading, error, reload };
 }

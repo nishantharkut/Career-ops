@@ -229,6 +229,7 @@ describe("AI tasks panel", () => {
     );
 
     const runButton = await screen.findByRole("button", { name: "Run AI review" });
+    await waitFor(() => expect(runButton).toBeEnabled());
     vi.useFakeTimers();
     await act(async () => {
       fireEvent.click(runButton);
@@ -270,6 +271,7 @@ describe("AI tasks panel", () => {
     render(<AiTasksPanel applicationId="app_1" initialTask={null} onPacketChanged={vi.fn()} />);
 
     const runButton = await screen.findByRole("button", { name: "Run AI review" });
+    await waitFor(() => expect(runButton).toBeEnabled());
     vi.useFakeTimers();
     fireEvent.click(runButton);
     await act(async () => Promise.resolve());
@@ -304,6 +306,7 @@ describe("AI tasks panel", () => {
     );
     const view = render(<AiTasksPanel applicationId="app_1" initialTask={null} onPacketChanged={vi.fn()} />);
     const runButton = await screen.findByRole("button", { name: "Run AI review" });
+    await waitFor(() => expect(runButton).toBeEnabled());
     vi.useFakeTimers();
     fireEvent.click(runButton);
     await act(async () => Promise.resolve());

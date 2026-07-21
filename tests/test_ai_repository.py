@@ -380,6 +380,21 @@ def claim_task(repo: CareerOpsRepository, task_id: str) -> str:
     return claim_token
 
 
+def make_legacy_application_pristine_for_claim(
+    repo: CareerOpsRepository, application_id: str = "app_v0"
+) -> None:
+    with repo.connection() as connection:
+        connection.execute(
+            """
+            UPDATE applications
+            SET approval_id = NULL, status = 'draft',
+                submission_state = 'not_submitted', submitted_at = NULL
+            WHERE id = ?
+            """,
+            (application_id,),
+        )
+
+
 def expire_claim(repo: CareerOpsRepository, task_id: str) -> None:
     with repo.connection() as connection:
         connection.execute(
@@ -2552,7 +2567,8 @@ def test_public_ai_business_writes_reject_approved_packet(tmp_path: Path):
     )
     provider = create_provider(repo)
     task = create_bound_task(repo, application.id, provider.id, "analyze_jd")
-    claim = claim_task(repo, task.id)
+    assert repo.claim_ai_task(task.id) is None
+    assert repo.get_ai_task(task.id).error_summary == "cancelled"
     before_application = repo.get_application(application.id)
     before_jd = repo.get_jd_snapshot(application.jd_snapshot_id)
 
@@ -2560,7 +2576,7 @@ def test_public_ai_business_writes_reject_approved_packet(tmp_path: Path):
         repo.update_jd_requirements_from_ai(
             snapshot_id=application.jd_snapshot_id,
             task_id=task.id,
-            claim_token=claim,
+            claim_token="inactive-claim",
             raw_ai={"required_skills": ["Rust"]},
             uncertainty={"items": []},
         )
@@ -3982,6 +3998,157 @@ def test_unsafe_verifier_states_cannot_be_accepted(
     )
 
 
+def approve_existing_application(
+    repo: CareerOpsRepository, application_id: str
+):
+    application = repo.get_application(application_id)
+    source_dir = repo.vault_path / "resumes" / application_id
+    source_dir.mkdir(parents=True, exist_ok=True)
+    tex_path = source_dir / "decision-race.tex"
+    pdf_path = source_dir / "decision-race.pdf"
+    tex_bytes = b"decision race resume"
+    pdf_bytes = b"%PDF-1.4\ndecision race"
+    tex_path.write_bytes(tex_bytes)
+    pdf_path.write_bytes(pdf_bytes)
+    resume = repo.create_resume_version(
+        name="Decision race resume",
+        role_family="software",
+        tex_path=tex_path,
+        tex_sha256=hashlib.sha256(tex_bytes).hexdigest(),
+        pdf_path=pdf_path,
+        pdf_sha256=hashlib.sha256(pdf_bytes).hexdigest(),
+    )
+    repo.select_resume(application_id, resume.id)
+    report = repo.save_report(
+        application_id=application_id,
+        resume_version_id=resume.id,
+        jd_snapshot_id=application.jd_snapshot_id,
+        fit={"score": 90},
+        risks={"blockers": [], "warnings": []},
+    )
+    return repo.approve_application(application_id, report.id, "Reviewed")
+
+
+@pytest.mark.parametrize("submitted", [False, True], ids=["approved", "submitted"])
+def test_finding_decision_rejects_application_that_became_read_only(
+    tmp_path: Path, submitted: bool
+):
+    repo = make_repo(tmp_path)
+    application = create_application(repo)
+    provider = create_provider(repo)
+    _task, finding = create_aggregate_finding(
+        repo,
+        application.id,
+        provider.id,
+        finding_type="verified_claim",
+        severity="info",
+        claim_text="Verified claim",
+        evidence_item_id=None,
+        recommendation="Use",
+        verifier_state="verified",
+    )
+    approve_existing_application(repo, application.id)
+    if submitted:
+        repo.mark_submitted_manual(application.id, "Submitted")
+
+    with pytest.raises(ValueError, match="approved or submitted"):
+        repo.update_ai_finding_decision(
+            finding.id, "accepted", expected_decision="pending"
+        )
+
+    assert repo.get_ai_finding(finding.id).decision == "pending"
+    assert not any(
+        event.event_type == "ai_finding.decision_updated"
+        and event.entity_id == finding.id
+        for event in repo.list_audit_events()
+    )
+
+
+def test_finding_decision_waiting_on_approval_transaction_observes_read_only_state(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    repo = make_repo(tmp_path)
+    application = create_application(repo)
+    provider = create_provider(repo)
+    _task, finding = create_aggregate_finding(
+        repo,
+        application.id,
+        provider.id,
+        finding_type="verified_claim",
+        severity="info",
+        claim_text="Verified claim",
+        evidence_item_id=None,
+        recommendation="Use",
+        verifier_state="verified",
+    )
+    application = repo.get_application(application.id)
+    source_dir = repo.vault_path / "resumes" / application.id
+    source_dir.mkdir(parents=True, exist_ok=True)
+    tex_path = source_dir / "concurrent-decision.tex"
+    pdf_path = source_dir / "concurrent-decision.pdf"
+    tex_bytes = b"concurrent decision resume"
+    pdf_bytes = b"%PDF-1.4\nconcurrent decision"
+    tex_path.write_bytes(tex_bytes)
+    pdf_path.write_bytes(pdf_bytes)
+    resume = repo.create_resume_version(
+        name="Concurrent decision resume",
+        role_family="software",
+        tex_path=tex_path,
+        tex_sha256=hashlib.sha256(tex_bytes).hexdigest(),
+        pdf_path=pdf_path,
+        pdf_sha256=hashlib.sha256(pdf_bytes).hexdigest(),
+    )
+    repo.select_resume(application.id, resume.id)
+    report = repo.save_report(
+        application_id=application.id,
+        resume_version_id=resume.id,
+        jd_snapshot_id=application.jd_snapshot_id,
+        fit={"score": 90},
+        risks={"blockers": [], "warnings": []},
+    )
+    approval_repo = CareerOpsRepository(repo.database_path, repo.vault_path)
+    decision_repo = CareerOpsRepository(repo.database_path, repo.vault_path)
+    approval_updated = Event()
+    release_approval = Event()
+    decision_started = Event()
+    original_write_audit = approval_repo._write_audit
+
+    def pause_approval_audit(
+        connection, event_type, entity_type, entity_id, before, after
+    ):
+        original_write_audit(
+            connection, event_type, entity_type, entity_id, before, after
+        )
+        if event_type == "application.approved":
+            approval_updated.set()
+            assert release_approval.wait(2)
+
+    monkeypatch.setattr(approval_repo, "_write_audit", pause_approval_audit)
+
+    def decide():
+        decision_started.set()
+        return decision_repo.update_ai_finding_decision(
+            finding.id, "accepted", expected_decision="pending"
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        approval_future = executor.submit(
+            approval_repo.approve_application,
+            application.id,
+            report.id,
+            "Reviewed",
+        )
+        assert approval_updated.wait(2)
+        decision_future = executor.submit(decide)
+        assert decision_started.wait(2)
+        release_approval.set()
+        approval_future.result(timeout=2)
+        with pytest.raises(ValueError, match="approved or submitted"):
+            decision_future.result(timeout=2)
+
+    assert repo.get_ai_finding(finding.id).decision == "pending"
+
+
 def test_concurrent_finding_decisions_have_one_causal_audit(tmp_path: Path):
     repo = make_repo(tmp_path)
     application = create_application(repo)
@@ -4340,6 +4507,7 @@ def test_v9_running_task_upgrade_consumes_invocation_fence(tmp_path: Path):
     assert migrated.invocation_started_at == "2026-02-01T00:00:00+00:00"
     assert migrated.status == "pending"
     assert repo.requeue_interrupted_ai_tasks() == 0
+    make_legacy_application_pristine_for_claim(repo)
     recovered_claim = claim_task(repo, migrated.id)
     assert repo.begin_ai_task_invocation(migrated.id, recovered_claim) is False
 
@@ -4807,6 +4975,7 @@ def test_f32e429_v11_database_repairs_fences_and_legacy_codex(tmp_path: Path):
     assert task.invocation_started_at == "2026-02-02T00:00:00+00:00"
     assert task.status == "pending"
     assert repo.requeue_interrupted_ai_tasks() == 0
+    make_legacy_application_pristine_for_claim(repo)
     recovered_claim = claim_task(repo, task.id)
     assert repo.begin_ai_task_invocation(task.id, recovered_claim) is False
 
@@ -4973,6 +5142,7 @@ def test_v12_upgrade_quarantines_duplicates_then_fails_closed_on_missing_artifac
     with pytest.raises(ValueError, match="legacy AI artifact"):
         repo.initialize()
     task = repo.get_ai_task("ait_v12_prompt")
+    make_legacy_application_pristine_for_claim(repo)
     claim = claim_task(repo, task.id)
 
     assert task.prompt_sha256 == ""

@@ -5,6 +5,7 @@ import { beforeEach, describe, expect, test, vi } from "vitest";
 import App, { statusLabel } from "./App";
 import type { ApplicationPacket, ApplicationRecord, EvidenceRecord, JsonValue, ReportRecord, RequirementsRecord } from "./api";
 import ReviewPanel from "./components/ReviewPanel";
+import { useApplicationPacket } from "./hooks/useApplicationPacket";
 
 const application = (id: string, company: string): ApplicationRecord => ({
   id,
@@ -658,6 +659,47 @@ describe("Application Desk UI", () => {
 
     expect(screen.getByRole("heading", { name: "Second Co" })).toBeInTheDocument();
     expect(screen.queryByText("Stale resume")).not.toBeInTheDocument();
+  });
+
+  test("an immediate application switch never renders the previous packet for the new selection", async () => {
+    const first = application("app_1", "First Co");
+    const second = application("app_2", "Second Co");
+    let resolveSecond!: (value: ReturnType<typeof jsonResponse>) => void;
+    const delayedSecond = new Promise<ReturnType<typeof jsonResponse>>((resolve) => {
+      resolveSecond = resolve;
+    });
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL) => {
+        const url = String(input);
+        if (url.endsWith("/applications/app_1/packet")) return jsonResponse(packet(first));
+        if (url.endsWith("/applications/app_2/packet")) return delayedSecond;
+        throw new Error(`Unhandled request: ${url}`);
+      })
+    );
+    const renders: Array<{ selectedId: string; packetId: string | null }> = [];
+
+    function PacketProbe({ selectedId }: { selectedId: string }) {
+      const { packet: selectedPacket } = useApplicationPacket(selectedId);
+      renders.push({
+        selectedId,
+        packetId: selectedPacket?.application.id ?? null
+      });
+      return <div>{selectedPacket?.application.company ?? "Loading packet"}</div>;
+    }
+
+    const view = render(<PacketProbe selectedId={first.id} />);
+    expect(await screen.findByText("First Co")).toBeInTheDocument();
+    renders.length = 0;
+
+    view.rerender(<PacketProbe selectedId={second.id} />);
+
+    expect(renders).not.toContainEqual({ selectedId: second.id, packetId: first.id });
+    expect(screen.getByText("Loading packet")).toBeInTheDocument();
+    await act(async () => {
+      resolveSecond(jsonResponse(packet(second)));
+    });
+    expect(await screen.findByText("Second Co")).toBeInTheDocument();
   });
 
   test("a completed mutation cannot reload the application selected when it started", async () => {

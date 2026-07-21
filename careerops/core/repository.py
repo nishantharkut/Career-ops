@@ -957,6 +957,42 @@ class CareerOpsRepository:
         with self.connection() as connection:
             connection.execute("BEGIN IMMEDIATE")
             now = utc_now()
+            task = connection.execute(
+                "SELECT * FROM ai_tasks WHERE id = ?", (task_id,)
+            ).fetchone()
+            if task is None or task["status"] != AiTaskStatus.PENDING.value:
+                return None
+            application = connection.execute(
+                "SELECT * FROM applications WHERE id = ?",
+                (task["application_id"],),
+            ).fetchone()
+            if application is None:
+                raise ValueError("AI task application is missing")
+            if not self._application_packet_is_pristine(application):
+                cursor = connection.execute(
+                    """
+                    UPDATE ai_tasks
+                    SET status = 'failed', completed_at = ?, error_summary = 'cancelled',
+                        claim_token = NULL, claim_expires_at = NULL, updated_at = ?
+                    WHERE id = ? AND status = 'pending'
+                    """,
+                    (now, now, task_id),
+                )
+                if cursor.rowcount != 1:
+                    return None
+                self._write_audit(
+                    connection,
+                    "ai_task.failed",
+                    "ai_task",
+                    task_id,
+                    dict(task),
+                    {
+                        "status": "failed",
+                        "completed_at": now,
+                        "error_summary": "cancelled",
+                    },
+                )
+                return None
             expires_at = (
                 datetime.fromisoformat(now)
                 + timedelta(seconds=self.claim_lease_seconds)
@@ -1749,10 +1785,33 @@ class CareerOpsRepository:
         with self.connection() as connection:
             connection.execute("BEGIN IMMEDIATE")
             before_row = connection.execute(
-                "SELECT * FROM ai_findings WHERE id = ?", (finding_id,)
+                """
+                SELECT ai_findings.*, applications.approval_id,
+                       applications.submission_state, applications.submitted_at,
+                       applications.status AS application_status
+                FROM ai_findings
+                JOIN ai_tasks ON ai_tasks.id = ai_findings.task_id
+                JOIN applications ON applications.id = ai_tasks.application_id
+                WHERE ai_findings.id = ?
+                """,
+                (finding_id,),
             ).fetchone()
             if before_row is None:
                 raise KeyError(f"No AI finding: {finding_id}")
+            if (
+                before_row["approval_id"] is not None
+                or before_row["submission_state"]
+                != SubmissionState.NOT_SUBMITTED.value
+                or before_row["submitted_at"] is not None
+                or before_row["application_status"]
+                in {
+                    ApplicationStatus.APPROVED.value,
+                    ApplicationStatus.SUBMITTED_MANUAL.value,
+                }
+            ):
+                raise ValueError(
+                    "AI task cannot replace approved or submitted application state"
+                )
             before = self._ai_finding_from_row(before_row)
             if before.decision != expected_decision:
                 raise ValueError("AI finding decision no longer matches expected decision")
@@ -3502,13 +3561,22 @@ class CareerOpsRepository:
         return self.get_application(application_id)
 
     @staticmethod
-    def _require_pristine_application_packet(application: sqlite3.Row) -> None:
-        if (
+    def _application_packet_is_pristine(application: sqlite3.Row) -> bool:
+        return not (
             application["approval_id"] is not None
             or application["submission_state"]
             != SubmissionState.NOT_SUBMITTED.value
             or application["submitted_at"] is not None
-        ):
+            or application["status"]
+            in {
+                ApplicationStatus.APPROVED.value,
+                ApplicationStatus.SUBMITTED_MANUAL.value,
+            }
+        )
+
+    @classmethod
+    def _require_pristine_application_packet(cls, application: sqlite3.Row) -> None:
+        if not cls._application_packet_is_pristine(application):
             raise ValueError(
                 "AI task cannot replace approved or submitted application state"
             )

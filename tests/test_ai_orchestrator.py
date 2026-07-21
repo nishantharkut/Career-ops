@@ -469,6 +469,63 @@ def test_enqueue_rejects_read_only_application_before_provider_access(
     assert repo.list_ai_tasks(application.id) == []
 
 
+@pytest.mark.parametrize("submitted", [False, True], ids=["approved", "submitted"])
+def test_run_cancels_queued_task_when_application_becomes_read_only_before_provider_access(
+    tmp_path: Path, submitted: bool
+):
+    from careerops.ai.orchestrator import AiOrchestrator
+
+    repo = make_repo(tmp_path)
+    application = create_application(repo)
+    resume = select_resume(repo, application.id)
+    report = repo.save_report(
+        application_id=application.id,
+        resume_version_id=resume.id,
+        jd_snapshot_id=application.jd_snapshot_id,
+        fit={"score": 100},
+        risks={"blockers": [], "warnings": []},
+    )
+    config = create_provider_config(repo)
+
+    class TrackingProvider:
+        def __init__(self) -> None:
+            self.availability_calls = 0
+            self.run_calls = 0
+
+        def availability(self):
+            self.availability_calls += 1
+            return availability()
+
+        def run(self, _request):
+            self.run_calls += 1
+            raise AssertionError("read-only queued task must not invoke the provider")
+
+    provider = TrackingProvider()
+    orchestrator = AiOrchestrator(repo, {config.id: provider})
+    task = orchestrator.enqueue(application.id, "analyze_jd", config.id)
+    repo.approve_application(application.id, report.id, "Reviewed")
+    if submitted:
+        repo.mark_submitted_manual(application.id, "Submitted")
+    provider.availability_calls = 0
+    versions_before_run = repo.list_application_versions(application.id)
+
+    result = orchestrator.run(task.id)
+
+    assert result.status == "failed"
+    assert result.started_at is None
+    assert result.completed_at is not None
+    assert result.error_summary == "cancelled"
+    assert provider.availability_calls == 0
+    assert provider.run_calls == 0
+    assert repo.list_application_versions(application.id) == versions_before_run
+    task_events = [
+        event for event in repo.list_audit_events() if event.entity_id == task.id
+    ]
+    assert [event.event_type for event in task_events] == ["ai_task.failed"]
+    assert task_events[0].before_json["status"] == "pending"
+    assert task_events[0].after_json["error_summary"] == "cancelled"
+
+
 def test_heartbeat_setup_failure_fails_exact_claim_without_invoking_provider(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):

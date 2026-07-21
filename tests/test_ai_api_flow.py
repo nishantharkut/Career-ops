@@ -684,6 +684,45 @@ def test_create_task_is_persisted_running_queryable_and_reloadable(tmp_path: Pat
         assert conflict.status_code == 409
 
 
+@pytest.mark.parametrize("submitted", [False, True], ids=["approved", "submitted"])
+def test_finding_decision_api_rejects_application_that_became_read_only(
+    tmp_path: Path, submitted: bool
+):
+    from careerops.ai.orchestrator import AiOrchestrator
+
+    repo = make_repo(tmp_path)
+    application = create_application(repo)
+    resume = select_resume(repo, application.id)
+    status = availability()
+    config = create_provider_config(repo, status)
+    provider = ControlledProvider(status)
+    orchestrator = AiOrchestrator(repo, {config.id: provider})
+    task = orchestrator.enqueue(
+        application.id, "suggest_resume_edits", config.id
+    )
+    assert orchestrator.run(task.id).status.value == "completed"
+    finding = repo.list_ai_findings(task.id)[0]
+    report = repo.save_report(
+        application_id=application.id,
+        resume_version_id=resume.id,
+        jd_snapshot_id=application.jd_snapshot_id,
+        fit={"score": 100},
+        risks={"blockers": [], "warnings": []},
+    )
+    repo.approve_application(application.id, report.id, "Reviewed")
+    if submitted:
+        repo.mark_submitted_manual(application.id, "Submitted")
+
+    response = TestClient(create_app(repo, provider_registry={})).post(
+        f"/ai-findings/{finding.id}/decision",
+        json={"decision": "accepted"},
+    )
+
+    assert response.status_code == 409
+    assert response.json() == {"detail": "AI finding decision conflict"}
+    assert repo.get_ai_finding(finding.id).decision.value == "pending"
+
+
 def test_background_failure_keeps_202_and_never_falls_back(tmp_path: Path):
     repo = make_repo(tmp_path)
     application = create_application(repo)
