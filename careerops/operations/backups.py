@@ -112,27 +112,18 @@ class _FileRecord:
     sha256: str
 
 
-@dataclass
-class _OpenSnapshotFile:
+@dataclass(frozen=True)
+class _SnapshotFile:
     record: _FileRecord
     staged_path: Path
-    staged_descriptor: int
     staged_identity: tuple[int, int, int, int, int]
     source_path: Path | None = None
-    source_descriptor: int | None = None
     source_identity: tuple[int, int, int, int, int] | None = None
-
-    def close(self) -> None:
-        for descriptor_name in ("source_descriptor", "staged_descriptor"):
-            descriptor = getattr(self, descriptor_name)
-            if descriptor is not None and descriptor >= 0:
-                os.close(descriptor)
-                setattr(self, descriptor_name, -1)
 
 
 @dataclass(frozen=True)
 class _VaultSnapshot:
-    files: tuple[_OpenSnapshotFile, ...]
+    files: tuple[_SnapshotFile, ...]
     directories: tuple[str, ...]
     topology: tuple[tuple[str, str, tuple[int, int, int, int, int]], ...]
 
@@ -555,56 +546,80 @@ def _capture_vault_snapshot(
     file_entries = [item for item in topology if item[1] == "file"]
     if len(topology) + 1 > limits.max_files:
         raise BackupIntegrityError("Backup exceeded its file-count limit")
-    opened: list[_OpenSnapshotFile] = []
-    try:
-        for archive_path, _kind, expected_identity in file_entries:
-            relative = PurePosixPath(archive_path).relative_to("vault")
-            source_path = vault / relative
+    captured: list[_SnapshotFile] = []
+    for archive_path, _kind, expected_identity in file_entries:
+        relative = PurePosixPath(archive_path).relative_to("vault")
+        source_path = vault / relative
+        source_descriptor = -1
+        staged_descriptor = -1
+        try:
             source_descriptor, source_identity = _open_regular_descriptor(
                 source_path, "Vault entry"
             )
             if source_identity != expected_identity:
-                os.close(source_descriptor)
                 raise BackupIntegrityError("Vault changed while it was staged")
             staged_path = staged_vault / relative
             staged_path.parent.mkdir(parents=True, exist_ok=True)
-            staged_descriptor = -1
-            try:
-                staged_descriptor = os.open(
-                    staged_path,
-                    os.O_RDWR
-                    | os.O_CREAT
-                    | os.O_EXCL
-                    | getattr(os, "O_BINARY", 0)
-                    | getattr(os, "O_NOFOLLOW", 0),
-                    0o600,
-                )
-                size, sha256 = _copy_descriptor(
-                    source_descriptor, staged_descriptor, limits.max_file_bytes
-                )
-                os.fsync(staged_descriptor)
-                staged_identity = _snapshot_identity(os.fstat(staged_descriptor))
-            except BaseException:
-                if staged_descriptor >= 0:
-                    os.close(staged_descriptor)
-                os.close(source_descriptor)
-                raise
-            opened.append(
-                _OpenSnapshotFile(
+            staged_descriptor = os.open(
+                staged_path,
+                os.O_RDWR
+                | os.O_CREAT
+                | os.O_EXCL
+                | getattr(os, "O_BINARY", 0)
+                | getattr(os, "O_NOFOLLOW", 0),
+                0o600,
+            )
+            size, sha256 = _copy_descriptor(
+                source_descriptor, staged_descriptor, limits.max_file_bytes
+            )
+            os.fsync(staged_descriptor)
+            _assert_descriptor_identity(
+                source_path,
+                source_descriptor,
+                source_identity,
+                "Vault source",
+            )
+            staged_identity = _snapshot_identity(os.fstat(staged_descriptor))
+            captured.append(
+                _SnapshotFile(
                     record=_FileRecord(archive_path, size, sha256),
                     staged_path=staged_path,
-                    staged_descriptor=staged_descriptor,
                     staged_identity=staged_identity,
                     source_path=source_path,
-                    source_descriptor=source_descriptor,
                     source_identity=source_identity,
                 )
             )
-        return _VaultSnapshot(tuple(opened), directories, topology)
-    except BaseException:
-        for item in opened:
-            item.close()
-        raise
+        finally:
+            if staged_descriptor >= 0:
+                os.close(staged_descriptor)
+            if source_descriptor >= 0:
+                os.close(source_descriptor)
+    return _VaultSnapshot(tuple(captured), directories, topology)
+
+
+def _revalidate_snapshot_path(
+    path: Path,
+    expected_identity: tuple[int, int, int, int, int],
+    record: _FileRecord,
+    limits: BackupLimits,
+    description: str,
+    mismatch_message: str,
+) -> None:
+    descriptor = -1
+    try:
+        try:
+            descriptor, opened_identity = _open_regular_descriptor(path, description)
+        except BackupPathError as error:
+            raise BackupIntegrityError(mismatch_message) from error
+        if opened_identity != expected_identity:
+            raise BackupIntegrityError(mismatch_message)
+        size, digest = _descriptor_digest(descriptor, limits.max_file_bytes)
+        _assert_descriptor_identity(path, descriptor, expected_identity, description)
+        if size != record.size or not secrets_compare_digest(digest, record.sha256):
+            raise BackupIntegrityError(mismatch_message)
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
 
 
 def _revalidate_vault_snapshot(
@@ -615,38 +630,27 @@ def _revalidate_vault_snapshot(
     if _vault_topology(vault) != snapshot.topology:
         raise BackupIntegrityError("Vault changed after the database snapshot")
     for item in snapshot.files:
-        if (
-            item.source_path is None
-            or item.source_descriptor is None
-            or item.source_identity is None
-        ):
+        if item.source_path is None or item.source_identity is None:
             raise BackupIntegrityError("Vault snapshot identity was incomplete")
-        _assert_descriptor_identity(
+        # Reopening keeps descriptor use constant. A same-user adversary that can
+        # replace bytes and perfectly restore identity metadata is outside this
+        # same-host operational boundary; hashes remain the byte authority.
+        _revalidate_snapshot_path(
             item.source_path,
-            item.source_descriptor,
             item.source_identity,
+            item.record,
+            limits,
             "Vault source",
+            "Vault changed after the database snapshot",
         )
-        size, digest = _descriptor_digest(
-            item.source_descriptor, limits.max_file_bytes
-        )
-        if size != item.record.size or not secrets_compare_digest(
-            digest, item.record.sha256
-        ):
-            raise BackupIntegrityError("Vault changed after the database snapshot")
-        _assert_descriptor_identity(
+        _revalidate_snapshot_path(
             item.staged_path,
-            item.staged_descriptor,
             item.staged_identity,
+            item.record,
+            limits,
             "Staged vault file",
+            "Staged vault bytes did not match the manifest",
         )
-        staged_size, staged_digest = _descriptor_digest(
-            item.staged_descriptor, limits.max_file_bytes
-        )
-        if staged_size != item.record.size or not secrets_compare_digest(
-            staged_digest, item.record.sha256
-        ):
-            raise BackupIntegrityError("Staged vault bytes did not match the manifest")
 
 
 def _safe_archive_path(raw: str, *, allow_manifest: bool = True) -> str:
@@ -766,27 +770,31 @@ def _snapshot_database(source: Path, destination: Path) -> None:
 def _open_database_snapshot(
     snapshot_path: Path,
     limits: BackupLimits,
-) -> _OpenSnapshotFile:
+) -> _SnapshotFile:
     descriptor, identity = _open_regular_descriptor(
         snapshot_path, "Staged database snapshot"
     )
     try:
         size, sha256 = _descriptor_digest(descriptor, limits.max_file_bytes)
-        return _OpenSnapshotFile(
+        _assert_descriptor_identity(
+            snapshot_path,
+            descriptor,
+            identity,
+            "Staged database snapshot",
+        )
+        return _SnapshotFile(
             record=_FileRecord(DATABASE_ARCHIVE_PATH, size, sha256),
             staged_path=snapshot_path,
-            staged_descriptor=descriptor,
             staged_identity=identity,
         )
-    except BaseException:
+    finally:
         os.close(descriptor)
-        raise
 
 
 def _validate_database_vault_bindings(
     database_snapshot: Path,
     source_vault: Path,
-    vault_files: tuple[_OpenSnapshotFile, ...],
+    vault_files: tuple[_SnapshotFile, ...],
 ) -> None:
     records = {_portable_path_key(item.record.path): item.record for item in vault_files}
     bindings = (
@@ -862,44 +870,47 @@ def _backup_snapshot_checkpoint(_boundary: str, _stage_path: Path) -> None:
 
 def _write_snapshot_member(
     archive: zipfile.ZipFile,
-    item: _OpenSnapshotFile,
+    item: _SnapshotFile,
     limits: BackupLimits,
 ) -> None:
-    _assert_descriptor_identity(
-        item.staged_path,
-        item.staged_descriptor,
-        item.staged_identity,
-        "Staged backup file",
-    )
-    digest = hashlib.sha256()
-    observed = 0
-    info = zipfile.ZipInfo(item.record.path)
-    info.compress_type = zipfile.ZIP_DEFLATED
-    info.create_system = 3
-    info.external_attr = (stat.S_IFREG | 0o600) << 16
-    os.lseek(item.staged_descriptor, 0, os.SEEK_SET)
-    with archive.open(info, "w", force_zip64=True) as output:
-        while True:
-            chunk = os.read(item.staged_descriptor, CHUNK_SIZE)
-            if not chunk:
-                break
-            observed += len(chunk)
-            if observed > limits.max_file_bytes or observed > item.record.size:
-                raise BackupIntegrityError(
-                    "Staged backup file exceeded its manifest size"
-                )
-            output.write(chunk)
-            digest.update(chunk)
-    _assert_descriptor_identity(
-        item.staged_path,
-        item.staged_descriptor,
-        item.staged_identity,
-        "Staged backup file",
-    )
-    if observed != item.record.size or not secrets_compare_digest(
-        digest.hexdigest(), item.record.sha256
-    ):
-        raise BackupIntegrityError("Staged backup bytes did not match the manifest")
+    descriptor = -1
+    try:
+        descriptor, opened_identity = _open_regular_descriptor(
+            item.staged_path, "Staged backup file"
+        )
+        if opened_identity != item.staged_identity:
+            raise BackupIntegrityError("Staged backup file changed during the snapshot")
+        digest = hashlib.sha256()
+        observed = 0
+        info = zipfile.ZipInfo(item.record.path)
+        info.compress_type = zipfile.ZIP_DEFLATED
+        info.create_system = 3
+        info.external_attr = (stat.S_IFREG | 0o600) << 16
+        with archive.open(info, "w", force_zip64=True) as output:
+            while True:
+                chunk = os.read(descriptor, CHUNK_SIZE)
+                if not chunk:
+                    break
+                observed += len(chunk)
+                if observed > limits.max_file_bytes or observed > item.record.size:
+                    raise BackupIntegrityError(
+                        "Staged backup file exceeded its manifest size"
+                    )
+                output.write(chunk)
+                digest.update(chunk)
+        _assert_descriptor_identity(
+            item.staged_path,
+            descriptor,
+            item.staged_identity,
+            "Staged backup file",
+        )
+        if observed != item.record.size or not secrets_compare_digest(
+            digest.hexdigest(), item.record.sha256
+        ):
+            raise BackupIntegrityError("Staged backup bytes did not match the manifest")
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
 
 
 def _write_directory_member(archive: zipfile.ZipFile, path: str) -> None:
@@ -953,7 +964,7 @@ def create_backup(
     final_path = root / archive_name
     temp_path = root / f".{archive_name}.tmp"
     stage_path: Path | None = None
-    open_snapshot_files: list[_OpenSnapshotFile] = []
+    snapshot_files: list[_SnapshotFile] = []
     temp_descriptor = -1
     try:
         stage_path = Path(tempfile.mkdtemp(prefix=".careerops-backup-stage-", dir=root))
@@ -961,10 +972,10 @@ def create_backup(
         snapshot_vault = stage_path / "vault"
         snapshot_vault.mkdir()
         vault_snapshot = _capture_vault_snapshot(vault, snapshot_vault, limits)
-        open_snapshot_files.extend(vault_snapshot.files)
+        snapshot_files.extend(vault_snapshot.files)
         _snapshot_database(database, snapshot_db)
         database_snapshot = _open_database_snapshot(snapshot_db, limits)
-        open_snapshot_files.append(database_snapshot)
+        snapshot_files.append(database_snapshot)
         _backup_snapshot_checkpoint("database_snapshotted", stage_path)
         _revalidate_vault_snapshot(vault, vault_snapshot, limits)
         _validate_database_vault_bindings(
@@ -973,7 +984,7 @@ def create_backup(
             vault_snapshot.files,
         )
 
-        records = [item.record for item in open_snapshot_files]
+        records = [item.record for item in snapshot_files]
         records.sort(key=lambda item: item.path)
         directories = tuple(sorted(vault_snapshot.directories))
         total_bytes = sum(record.size for record in records)
@@ -984,7 +995,7 @@ def create_backup(
             raise BackupIntegrityError("Backup manifest exceeded its size limit")
         _backup_snapshot_checkpoint("manifest_built", stage_path)
 
-        by_path = {item.record.path: item for item in open_snapshot_files}
+        by_path = {item.record.path: item for item in snapshot_files}
         temp_descriptor = os.open(
             temp_path,
             os.O_RDWR
@@ -1040,8 +1051,6 @@ def create_backup(
     finally:
         if temp_descriptor >= 0:
             os.close(temp_descriptor)
-        for item in open_snapshot_files:
-            item.close()
         if temp_path.exists() and not _is_link_or_reparse(temp_path):
             temp_path.unlink()
         if stage_path is not None and stage_path.exists() and not _is_link_or_reparse(stage_path):

@@ -217,6 +217,43 @@ def test_backup_rejects_staged_file_mutation_after_manifest(
     assert not list((tmp_path / "backups").glob("*.zip"))
 
 
+def test_backup_uses_a_fixed_descriptor_bound_for_large_vaults(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    repo = _make_repo(tmp_path)
+    fixtures = repo.vault_path / "many-files"
+    fixtures.mkdir()
+    for index in range(1_000):
+        (fixtures / f"item-{index:04d}.txt").write_bytes(f"value-{index}".encode())
+
+    real_open = backups_module.os.open
+    real_close = backups_module.os.close
+    live_descriptors: set[int] = set()
+    maximum_live = 0
+
+    def tracked_open(*args, **kwargs):
+        nonlocal maximum_live
+        descriptor = real_open(*args, **kwargs)
+        live_descriptors.add(descriptor)
+        maximum_live = max(maximum_live, len(live_descriptors))
+        return descriptor
+
+    def tracked_close(descriptor: int):
+        try:
+            return real_close(descriptor)
+        finally:
+            live_descriptors.discard(descriptor)
+
+    monkeypatch.setattr(backups_module.os, "open", tracked_open)
+    monkeypatch.setattr(backups_module.os, "close", tracked_close)
+
+    backup = create_backup(repo.database_path, repo.vault_path, tmp_path / "backups")
+
+    assert backup.file_count >= 1_001
+    assert maximum_live <= 8
+    assert live_descriptors == set()
+
+
 def test_restore_rejects_archive_path_swap_after_descriptor_hash(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):

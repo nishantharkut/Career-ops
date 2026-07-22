@@ -685,6 +685,8 @@ param([string]$ScriptPath, [string]$Root, [string]$FixtureExecutable)
 $script:HarnessRoot = $Root
 $script:RemovedRules = @()
 $script:StoppedProcesses = @()
+$script:AliveProcesses = @{ 4201 = $true; 4202 = $true; 4203 = $true }
+$script:ListenerOwner = 0
 $script:Rules = @{
     "CareerOps-Ollama-runtime-intent" = [pscustomobject]@{ Name = "CareerOps-Ollama-runtime-intent"; DisplayName = "CareerOps-Ollama-runtime-intent"; Description = "CareerOps managed Ollama runtime 11111111111111111111111111111111"; Enabled = "True"; Direction = "Outbound"; Action = "Block"; Profile = "Any" }
     "CareerOps-Ollama-runtime-launched" = [pscustomobject]@{ Name = "CareerOps-Ollama-runtime-launched"; DisplayName = "CareerOps-Ollama-runtime-launched"; Description = "CareerOps managed Ollama runtime 22222222222222222222222222222222"; Enabled = "True"; Direction = "Outbound"; Action = "Block"; Profile = "Any" }
@@ -719,23 +721,33 @@ function Get-NetFirewallAddressFilter {
 function Get-Process {
     [CmdletBinding()]
     param([int]$Id)
-    if ($Id -in @(4201, 4202, 4203)) {
+    if ($Id -in @(4201, 4202, 4203) -and $script:AliveProcesses[$Id]) {
         $Instance = switch ($Id) { 4201 { "runtime-launched" } 4202 { "runtime-starting" } 4203 { "runtime-intent-started" } }
-        return [pscustomobject]@{
+        $Process = [pscustomobject]@{
             Id = $Id
             Path = (Join-Path $script:HarnessRoot "$Instance/bin/ollama.exe")
             StartTime = [DateTime]::ParseExact("2026-07-22T10:00:00.0000000Z", "o", [System.Globalization.CultureInfo]::InvariantCulture, [System.Globalization.DateTimeStyles]::RoundtripKind)
         }
+        $Process | Add-Member -MemberType ScriptMethod -Name WaitForExit -Value {
+            param([int]$Milliseconds)
+            $script:AliveProcesses[[int]$this.Id] = $false
+            return $true
+        }
+        return $Process
     }
     return $null
 }
 function Get-CimInstance {
     [CmdletBinding()]
     param([string]$ClassName)
-    return @(
-        [pscustomobject]@{ ProcessId = 4202; ExecutablePath = (Join-Path $script:HarnessRoot "runtime-starting/bin/ollama.exe") },
-        [pscustomobject]@{ ProcessId = 4203; ExecutablePath = (Join-Path $script:HarnessRoot "runtime-intent-started/bin/ollama.exe") }
-    )
+    $Observed = @()
+    if ($script:AliveProcesses[4202]) {
+        $Observed += [pscustomobject]@{ ProcessId = 4202; ExecutablePath = (Join-Path $script:HarnessRoot "runtime-starting/bin/ollama.exe") }
+    }
+    if ($script:AliveProcesses[4203]) {
+        $Observed += [pscustomobject]@{ ProcessId = 4203; ExecutablePath = (Join-Path $script:HarnessRoot "runtime-intent-started/bin/ollama.exe") }
+    }
+    return $Observed
 }
 function Stop-Process {
     [CmdletBinding()]
@@ -745,6 +757,7 @@ function Stop-Process {
 function Get-NetTCPConnection {
     [CmdletBinding()]
     param([string]$State, [int]$LocalPort)
+    if ($script:ListenerOwner -eq 0) { return @() }
     return [pscustomobject]@{
         OwningProcess = $script:ListenerOwner
         LocalAddress = "127.0.0.1"
@@ -892,6 +905,236 @@ if (-not $Rejected -or -not $RecordExists -or $script:Removed) { throw "unsafe r
         "rejected": True,
         "removed": False,
     }
+
+
+@pytest.mark.skipif(
+    shutil.which("pwsh") is None and shutil.which("powershell") is None,
+    reason="PowerShell is unavailable",
+)
+@pytest.mark.parametrize(
+    ("scenario", "wait_result", "expect_failure", "expect_stop"),
+    [
+        ("direct", False, True, True),
+        ("recovery", False, True, True),
+        ("direct", True, False, True),
+        ("pid_reuse", True, True, False),
+    ],
+)
+def test_windows_cleanup_removes_isolation_only_after_verified_process_exit(
+    tmp_path: Path,
+    scenario: str,
+    wait_result: bool,
+    expect_failure: bool,
+    expect_stop: bool,
+) -> None:
+    powershell = shutil.which("pwsh") or shutil.which("powershell")
+    script = Path(__file__).resolve().parents[1] / "scripts" / "start-managed-ollama.ps1"
+    root = tmp_path / "runtime"
+    instance = root / "runtime-cleanup"
+    owned = instance / "bin" / "ollama.exe"
+    owned.parent.mkdir(parents=True)
+    owned.write_bytes(b"owned-cleanup")
+    started_at = "2026-07-22T11:00:00.0000000Z"
+    digest = hashlib.sha256(b"owned-cleanup").hexdigest()
+    record = instance / "launch-record.json"
+    record.write_text(
+        json.dumps(
+            {
+                "version": 2,
+                "runtime_instance_id": "runtime-cleanup",
+                "isolation_rule_id": "CareerOps-Ollama-runtime-cleanup",
+                "owned_executable": str(owned),
+                "endpoint": "http://127.0.0.1:11434",
+                "model": "qwen2.5:7b",
+                "process_id": 4301,
+                "runtime_handle": "pid:4301",
+                "process_started_at": started_at,
+                "executable_sha256": digest,
+                "executable_size": len(b"owned-cleanup"),
+                "firewall_rule_token": "6" * 32,
+                "state": "launched",
+            }
+        ),
+        encoding="utf-8",
+    )
+    fixture = tmp_path / "fixture.exe"
+    fixture.write_bytes(b"fixture")
+    harness = tmp_path / "cleanup-harness.ps1"
+    harness.write_text(
+        r'''
+param(
+    [string]$ScriptPath,
+    [string]$Root,
+    [string]$Fixture,
+    [string]$Scenario,
+    [string]$WaitResult
+)
+. $ScriptPath -Action Recover -ExecutablePath $Fixture -Model "qwen2.5:7b" -RuntimeRoot $Root
+$script:HarnessRoot = $Root
+$script:Alive = $true
+$script:WaitSucceeds = $WaitResult -eq "true"
+$script:PidReused = $Scenario -eq "pid_reuse"
+$script:RuleExists = $true
+$script:StopCalled = $false
+$RuleName = "CareerOps-Ollama-runtime-cleanup"
+$OwnedExecutable = Join-Path $Root "runtime-cleanup/bin/ollama.exe"
+$RecordPath = Join-Path $Root "runtime-cleanup/launch-record.json"
+$StartedAt = "2026-07-22T11:00:00.0000000Z"
+$Digest = (Get-FileHash -LiteralPath $OwnedExecutable -Algorithm SHA256).Hash.ToLowerInvariant()
+$Size = (Get-Item -LiteralPath $OwnedExecutable).Length
+function New-FakeOwnedProcess {
+    $Process = [pscustomobject]@{
+        Id = 4301
+        Path = $script:OwnedExecutable
+        StartTime = [DateTime]::ParseExact(
+            "2026-07-22T11:00:00.0000000Z",
+            "o",
+            [System.Globalization.CultureInfo]::InvariantCulture,
+            [System.Globalization.DateTimeStyles]::RoundtripKind
+        )
+    }
+    $Process | Add-Member -MemberType ScriptMethod -Name WaitForExit -Value {
+        param([int]$Milliseconds)
+        if ($script:WaitSucceeds) { $script:Alive = $false }
+        return $script:WaitSucceeds
+    }
+    return $Process
+}
+$script:OwnedExecutable = $OwnedExecutable
+function Get-Process {
+    [CmdletBinding()]
+    param([int]$Id)
+    if ($Id -eq 4301 -and $script:Alive -and $script:PidReused) {
+        return [pscustomobject]@{
+            Id = 4301
+            Path = $Fixture
+            StartTime = [DateTime]::ParseExact(
+                "2026-07-22T11:01:00.0000000Z",
+                "o",
+                [System.Globalization.CultureInfo]::InvariantCulture,
+                [System.Globalization.DateTimeStyles]::RoundtripKind
+            )
+        }
+    }
+    if ($Id -eq 4301 -and $script:Alive) { return New-FakeOwnedProcess }
+    return $null
+}
+function Get-CimInstance {
+    [CmdletBinding()]
+    param([string]$ClassName)
+    if ($script:Alive) {
+        return [pscustomobject]@{ ProcessId = 4301; ExecutablePath = $script:OwnedExecutable }
+    }
+    return @()
+}
+function Stop-Process {
+    [CmdletBinding()]
+    param([int]$Id, [switch]$Force)
+    $script:StopCalled = $true
+}
+function Get-NetTCPConnection {
+    [CmdletBinding()]
+    param([string]$State, [int]$LocalPort)
+    if ($script:Alive) {
+        return [pscustomobject]@{ OwningProcess = 4301; LocalAddress = "127.0.0.1" }
+    }
+    return @()
+}
+function Get-NetFirewallRule {
+    [CmdletBinding()]
+    param([string]$Name)
+    if ($script:RuleExists) {
+        return [pscustomobject]@{
+            Name = $Name
+            DisplayName = $Name
+            Description = "CareerOps managed Ollama runtime 66666666666666666666666666666666"
+            Enabled = "True"
+            Direction = "Outbound"
+            Action = "Block"
+            Profile = "Any"
+        }
+    }
+    return $null
+}
+function Get-NetFirewallApplicationFilter {
+    [CmdletBinding()]
+    param([Parameter(ValueFromPipeline = $true)]$InputObject)
+    process { [pscustomobject]@{ Program = $script:OwnedExecutable } }
+}
+function Get-NetFirewallAddressFilter {
+    [CmdletBinding()]
+    param([Parameter(ValueFromPipeline = $true)]$InputObject)
+    process { [pscustomobject]@{ RemoteAddress = $NonLoopbackRanges } }
+}
+function Remove-NetFirewallRule {
+    [CmdletBinding()]
+    param([string]$Name)
+    $script:RuleExists = $false
+}
+$Failed = $false
+try {
+    if ($Scenario -eq "recovery") {
+        Recover-PendingLaunches -Root $Root | Out-Null
+    }
+    else {
+        Complete-ManagedRuntimeCleanup `
+            -Root (Join-Path $Root "runtime-cleanup") `
+            -OwnedExecutable $OwnedExecutable `
+            -OwnedProcessId 4301 `
+            -ExpectedStartedAt $StartedAt `
+            -ExpectedExecutableSha256 $Digest `
+            -ExpectedExecutableSize $Size `
+            -RuleName $RuleName `
+            -RuleToken "66666666666666666666666666666666" `
+            -RecordPath $RecordPath
+    }
+}
+catch { $Failed = $true }
+[ordered]@{
+    failed = $Failed
+    alive = $script:Alive
+    stop_called = $script:StopCalled
+    rule_exists = $script:RuleExists
+    record_exists = (Test-Path -LiteralPath $RecordPath)
+} | ConvertTo-Json -Compress
+''',
+        encoding="utf-8",
+    )
+
+    completed = subprocess.run(
+        [
+            powershell,
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            str(harness),
+            "-ScriptPath",
+            str(script),
+            "-Root",
+            str(root),
+            "-Fixture",
+            str(fixture),
+            "-Scenario",
+            scenario,
+            "-WaitResult",
+            str(wait_result).lower(),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    result = json.loads(completed.stdout.strip().splitlines()[-1])
+    assert result["failed"] is expect_failure
+    assert result["stop_called"] is expect_stop
+    assert result["alive"] is expect_failure
+    assert result["rule_exists"] is expect_failure
+    assert result["record_exists"] is expect_failure
 
 
 def _container_record(*, model: str = "qwen2.5:7b") -> RuntimeLaunchRecord:

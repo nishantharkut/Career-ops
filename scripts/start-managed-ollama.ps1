@@ -405,23 +405,16 @@ function Recover-PendingLaunches {
                     -ExpectedExecutableSize $RecordExecutableSize | Out-Null
             }
         }
-        $Rule = Get-NetFirewallRule -Name $Record.isolation_rule_id -ErrorAction SilentlyContinue
-        if ($null -ne $Rule) {
-            Assert-FirewallBoundary `
-                -RuleName $Record.isolation_rule_id `
-                -OwnedExecutable $ExpectedExecutable `
-                -RuleToken $RecordFirewallToken
-        }
-        if ($null -ne $Candidate) {
-            Stop-Process -Id $RecordProcessId -Force -ErrorAction Stop
-        }
-        if ($null -ne $Rule) {
-            Remove-NetFirewallRule -Name $Record.isolation_rule_id -ErrorAction Stop
-            if (Get-NetFirewallRule -Name $Record.isolation_rule_id -ErrorAction SilentlyContinue) {
-                throw "Managed Ollama firewall rule was not removed"
-            }
-        }
-        Remove-Item -LiteralPath $RecordPath -Force -ErrorAction Stop
+        Complete-ManagedRuntimeCleanup `
+            -Root $Directory.FullName `
+            -OwnedExecutable $ExpectedExecutable `
+            -OwnedProcessId $RecordProcessId `
+            -ExpectedStartedAt $RecordProcessStartedAt `
+            -ExpectedExecutableSha256 $RecordExecutableSha256 `
+            -ExpectedExecutableSize $RecordExecutableSize `
+            -RuleName ([string]$Record.isolation_rule_id) `
+            -RuleToken $RecordFirewallToken `
+            -RecordPath $RecordPath
         $Recovered += $Directory.Name
     }
     return $Recovered
@@ -494,6 +487,122 @@ function Assert-OwnedProcess {
         throw "Managed Ollama process executable identity did not match"
     }
     return $Process
+}
+
+function Get-OwnedProcessIfPresent {
+    param([Parameter(Mandatory = $true)][int]$OwnedProcessId)
+    try {
+        return Get-Process -Id $OwnedProcessId -ErrorAction Stop
+    }
+    catch {
+        if ($_.FullyQualifiedErrorId -notlike "NoProcessFoundForGivenId*") {
+            throw
+        }
+        return $null
+    }
+}
+
+function Assert-OwnedRuntimeTerminated {
+    param(
+        [Parameter(Mandatory = $true)][string]$OwnedExecutable,
+        [Parameter(Mandatory = $true)][int]$OwnedProcessId,
+        [Parameter(Mandatory = $true)][string]$ExpectedExecutableSha256,
+        [Parameter(Mandatory = $true)][int64]$ExpectedExecutableSize
+    )
+    $ExecutableIdentity = Get-ExecutableIdentity -OwnedExecutable $OwnedExecutable
+    if (
+        $ExecutableIdentity.Sha256 -ne $ExpectedExecutableSha256 -or
+        $ExecutableIdentity.Size -ne $ExpectedExecutableSize
+    ) {
+        throw "Managed Ollama executable identity changed during cleanup"
+    }
+    if ($OwnedProcessId -gt 0) {
+        $RemainingPid = Get-OwnedProcessIfPresent -OwnedProcessId $OwnedProcessId
+        if ($null -ne $RemainingPid) {
+            $RemainingPath = ""
+            try {
+                $RemainingPath = [System.IO.Path]::GetFullPath([string]$RemainingPid.Path)
+            }
+            catch {
+                throw "Managed Ollama process termination could not be verified"
+            }
+            if ($RemainingPath -eq $OwnedExecutable) {
+                throw "Managed Ollama process remained after termination"
+            }
+        }
+    }
+    foreach ($ObservedProcess in @(Get-CimInstance Win32_Process -ErrorAction Stop)) {
+        if ($null -eq $ObservedProcess.ExecutablePath) {
+            continue
+        }
+        try {
+            $ObservedExecutable = [System.IO.Path]::GetFullPath(
+                [string]$ObservedProcess.ExecutablePath
+            )
+        }
+        catch {
+            throw "Managed Ollama process enumeration was inconclusive"
+        }
+        if ($ObservedExecutable -eq $OwnedExecutable) {
+            throw "Managed Ollama owned executable remained after termination"
+        }
+    }
+    $RemainingListeners = @(Get-NetTCPConnection `
+        -State Listen `
+        -LocalPort $Port `
+        -ErrorAction Stop)
+    if ($RemainingListeners.Count -ne 0) {
+        throw "Managed Ollama endpoint remained after termination"
+    }
+}
+
+function Complete-ManagedRuntimeCleanup {
+    param(
+        [Parameter(Mandatory = $true)][string]$Root,
+        [Parameter(Mandatory = $true)][string]$OwnedExecutable,
+        [Parameter(Mandatory = $true)][int]$OwnedProcessId,
+        [Parameter(Mandatory = $true)][AllowEmptyString()][string]$ExpectedStartedAt,
+        [Parameter(Mandatory = $true)][string]$ExpectedExecutableSha256,
+        [Parameter(Mandatory = $true)][int64]$ExpectedExecutableSize,
+        [Parameter(Mandatory = $true)][string]$RuleName,
+        [Parameter(Mandatory = $true)][string]$RuleToken,
+        [Parameter(Mandatory = $true)][string]$RecordPath
+    )
+    $Rule = Get-NetFirewallRule -Name $RuleName -ErrorAction SilentlyContinue
+    if ($null -ne $Rule) {
+        Assert-FirewallBoundary `
+            -RuleName $RuleName `
+            -OwnedExecutable $OwnedExecutable `
+            -RuleToken $RuleToken
+    }
+    if ($OwnedProcessId -gt 0) {
+        $OwnedProcess = Get-OwnedProcessIfPresent -OwnedProcessId $OwnedProcessId
+        if ($null -ne $OwnedProcess) {
+            $OwnedProcess = Assert-OwnedProcess `
+                -Root $Root `
+                -OwnedExecutable $OwnedExecutable `
+                -OwnedProcessId $OwnedProcessId `
+                -ExpectedStartedAt $ExpectedStartedAt `
+                -ExpectedExecutableSha256 $ExpectedExecutableSha256 `
+                -ExpectedExecutableSize $ExpectedExecutableSize
+            Stop-Process -Id $OwnedProcessId -Force -ErrorAction Stop
+            if (-not $OwnedProcess.WaitForExit(10000)) {
+                throw "Managed Ollama process did not terminate within the cleanup timeout"
+            }
+        }
+    }
+    Assert-OwnedRuntimeTerminated `
+        -OwnedExecutable $OwnedExecutable `
+        -OwnedProcessId $OwnedProcessId `
+        -ExpectedExecutableSha256 $ExpectedExecutableSha256 `
+        -ExpectedExecutableSize $ExpectedExecutableSize
+    if ($null -ne $Rule) {
+        Remove-NetFirewallRule -Name $RuleName -ErrorAction Stop
+        if (Get-NetFirewallRule -Name $RuleName -ErrorAction SilentlyContinue) {
+            throw "Managed Ollama firewall rule was not removed"
+        }
+    }
+    Remove-Item -LiteralPath $RecordPath -Force -ErrorAction Stop
 }
 
 function Assert-LocalModel {
@@ -733,29 +842,16 @@ if ($Action -eq "Verify") {
     exit 0
 }
 
-Assert-FirewallBoundary `
-    -RuleName $IsolationRuleId `
+Complete-ManagedRuntimeCleanup `
+    -Root $Paths.InstanceRoot `
     -OwnedExecutable $Paths.OwnedExecutable `
-    -RuleToken $FirewallRuleToken
-$OwnedProcess = Get-Process -Id $ProcessId -ErrorAction SilentlyContinue
-if ($null -ne $OwnedProcess) {
-    Assert-OwnedProcess `
-        -Root $Paths.InstanceRoot `
-        -OwnedExecutable $Paths.OwnedExecutable `
-        -OwnedProcessId $ProcessId `
-        -ExpectedStartedAt $ProcessStartedAt `
-        -ExpectedExecutableSha256 $ExecutableSha256 `
-        -ExpectedExecutableSize $ExecutableSize | Out-Null
-    $OwnedProcess | Stop-Process -Force -ErrorAction Stop
-    $OwnedProcess.WaitForExit(10000)
-}
-Remove-NetFirewallRule -Name $IsolationRuleId -ErrorAction Stop
-if (Get-NetFirewallRule -Name $IsolationRuleId -ErrorAction SilentlyContinue) {
-    throw "Managed Ollama firewall rule was not removed"
-}
-if (Test-Path -LiteralPath $Paths.LaunchRecord) {
-    Remove-Item -LiteralPath $Paths.LaunchRecord -Force -ErrorAction Stop
-}
+    -OwnedProcessId $ProcessId `
+    -ExpectedStartedAt $ProcessStartedAt `
+    -ExpectedExecutableSha256 $ExecutableSha256 `
+    -ExpectedExecutableSize $ExecutableSize `
+    -RuleName $IsolationRuleId `
+    -RuleToken $FirewallRuleToken `
+    -RecordPath $Paths.LaunchRecord
 [ordered]@{
     stopped = $true
     runtime_instance_id = $RuntimeInstanceId
