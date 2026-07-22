@@ -76,7 +76,7 @@ Tests verify:
 - cloud tasks reject missing per-run transfer acknowledgement and persist its server timestamp
 - managed-runtime report approval and submission survive API restarts without trusting refreshed availability as historical evidence
 
-The mock-provider Playwright flow exercises create application, analyze JD, save a correction, add evidence and a profile fact, render risky and clean resumes, block and reject an unsafe claim, create a verified child draft, rerender and rerun, export artifacts, review claims, approve, submit manually, reload, and inspect history.
+The mock-provider Playwright flow exercises create application, analyze JD, save a correction, add evidence and a profile fact, render risky and clean resumes, block an altered unsupported metric with exact statement diagnostics, create a verified child draft, rerender and rerun, export artifacts, review claims, approve, submit manually, reload, and inspect history. An opt-in real-resume case imports the configured `.tex`, verifies its source SHA-256, renders and exports a one-page PDF, and completes fit review.
 
 ## Managed Runtime And Hosting
 
@@ -145,7 +145,7 @@ Normal pytest excludes real providers through the configured `not live_provider`
 .\.venv\Scripts\python.exe -m pytest -m live_provider -q
 ```
 
-The live tests use only synthetic JD fixture data under `tmp_path`. Codex selects `codex2` only and never falls back. Managed Ollama runs only through an explicitly configured managed runtime that has passed attestation; otherwise it skips with an unavailable reason.
+The live tests use only synthetic JD fixture data under `tmp_path`. Codex selects `codex2` only and never falls back to another identity. The Codex smoke starts a persisted thread and proves a second structured task resumes the exact UUID. Managed Ollama runs only through an explicitly configured managed runtime that has passed attestation; otherwise it skips with an unavailable reason.
 
 ## Release Gate
 

@@ -1,0 +1,78 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "task_type": {
+      "const": "analyze_fit",
+      "title": "Task Type",
+      "type": "string"
+    },
+    "score": {
+      "maximum": 100,
+      "minimum": 0,
+      "title": "Score",
+      "type": "integer"
+    },
+    "matches": {
+      "items": {
+        "maxLength": 500,
+        "minLength": 1,
+        "type": "string"
+      },
+      "maxItems": 30,
+      "title": "Matches",
+      "type": "array"
+    },
+    "gaps": {
+      "items": {
+        "maxLength": 500,
+        "minLength": 1,
+        "type": "string"
+      },
+      "maxItems": 30,
+      "title": "Gaps",
+      "type": "array"
+    },
+    "blockers": {
+      "items": {
+        "maxLength": 500,
+        "minLength": 1,
+        "type": "string"
+      },
+      "maxItems": 30,
+      "title": "Blockers",
+      "type": "array"
+    },
+    "warnings": {
+      "items": {
+        "maxLength": 500,
+        "minLength": 1,
+        "type": "string"
+      },
+      "maxItems": 30,
+      "title": "Warnings",
+      "type": "array"
+    },
+    "recommendations": {
+      "items": {
+        "maxLength": 500,
+        "minLength": 1,
+        "type": "string"
+      },
+      "maxItems": 30,
+      "title": "Recommendations",
+      "type": "array"
+    }
+  },
+  "required": [
+    "task_type",
+    "score",
+    "matches",
+    "gaps",
+    "blockers",
+    "warnings",
+    "recommendations"
+  ],
+  "title": "AnalyzeFitOutput",
+  "type": "object"
+}

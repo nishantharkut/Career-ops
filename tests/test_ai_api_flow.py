@@ -46,7 +46,8 @@ VALID_OUTPUTS: dict[str, dict[str, Any]] = {
         "score": 80,
         "matches": [],
         "gaps": [],
-        "risks": [],
+        "blockers": [],
+        "warnings": [],
         "recommendations": [],
     },
     "suggest_resume_edits": {

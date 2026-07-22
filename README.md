@@ -68,6 +68,8 @@ npm run dev:api
 
 `codex2` is preferred when both identities pass discovery. `codex2` and `codex` are separate provider records with separate `CODEX_HOME` directories. A task stays bound to the selected identity; a failed `codex2` task is never retried through `codex`.
 
+CareerOps keeps one Codex conversation for each application and exact provider binding. Tasks for Google and Stripe do not share a conversation, and `codex2` never shares one with `codex`. Every turn still includes the complete current bounded CareerOps context, so saved session history adds continuity but never overrides the current JD, resume, facts, evidence, rejected claims, or privacy rules. If a saved thread cannot resume, CareerOps makes one fresh read-only call from the current context and records the task as `Rebuilt`.
+
 The approved `codex2.cmd` descriptor on `PATH` is exactly:
 
 ```bat
@@ -81,7 +83,7 @@ The native executable remains `codex.exe`; CareerOps validates and hashes it, va
 
 Codex is `cloud_external`: the bounded selected task prompt and context leave the machine through the selected signed-in ChatGPT account. The UI disables the run command until `Acknowledge Codex data transfer for this run` is checked. The API also requires that acknowledgement and persists it with a server timestamp on the immutable task record. The acknowledgement resets after a launch or provider/task change. No API key or account secret is stored in source.
 
-The provider label identifies `Codex account 2 (codex2)` or `Codex default (codex)`. The task panel shows the selected provider identity, model, privacy mode, task ID, prompt ID, and prompt checksum. Provider output and invocation provenance are checksummed in the task vault.
+The provider label identifies `Codex account 2 (codex2)` or `Codex default (codex)`. The task panel shows the selected provider identity, model, privacy mode, task ID, prompt ID, prompt checksum, and context state (`Started`, `Continued`, or `Rebuilt`). Provider output and invocation provenance are checksummed in the task vault.
 
 Availability checks:
 

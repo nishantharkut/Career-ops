@@ -24,6 +24,7 @@ from careerops.core.repository import CareerOpsRepository
 
 
 UNSAFE_METRIC = "Improved service throughput by 70+ percent without verified evidence."
+UNSUPPORTED_OUTPUT_METRIC = "Improved service throughput by 95+ percent without verified evidence."
 RESUME_SOURCE = "Worked on healthcare automation testing and release support with evidence-backed claims only."
 RESUME_REPLACEMENT = "Worked on healthcare automation testing, release support, and production software delivery."
 CONTROL_HEADER = "X-CareerOps-E2E-Control"
@@ -167,9 +168,12 @@ def _mock_output(request: ProviderRequest) -> Mapping[str, Any]:
         return {
             "task_type": "analyze_fit",
             "score": 90,
-            "matches": [UNSAFE_METRIC] if UNSAFE_METRIC in source_text else [],
+            "matches": (
+                [UNSUPPORTED_OUTPUT_METRIC] if UNSAFE_METRIC in source_text else []
+            ),
             "gaps": [],
-            "risks": [],
+            "blockers": [],
+            "warnings": [],
             "recommendations": [],
         }
     if request.task_type == "suggest_resume_edits":

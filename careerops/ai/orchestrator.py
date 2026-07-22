@@ -31,7 +31,7 @@ from careerops.ai.providers.base import (
     ProviderTimeoutError,
     ProviderUnavailableError,
 )
-from careerops.ai.verifier import BLOCKING_CODES, VerifierFinding, verify_task_output
+from careerops.ai.verifier import VerifierFinding, verify_task_output
 from careerops.core.models import (
     AiArtifact,
     AiProviderConfig,
@@ -182,6 +182,7 @@ class AiOrchestrator:
                 template.text.encode("utf-8"),
                 context,
                 attempt_dir,
+                provider_kind=config.provider_kind,
             )
             artifacts.append(
                 self._save_artifact(
@@ -223,6 +224,13 @@ class AiOrchestrator:
             )
 
             self._validate_result_metadata(config, availability, result)
+            if config.provider_kind == "codex" and result.invocation.provider_thread_id:
+                self._repository.record_ai_task_provider_thread(
+                    task.id,
+                    claim_token,
+                    provider_thread_id=result.invocation.provider_thread_id,
+                    provider_thread_mode=result.invocation.provider_thread_mode,
+                )
             self._require_claim_heartbeat_healthy(
                 heartbeat_errors, heartbeat_lost
             )
@@ -515,6 +523,8 @@ class AiOrchestrator:
         prompt_bytes: bytes,
         context: ContextPacket,
         attempt_dir: Path,
+        *,
+        provider_kind: str,
     ) -> ProviderRequest:
         template = load_prompt_template(task.task_type.value)
         if (
@@ -540,14 +550,25 @@ class AiOrchestrator:
                 item["id"]
                 for item in context.to_dict().get("confirmed_profile_facts", [])
             )
+        provider_thread_id = (
+            self._repository.latest_ai_provider_thread(
+                application_id=task.application_id,
+                provider_config_id=task.provider_config_id,
+                provider_binding_sha256=task.provider_binding_sha256,
+            )
+            if provider_kind == "codex"
+            else None
+        )
         return ProviderRequest(
             task_id=task.id,
+            application_id=task.application_id,
             task_type=task.task_type.value,
             task_dir=attempt_dir,
             prompt_path=prompt_path,
             context_path=context_path,
             schema_path=schema_path,
             expected_claim_ids=expected_claim_ids,
+            provider_thread_id=provider_thread_id,
         )
 
     @staticmethod
@@ -629,17 +650,14 @@ class AiOrchestrator:
 
     @staticmethod
     def _verifier_finding_spec(finding: VerifierFinding) -> dict[str, Any]:
-        location = (
-            f"output item {finding.item_index}"
-            if finding.item_index is not None
-            else "provider output"
-        )
+        location_parts = [value for value in (finding.output_field,) if value]
+        if finding.item_index is not None:
+            location_parts.append(f"item {finding.item_index + 1}")
+        location = ", ".join(location_parts) or "provider output"
         return {
             "finding_type": finding.code,
-            "severity": (
-                "blocking" if finding.code in BLOCKING_CODES else "warning"
-            ),
-            "claim_text": f"{finding.code} in {location}",
+            "severity": "blocking" if finding.verifier_state == "blocked" else "warning",
+            "claim_text": finding.claim_text or f"{finding.code} in {location}",
             "evidence_item_id": finding.evidence_item_id,
             "recommendation": finding.recommendation,
             "verifier_state": finding.verifier_state,
@@ -647,6 +665,7 @@ class AiOrchestrator:
                 "claim_id": finding.claim_id,
                 "code": finding.code,
                 "item_index": finding.item_index,
+                "output_field": finding.output_field,
             },
         }
 
@@ -733,8 +752,8 @@ class AiOrchestrator:
                     "score": output.score,
                 },
                 "risks": {
-                    "blockers": [],
-                    "warnings": list(output.risks),
+                    "blockers": list(output.blockers),
+                    "warnings": list(output.warnings),
                 },
             }
 

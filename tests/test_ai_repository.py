@@ -367,6 +367,156 @@ def create_bound_task(
     )
 
 
+def test_ai_task_provider_thread_is_persisted_and_scoped_to_continuity_key(
+    tmp_path: Path,
+):
+    repo = make_repo(tmp_path)
+    first_application = create_application(repo)
+    second_application = repo.create_application(
+        company="Second Corp",
+        role_title="Backend Engineer",
+        location="India",
+        source_url="https://example.com/jobs/2",
+        jd_text="Build reliable backend services.",
+    )
+    provider = create_provider(repo)
+    first_task = create_task(repo, first_application.id, provider.id)
+    claim_token = claim_task(repo, first_task.id)
+    assert repo.begin_ai_task_invocation(first_task.id, claim_token) is True
+
+    thread_id = "019f9ef0-c752-7d31-91f6-29a91f6ee8e0"
+    persisted = repo.record_ai_task_provider_thread(
+        first_task.id,
+        claim_token,
+        provider_thread_id=thread_id,
+        provider_thread_mode="started",
+    )
+
+    assert persisted.provider_thread_id == thread_id
+    assert persisted.provider_thread_mode == "started"
+    assert (
+        repo.latest_ai_provider_thread(
+            application_id=first_application.id,
+            provider_config_id=provider.id,
+            provider_binding_sha256=provider.availability_binding_sha256,
+        )
+        == thread_id
+    )
+    assert (
+        repo.latest_ai_provider_thread(
+            application_id=second_application.id,
+            provider_config_id=provider.id,
+            provider_binding_sha256=provider.availability_binding_sha256,
+        )
+        is None
+    )
+
+
+def test_ai_task_provider_thread_requires_active_invocation_and_valid_metadata(
+    tmp_path: Path,
+):
+    repo = make_repo(tmp_path)
+    application = create_application(repo)
+    provider = create_provider(repo)
+    task = create_task(repo, application.id, provider.id)
+    claim_token = claim_task(repo, task.id)
+
+    with pytest.raises(ValueError, match="invocation is not active"):
+        repo.record_ai_task_provider_thread(
+            task.id,
+            claim_token,
+            provider_thread_id="019f9ef0-c752-7d31-91f6-29a91f6ee8e0",
+            provider_thread_mode="started",
+        )
+
+    assert repo.begin_ai_task_invocation(task.id, claim_token) is True
+    with pytest.raises(ValueError, match="thread ID"):
+        repo.record_ai_task_provider_thread(
+            task.id,
+            claim_token,
+            provider_thread_id="not-a-thread",
+            provider_thread_mode="started",
+        )
+    with pytest.raises(ValueError, match="thread mode"):
+        repo.record_ai_task_provider_thread(
+            task.id,
+            claim_token,
+            provider_thread_id="019f9ef0-c752-7d31-91f6-29a91f6ee8e0",
+            provider_thread_mode="unknown",
+        )
+
+
+def test_ai_task_provider_thread_database_guards_partial_and_mutated_values(
+    tmp_path: Path,
+):
+    repo = make_repo(tmp_path)
+    application = create_application(repo)
+    provider = create_provider(repo)
+    task = create_task(repo, application.id, provider.id)
+    thread_id = "019f9ef0-c752-7d31-91f6-29a91f6ee8e0"
+
+    with pytest.raises(sqlite3.IntegrityError, match="invalid AI task provider thread"):
+        with repo.connection() as connection:
+            connection.execute(
+                "UPDATE ai_tasks SET provider_thread_id = ? WHERE id = ?",
+                (thread_id, task.id),
+            )
+
+    with repo.connection() as connection:
+        connection.execute(
+            """
+            UPDATE ai_tasks
+            SET provider_thread_id = ?, provider_thread_mode = 'started'
+            WHERE id = ?
+            """,
+            (thread_id, task.id),
+        )
+
+    with pytest.raises(sqlite3.IntegrityError, match="immutable"):
+        with repo.connection() as connection:
+            connection.execute(
+                """
+                UPDATE ai_tasks
+                SET provider_thread_id = ?, provider_thread_mode = 'continued'
+                WHERE id = ?
+                """,
+                ("019f9ef1-0263-72ba-8de6-1125ead43a37", task.id),
+            )
+
+    persisted = repo.get_ai_task(task.id)
+    assert persisted.provider_thread_id == thread_id
+    assert persisted.provider_thread_mode == "started"
+
+
+def test_ai_task_claims_serialize_same_application_and_provider(
+    tmp_path: Path,
+):
+    repo = make_repo(tmp_path)
+    application = create_application(repo)
+    provider = repo.upsert_ai_provider(
+        provider_kind="codex",
+        display_name="Codex fixture",
+        privacy_mode="local_private",
+        endpoint="codex-identity://codex2",
+        identity_name="codex2",
+        model="fixture-v1",
+        enabled=True,
+        availability_binding=provider_binding(
+            provider_kind="codex",
+            endpoint="codex-identity://codex2",
+            identity_name="codex2",
+        ),
+    )
+    first_task = create_task(repo, application.id, provider.id)
+    second_task = create_task(repo, application.id, provider.id)
+
+    first_claim = claim_task(repo, first_task.id)
+    assert repo.claim_ai_task(second_task.id) is None
+
+    repo.fail_ai_task(first_task.id, first_claim, "provider_failed")
+    assert isinstance(repo.claim_ai_task(second_task.id), str)
+
+
 def write_attempt_artifact(
     repo: CareerOpsRepository,
     task_id: str,
@@ -6892,7 +7042,7 @@ def test_v15_upgrade_preserves_bindings_while_adding_container_image_identity(
             "SELECT * FROM ai_tasks WHERE id = ?", (task.id,)
         ).fetchone()
 
-    assert LATEST_SCHEMA_VERSION == 18
+    assert LATEST_SCHEMA_VERSION == 19
     assert upgraded_provider["enabled"] == 0
     assert upgraded_provider["availability_binding_json"] == expected_json
     assert upgraded_provider["availability_binding_sha256"] == expected_sha256

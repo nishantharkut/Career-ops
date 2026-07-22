@@ -40,6 +40,8 @@ const task = (overrides: Partial<AiTaskRecord> = {}): AiTaskRecord => ({
   privacy_mode: "cloud_external",
   cloud_transfer_acknowledged: true,
   cloud_transfer_acknowledged_at: "",
+  provider_thread_id: null,
+  provider_thread_mode: null,
   started_at: "",
   completed_at: "",
   error_summary: "",
@@ -401,8 +403,7 @@ describe("AI tasks panel", () => {
     expect(await screen.findByText("Decision: accepted")).toBeInTheDocument();
   });
 
-  test("rejects a blocked suggestion without ever offering acceptance and restores the decision", async () => {
-    let decision: "pending" | "rejected" = "pending";
+  test("shows exact blocked analysis findings without suggestion decisions", async () => {
     const blockedFinding = () => ({
       id: "aif_blocked",
       task_id: "ait_1",
@@ -412,40 +413,19 @@ describe("AI tasks panel", () => {
       evidence_item_id: null,
       recommendation: "Remove the unsupported metric",
       verifier_state: "blocked",
-      decision,
-      payload: {},
+      decision: "pending",
+      payload: { output_field: "matches", item_index: 0 },
       created_at: "",
       updated_at: ""
     });
-    const onPacketChanged = vi.fn();
-    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
       const url = String(input);
       if (url.endsWith("/ai/providers")) return jsonResponse([]);
       if (url.endsWith("/ai-tasks/ait_1/findings")) return jsonResponse([blockedFinding()]);
-      if (url.endsWith("/ai-findings/aif_blocked/decision")) {
-        expect(JSON.parse(String(init?.body))).toEqual({ decision: "rejected" });
-        decision = "rejected";
-        return jsonResponse(blockedFinding());
-      }
       throw new Error(`Unhandled request: ${url}`);
     });
     vi.stubGlobal("fetch", fetchMock);
 
-    const first = render(
-      <AiTasksPanel
-        applicationId="app_1"
-        initialTask={task({ task_type: "analyze_fit", status: "blocked" })}
-        onPacketChanged={onPacketChanged}
-      />
-    );
-
-    expect(await screen.findByText("Blocked by verifier")).toBeInTheDocument();
-    expect(screen.queryByRole("button", { name: /Accept/ })).not.toBeInTheDocument();
-    await userEvent.click(screen.getByRole("button", { name: "Reject suggestion" }));
-    expect(await screen.findByText("Decision: rejected")).toBeInTheDocument();
-    expect(onPacketChanged).toHaveBeenCalledTimes(1);
-
-    first.unmount();
     render(
       <AiTasksPanel
         applicationId="app_1"
@@ -453,12 +433,14 @@ describe("AI tasks panel", () => {
         onPacketChanged={vi.fn()}
       />
     );
-    expect(await screen.findByText("Decision: rejected")).toBeInTheDocument();
-    expect(screen.queryByRole("button", { name: /Accept|Reject/ })).not.toBeInTheDocument();
-    expect(screen.queryByRole("button", { name: "Create resume draft" })).not.toBeInTheDocument();
+
+    expect(await screen.findByText("Blocked by verifier")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /Accept/ })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /Reject/ })).not.toBeInTheDocument();
+    expect(fetchMock.mock.calls.some(([input]) => String(input).includes("/decision"))).toBe(false);
   });
 
-  test("disables rejection for a blocked finding when read-only", async () => {
+  test("labels needs-evidence analysis findings without offering decisions", async () => {
     const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
       const url = String(input);
       if (url.endsWith("/ai/providers")) return jsonResponse([]);
@@ -467,11 +449,11 @@ describe("AI tasks panel", () => {
           id: "aif_blocked",
           task_id: "ait_1",
           finding_type: "unsupported_metric",
-          severity: "blocking",
-          claim_text: "unsupported_metric in provider output",
+          severity: "warning",
+          claim_text: "Prioritize distributed systems ownership",
           evidence_item_id: null,
           recommendation: "Remove the unsupported metric",
-          verifier_state: "blocked",
+          verifier_state: "needs_evidence",
           decision: "pending",
           payload: {},
           created_at: "",
@@ -486,15 +468,50 @@ describe("AI tasks panel", () => {
       <AiTasksPanel
         applicationId="app_1"
         initialTask={task({ task_type: "analyze_fit", status: "blocked" })}
-        readOnly
         onPacketChanged={vi.fn()}
       />
     );
 
-    expect(await screen.findByText("Blocked by verifier")).toBeInTheDocument();
+    expect(await screen.findByText("Needs evidence")).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: /Accept/ })).not.toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Reject suggestion" })).toBeDisabled();
+    expect(screen.queryByRole("button", { name: /Reject/ })).not.toBeInTheDocument();
     expect(fetchMock.mock.calls.some(([input]) => String(input).includes("/decision"))).toBe(false);
+  });
+
+  test("shows whether Codex context was continued or rebuilt", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL) => {
+        const url = String(input);
+        if (url.endsWith("/ai/providers")) return jsonResponse([]);
+        if (url.endsWith("/ai-tasks/ait_1/findings")) return jsonResponse([]);
+        throw new Error(`Unhandled request: ${url}`);
+      })
+    );
+
+    const view = render(
+      <AiTasksPanel
+        applicationId="app_1"
+        initialTask={task({
+          provider_thread_id: "019f9ef0-c752-7d31-91f6-29a91f6ee8e0",
+          provider_thread_mode: "continued"
+        })}
+        onPacketChanged={vi.fn()}
+      />
+    );
+
+    expect(await screen.findByText("Continued")).toBeInTheDocument();
+    view.rerender(
+      <AiTasksPanel
+        applicationId="app_1"
+        initialTask={task({
+          provider_thread_id: "019f9ef1-0263-72ba-8de6-1125ead43a37",
+          provider_thread_mode: "rebuilt"
+        })}
+        onPacketChanged={vi.fn()}
+      />
+    );
+    expect(await screen.findByText("Rebuilt")).toBeInTheDocument();
   });
 
   test("disables AI task, finding decision, and draft controls when read-only", async () => {

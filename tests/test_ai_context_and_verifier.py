@@ -56,7 +56,8 @@ def _fit_output(**updates: object) -> dict[str, object]:
         "score": 72,
         "matches": ["Python"],
         "gaps": [],
-        "risks": ["Seniority is unspecified"],
+        "blockers": [],
+        "warnings": ["Seniority is unspecified"],
         "recommendations": [],
     }
     output.update(updates)
@@ -2511,14 +2512,14 @@ def test_fit_analysis_requires_candidate_and_job_grounding_by_field():
     grounded = _fit_output(
         matches=["Python"],
         gaps=["Kubernetes"],
-        risks=["Seniority is unspecified"],
+        warnings=["Seniority is unspecified"],
         recommendations=["Show relevant backend evidence"],
     )
     invented = _fit_output(
         score=100,
         matches=["Kubernetes leadership"],
         gaps=["Python"],
-        risks=[],
+        warnings=[],
         recommendations=[],
     )
 
@@ -2542,11 +2543,113 @@ def test_fit_metric_cannot_be_authorized_only_by_the_job_description():
     )
 
     result = verify_analyze_fit(
-        _fit_output(matches=["Serve 70+ clients"], gaps=[], risks=[], recommendations=[]),
+        _fit_output(matches=["Serve 70+ clients"], gaps=[], warnings=[], recommendations=[]),
         context=context,
     )
 
     assert "unsupported_metric" in {finding.code for finding in result.findings}
+
+
+def test_fit_metric_in_a_match_can_be_grounded_by_the_candidate_resume():
+    context = ContextPacketBuilder().build(
+        "analyze_fit",
+        job_description={
+            "snapshot_id": "jd-candidate-metric",
+            "text": "Python backend role",
+        },
+        resume={
+            "version_id": "resume-candidate-metric",
+            "source_kind": "latex",
+            "source_text": "Served 70+ clients using Python",
+        },
+    )
+
+    result = verify_analyze_fit(
+        _fit_output(
+            matches=["Served 70+ clients using Python"],
+            warnings=[],
+        ),
+        context=context,
+    )
+
+    assert result.safe is True
+    assert "unsupported_metric" not in {finding.code for finding in result.findings}
+
+
+def test_ordinary_applicant_submission_instruction_is_not_prompt_injection():
+    context = ContextPacketBuilder().build(
+        "analyze_fit",
+        job_description={
+            "snapshot_id": "jd-ordinary-submission",
+            "text": (
+                "Python backend role. Applicants must include a resume and "
+                "current contact details with the application."
+            ),
+        },
+        resume={
+            "version_id": "resume-ordinary-submission",
+            "source_kind": "latex",
+            "source_text": "Python backend developer",
+        },
+    )
+
+    result = verify_analyze_fit(_fit_output(), context=context)
+
+    assert result.safe is True
+    assert "prompt_injection_echo" not in {finding.code for finding in result.findings}
+
+
+def test_analysis_warning_identifies_exact_field_and_statement_without_blocking():
+    recommendation = "Prioritize demonstrable distributed systems ownership"
+    context = ContextPacketBuilder().build(
+        "analyze_fit",
+        job_description={"snapshot_id": "jd-warning", "text": "Python backend role"},
+        resume={
+            "version_id": "resume-warning",
+            "source_kind": "latex",
+            "source_text": "Python backend developer",
+        },
+    )
+
+    result = verify_analyze_fit(
+        _fit_output(recommendations=[recommendation]),
+        context=context,
+    )
+
+    finding = next(item for item in result.findings if item.code == "unsupported_claim")
+    assert result.safe is True
+    assert finding.verifier_state == "needs_evidence"
+    assert finding.output_field == "recommendations"
+    assert finding.item_index == 0
+    assert finding.claim_text == recommendation
+
+
+def test_unsupported_fit_match_remains_blocked_and_identifies_exact_statement():
+    claim = "Kubernetes leadership"
+    context = ContextPacketBuilder().build(
+        "analyze_fit",
+        job_description={
+            "snapshot_id": "jd-unsupported-match",
+            "text": "Kubernetes is required",
+        },
+        resume={
+            "version_id": "resume-unsupported-match",
+            "source_kind": "latex",
+            "source_text": "Python developer",
+        },
+    )
+
+    result = verify_analyze_fit(
+        _fit_output(matches=[claim], warnings=[]),
+        context=context,
+    )
+
+    finding = next(item for item in result.findings if item.code == "unsupported_claim")
+    assert result.safe is False
+    assert finding.verifier_state == "blocked"
+    assert finding.output_field == "matches"
+    assert finding.item_index == 0
+    assert finding.claim_text == claim
 
 
 def test_punctuation_cannot_promote_unverified_resume_text_to_a_factual_clause():
@@ -2608,7 +2711,7 @@ def test_private_classification_stays_local_and_packet_repr_hides_resume_text():
     assert private_fact not in repr(context)
     result = verify_analyze_fit(
         _fit_output(
-            matches=[private_fact], gaps=[], risks=[], recommendations=[]
+            matches=[private_fact], gaps=[], warnings=[], recommendations=[]
         ),
         context=context,
     )
@@ -2815,7 +2918,7 @@ def test_maximum_analysis_shape_reuses_precomputed_source_grounding():
         (
             "Kubernetes role",
             "I do not know Kubernetes",
-            _fit_output(matches=["Kubernetes"], gaps=[], risks=[], recommendations=[]),
+            _fit_output(matches=["Kubernetes"], gaps=[], warnings=[], recommendations=[]),
         ),
         (
             "Python may be useful.",
@@ -2916,7 +3019,7 @@ def test_generic_prefix_of_private_evidence_does_not_overblock_fit_analysis():
     )
 
     result = verify_analyze_fit(
-        _fit_output(matches=["Python backend"], gaps=[], risks=[], recommendations=[]),
+        _fit_output(matches=["Python backend"], gaps=[], warnings=[], recommendations=[]),
         context=context,
     )
 
@@ -3115,7 +3218,7 @@ def test_rehashed_private_sidecar_cannot_reuse_the_original_packet_authority():
     )
 
     result = verify_analyze_fit(
-        _fit_output(matches=["Python"], gaps=[], risks=[], recommendations=[]),
+        _fit_output(matches=["Python"], gaps=[], warnings=[], recommendations=[]),
         context=forged,
     )
 
@@ -3296,7 +3399,7 @@ def test_claim_review_cannot_ignore_unreferenced_exact_verified_evidence():
         (
             "Kubernetes role",
             "I am unfamiliar with Kubernetes.",
-            _fit_output(matches=["Kubernetes"], gaps=[], risks=[], recommendations=[]),
+            _fit_output(matches=["Kubernetes"], gaps=[], warnings=[], recommendations=[]),
         ),
     ],
 )
@@ -3686,7 +3789,7 @@ def test_candidate_modality_cannot_become_confirmed_fit(resume_text: str):
     )
 
     result = verify_analyze_fit(
-        _fit_output(matches=["Kubernetes"], gaps=[], risks=[], recommendations=[]),
+        _fit_output(matches=["Kubernetes"], gaps=[], warnings=[], recommendations=[]),
         context=context,
     )
 
@@ -4192,7 +4295,7 @@ def test_learning_intent_cannot_become_confirmed_fit():
         },
     )
     result = verify_analyze_fit(
-        _fit_output(matches=["Kubernetes"], gaps=[], risks=[], recommendations=[]),
+        _fit_output(matches=["Kubernetes"], gaps=[], warnings=[], recommendations=[]),
         context=context,
     )
 

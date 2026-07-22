@@ -98,7 +98,7 @@ _SOURCE_DIRECTIVE_PATTERN = re.compile(
     r"\b(?:do\s+not|don't|never|please|kindly|always)\s+"
     r"(?:claim|include|list|output|report|return|say|state)\b|"
     r"\byou\s+should\s+(?:claim|include|list|output|report|return|say|state)\b|"
-    r"\bmust\s+(?:claim|include|list|output|report|return|say|state)\b|"
+    r"\bmust\s+(?:claim|list|output|report|return|say|state)\b|"
     r"\bmake\s+sure\s+to\s+"
     r"(?:claim|include|list|output|report|return|say|state)\b)"
 )
@@ -393,6 +393,8 @@ _GENERIC_TECH_CONTEXT_LEXEMES = frozenset(
 class VerifierFinding:
     code: str
     verifier_state: str = "blocked"
+    output_field: str | None = None
+    claim_text: str | None = None
     item_index: int | None = None
     claim_id: str | None = None
     evidence_item_id: str | None = None
@@ -407,7 +409,9 @@ class VerificationResult:
 
     @property
     def safe(self) -> bool:
-        return not self.findings and self.output is not None
+        return self.output is not None and not any(
+            finding.verifier_state == "blocked" for finding in self.findings
+        )
 
 
 @dataclass(frozen=True)
@@ -446,12 +450,18 @@ MaterialCache = dict[tuple[str, str], Any]
 def _finding(
     code: str,
     *,
+    verifier_state: str = "blocked",
+    output_field: str | None = None,
+    claim_text: str | None = None,
     item_index: int | None = None,
     claim_id: str | None = None,
     evidence_item_id: str | None = None,
 ) -> VerifierFinding:
     return VerifierFinding(
         code=code,
+        verifier_state=verifier_state,
+        output_field=output_field,
+        claim_text=claim_text,
         item_index=item_index,
         claim_id=claim_id,
         evidence_item_id=evidence_item_id,
@@ -465,6 +475,8 @@ def _normalized_findings(
     unique: dict[tuple[Any, ...], VerifierFinding] = {}
     for finding in findings:
         key = (
+            finding.output_field,
+            finding.claim_text,
             finding.item_index,
             finding.claim_id,
             finding.evidence_item_id,
@@ -475,7 +487,9 @@ def _normalized_findings(
         sorted(
             unique.values(),
             key=lambda finding: (
+                finding.output_field or "",
                 finding.item_index if finding.item_index is not None else -1,
+                finding.claim_text or "",
                 finding.claim_id or "",
                 _CODE_ORDER[finding.code],
                 finding.evidence_item_id or "",
@@ -943,6 +957,38 @@ def _analysis_statement_supported(
         if _ordered_subsequence(required, available):
             return True
     return False
+
+
+def _analysis_statement_grounded(
+    statement: str,
+    source_lexemes: Sequence[Sequence[str]],
+    *,
+    allow_generic_uncertainty: bool = False,
+    minimum_overlap: int | None = None,
+) -> bool | None:
+    exact = _analysis_statement_supported(
+        statement,
+        source_lexemes,
+        allow_generic_uncertainty=allow_generic_uncertainty,
+    )
+    if exact is not False:
+        return exact
+    required = _analysis_lexemes(statement)
+    if required is None:
+        return None
+    distinctive = tuple(
+        value for value in required if value not in _GENERIC_TECH_CONTEXT_LEXEMES
+    ) or required
+    available = {value for segment in source_lexemes for value in segment}
+    overlap = len(set(distinctive) & available)
+    minimum = (
+        minimum_overlap
+        if minimum_overlap is not None
+        else 1
+        if len(set(distinctive)) <= 2
+        else 2
+    )
+    return overlap >= minimum
 
 
 def _field_value_supported(
@@ -1563,93 +1609,160 @@ def _verify_analysis(
     if private_echo:
         findings.append(_finding("private_claim"))
 
-    support_checks: list[bool | None] = []
-    metric_checks: list[bool] = []
+    invalid_analysis = False
+
+    def assess_statement(
+        output_field: str,
+        item_index: int | None,
+        claim_text: str,
+        supported: bool | None,
+        *,
+        verifier_state: str = "blocked",
+    ) -> None:
+        nonlocal invalid_analysis
+        if supported is None:
+            invalid_analysis = True
+        elif not supported:
+            findings.append(
+                _finding(
+                    "unsupported_claim",
+                    verifier_state=verifier_state,
+                    output_field=output_field,
+                    claim_text=claim_text,
+                    item_index=item_index,
+                )
+            )
+
+    def assess_metric(
+        output_field: str,
+        item_index: int | None,
+        claim_text: str,
+        supported: bool,
+    ) -> None:
+        if not supported:
+            findings.append(
+                _finding(
+                    "unsupported_metric",
+                    output_field=output_field,
+                    claim_text=claim_text,
+                    item_index=item_index,
+                )
+            )
+
     if isinstance(output, AnalyzeJdOutput):
         normalized_fields = (
-            ("title", output.normalized_title),
-            ("company", output.normalized_company),
-            ("location", output.normalized_location),
+            ("normalized_title", "title", output.normalized_title),
+            ("normalized_company", "company", output.normalized_company),
+            ("normalized_location", "location", output.normalized_location),
         )
-        support_checks.extend(
-            _field_value_supported(field, value, job_sources)
-            if _normalized_text(value) not in {"not specified", "unknown", "unspecified"}
-            else True
-            for field, value in normalized_fields
-        )
-        strict_extracted = output.responsibilities + output.required_skills
-        descriptive_extracted = output.preferred_skills + output.keywords
-        extracted = strict_extracted + descriptive_extracted
-        support_checks.extend(
-            _analysis_statement_supported(value, strict_job_grounding)
-            for value in strict_extracted
-        )
-        support_checks.extend(
-            _analysis_statement_supported(value, job_grounding)
-            for value in descriptive_extracted
-        )
-        support_checks.extend(
-            _analysis_statement_supported(
-                value, job_grounding, allow_generic_uncertainty=True
+        for output_field, source_field, value in normalized_fields:
+            assess_statement(
+                output_field,
+                None,
+                value,
+                _field_value_supported(source_field, value, job_sources)
+                if _normalized_text(value)
+                not in {"not specified", "unknown", "unspecified"}
+                else True,
             )
-            for value in output.uncertainties
+        jd_groups = (
+            ("responsibilities", output.responsibilities, strict_job_grounding, False),
+            ("required_skills", output.required_skills, strict_job_grounding, False),
+            ("preferred_skills", output.preferred_skills, job_grounding, False),
+            ("keywords", output.keywords, job_grounding, False),
+            ("uncertainties", output.uncertainties, job_grounding, True),
         )
-        metric_checks.extend(
-            _metric_supported_by_sources(value, job_sources)
-            for value in extracted + output.uncertainties
-        )
+        for output_field, values, grounding, allow_uncertainty in jd_groups:
+            for item_index, value in enumerate(values):
+                assess_statement(
+                    output_field,
+                    item_index,
+                    value,
+                    _analysis_statement_supported(
+                        value,
+                        grounding,
+                        allow_generic_uncertainty=allow_uncertainty,
+                    ),
+                )
+                assess_metric(
+                    output_field,
+                    item_index,
+                    value,
+                    _metric_supported_by_sources(value, job_sources),
+                )
     elif isinstance(output, AnalyzeFitOutput):
         all_sources = job_sources + candidate_sources
-        for value in output.matches:
-            job_support = _analysis_statement_supported(value, job_grounding)
-            candidate_support = _analysis_statement_supported(value, candidate_grounding)
-            support_checks.append(
+        for item_index, value in enumerate(output.matches):
+            job_support = _analysis_statement_grounded(
+                value, job_grounding, minimum_overlap=1
+            )
+            candidate_support = _analysis_statement_grounded(value, candidate_grounding)
+            assess_statement(
+                "matches",
+                item_index,
+                value,
                 None
                 if job_support is None or candidate_support is None
-                else job_support and candidate_support
+                else job_support and candidate_support,
             )
-            metric_checks.append(
-                _metric_supported_by_sources(value, job_sources)
-                and _metric_supported_by_sources(value, candidate_sources)
+            assess_metric(
+                "matches",
+                item_index,
+                value,
+                _metric_supported_by_sources(value, candidate_sources),
             )
-        for value in output.gaps:
-            job_support = _analysis_statement_supported(value, job_grounding)
-            candidate_support = _analysis_statement_supported(value, candidate_grounding)
-            support_checks.append(
+        for item_index, value in enumerate(output.gaps):
+            job_support = _analysis_statement_grounded(
+                value, job_grounding, minimum_overlap=1
+            )
+            candidate_support = _analysis_statement_grounded(value, candidate_grounding)
+            assess_statement(
+                "gaps",
+                item_index,
+                value,
                 None
                 if job_support is None or candidate_support is None
-                else job_support and not candidate_support
+                else job_support and not candidate_support,
             )
-            metric_checks.append(_metric_supported_by_sources(value, job_sources))
-        support_checks.extend(
-            _analysis_statement_supported(
-                value, all_grounding, allow_generic_uncertainty=True
+            assess_metric(
+                "gaps",
+                item_index,
+                value,
+                _metric_supported_by_sources(value, job_sources),
             )
-            for value in output.risks
+        fit_groups = (
+            ("blockers", output.blockers, all_sources, True),
+            ("warnings", output.warnings, all_sources, True),
+            ("recommendations", output.recommendations, candidate_sources, False),
         )
-        support_checks.extend(
-            _analysis_statement_supported(value, all_grounding)
-            for value in output.recommendations
-        )
-        metric_checks.extend(
-            _metric_supported_by_sources(value, all_sources) for value in output.risks
-        )
-        metric_checks.extend(
-            _metric_supported_by_sources(value, candidate_sources)
-            for value in output.recommendations
-        )
+        for output_field, values, metric_sources, allow_uncertainty in fit_groups:
+            for item_index, value in enumerate(values):
+                assess_statement(
+                    output_field,
+                    item_index,
+                    value,
+                    _analysis_statement_grounded(
+                        value,
+                        all_grounding,
+                        allow_generic_uncertainty=allow_uncertainty,
+                    ),
+                    verifier_state="needs_evidence",
+                )
+                assess_metric(
+                    output_field,
+                    item_index,
+                    value,
+                    _metric_supported_by_sources(value, metric_sources),
+                )
     else:
         return _result(task_type, None, [_finding("schema_invalid")])
 
-    if any(value is None for value in support_checks):
+    if invalid_analysis:
         return _result(task_type, None, [_finding("schema_invalid")])
-    if not all(support_checks):
-        findings.append(_finding("unsupported_claim"))
-    metric_supported = all(metric_checks)
     findings.extend(
         _risk_findings(
             output_text,
-            metric_supported=metric_supported,
+            metric_supported=True,
             private_material=private_echo,
         )
     )

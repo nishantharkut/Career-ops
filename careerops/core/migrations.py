@@ -1907,6 +1907,51 @@ def _add_ai_task_cloud_transfer_acknowledgement(
         )
 
 
+def _add_ai_task_provider_thread_continuity(
+    connection: sqlite3.Connection,
+) -> None:
+    columns = _column_names(connection, "ai_tasks")
+    if "provider_thread_id" not in columns:
+        connection.execute("ALTER TABLE ai_tasks ADD COLUMN provider_thread_id TEXT")
+    if "provider_thread_mode" not in columns:
+        connection.execute("ALTER TABLE ai_tasks ADD COLUMN provider_thread_mode TEXT")
+
+    for operation in ("INSERT", "UPDATE"):
+        trigger = f"validate_ai_task_provider_thread_{operation.lower()}"
+        connection.execute(f"DROP TRIGGER IF EXISTS {trigger}")
+        connection.execute(
+            f"""
+            CREATE TRIGGER {trigger}
+            BEFORE {operation} ON ai_tasks
+            WHEN (
+                (NEW.provider_thread_id IS NULL) != (NEW.provider_thread_mode IS NULL)
+            ) OR (
+                NEW.provider_thread_mode IS NOT NULL
+                AND NEW.provider_thread_mode NOT IN ('started', 'continued', 'rebuilt')
+            )
+            BEGIN
+                SELECT RAISE(ABORT, 'invalid AI task provider thread metadata');
+            END
+            """
+        )
+
+    connection.execute("DROP TRIGGER IF EXISTS validate_ai_task_provider_thread_immutable")
+    connection.execute(
+        """
+        CREATE TRIGGER validate_ai_task_provider_thread_immutable
+        BEFORE UPDATE ON ai_tasks
+        WHEN OLD.provider_thread_id IS NOT NULL
+          AND (
+              NEW.provider_thread_id IS NOT OLD.provider_thread_id
+              OR NEW.provider_thread_mode IS NOT OLD.provider_thread_mode
+          )
+        BEGIN
+            SELECT RAISE(ABORT, 'AI task provider thread metadata is immutable');
+        END
+        """
+    )
+
+
 MIGRATIONS: tuple[tuple[int, Migration], ...] = (
     (1, _add_application_role_type),
     (2, _add_application_submitted_at),
@@ -1926,6 +1971,7 @@ MIGRATIONS: tuple[tuple[int, Migration], ...] = (
     (16, _add_provider_container_image_bindings),
     (17, _add_report_ai_approval_authority),
     (18, _add_ai_task_cloud_transfer_acknowledgement),
+    (19, _add_ai_task_provider_thread_continuity),
 )
 
 LATEST_SCHEMA_VERSION = MIGRATIONS[-1][0]

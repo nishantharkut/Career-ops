@@ -48,7 +48,8 @@ VALID_OUTPUTS: dict[str, dict[str, Any]] = {
         "score": 80,
         "matches": [],
         "gaps": [],
-        "risks": [],
+        "blockers": [],
+        "warnings": [],
         "recommendations": [],
     },
     "suggest_resume_edits": {
@@ -141,12 +142,14 @@ class ScriptedProvider:
         error: Exception | None = None,
         on_run: Any | None = None,
         result_overrides: dict[str, Any] | None = None,
+        provider_thread_id: str = "",
     ) -> None:
         self.status = status
         self.outputs = outputs or VALID_OUTPUTS
         self.error = error
         self.on_run = on_run
         self.result_overrides = result_overrides or {}
+        self.provider_thread_id = provider_thread_id
         self.calls = 0
         self.requests: list[Any] = []
         self._lock = Lock()
@@ -198,6 +201,14 @@ class ScriptedProvider:
                     self.status.isolation_evidence_signature
                 ),
                 reasoning_effort=self.status.reasoning_effort,
+                provider_thread_id=self.provider_thread_id,
+                provider_thread_mode=(
+                    "continued"
+                    if self.provider_thread_id and request.provider_thread_id
+                    else "started"
+                    if self.provider_thread_id
+                    else ""
+                ),
             ),
             **self.result_overrides,
         }
@@ -1506,6 +1517,94 @@ def test_attempt_artifacts_are_atomic_checksummed_and_never_contain_sidecar(
         assert ".tmp-" not in path.name
 
 
+def test_orchestrator_replays_context_while_continuing_exact_provider_thread(
+    tmp_path: Path,
+):
+    from careerops.ai.orchestrator import AiOrchestrator
+
+    repo = make_repo(tmp_path)
+    application = create_application(repo)
+    status = availability(
+        provider_kind="codex",
+        model="gpt-5.6-sol",
+        privacy_mode=PrivacyMode.CLOUD_EXTERNAL,
+        data_leaves_machine=True,
+        endpoint="codex-identity://codex2",
+        identity_name="codex2",
+        executable="C:/Codex/codex.exe",
+        executable_sha256="a" * 64,
+        executable_version="codex-cli 1.0.0",
+        codex_home="C:/Users/test/codex-account2/.codex",
+        reasoning_effort="high",
+    )
+    config = create_provider_config(
+        repo,
+        provider_kind="codex",
+        model="gpt-5.6-sol",
+        privacy_mode="cloud_external",
+        endpoint="codex-identity://codex2",
+        identity_name="codex2",
+        binding_status=status,
+    )
+    thread_id = "019f9ef0-c752-7d31-91f6-29a91f6ee8e0"
+    provider = ScriptedProvider(
+        status,
+        provider_thread_id=thread_id,
+    )
+    orchestrator = AiOrchestrator(repo, {config.id: provider})
+
+    first = orchestrator.enqueue(
+        application.id,
+        "analyze_jd",
+        config.id,
+        cloud_transfer_acknowledged=True,
+    )
+    first_result = orchestrator.run(first.id)
+    second = orchestrator.enqueue(
+        application.id,
+        "analyze_jd",
+        config.id,
+        cloud_transfer_acknowledged=True,
+    )
+    second_result = orchestrator.run(second.id)
+
+    assert first_result.status == "completed"
+    assert second_result.status == "completed"
+    assert provider.requests[0].application_id == application.id
+    assert provider.requests[0].provider_thread_id is None
+    assert provider.requests[1].provider_thread_id == thread_id
+    assert provider.requests[0].context_snapshot
+    assert provider.requests[1].context_snapshot
+    assert repo.get_ai_task(first.id).provider_thread_mode == "started"
+    assert repo.get_ai_task(second.id).provider_thread_mode == "continued"
+
+
+def test_orchestrator_does_not_replay_non_codex_thread_metadata(tmp_path: Path):
+    from careerops.ai.orchestrator import AiOrchestrator
+
+    repo = make_repo(tmp_path)
+    application = create_application(repo)
+    config = create_provider_config(repo)
+    thread_id = "019f9ef0-c752-7d31-91f6-29a91f6ee8e0"
+    provider = ScriptedProvider(
+        availability(),
+        provider_thread_id=thread_id,
+    )
+    orchestrator = AiOrchestrator(repo, {config.id: provider})
+
+    first = orchestrator.enqueue(application.id, "analyze_jd", config.id)
+    first_result = orchestrator.run(first.id)
+    second = orchestrator.enqueue(application.id, "analyze_jd", config.id)
+    second_result = orchestrator.run(second.id)
+
+    assert first_result.status == "completed"
+    assert second_result.status == "completed"
+    assert provider.requests[0].provider_thread_id is None
+    assert provider.requests[1].provider_thread_id is None
+    assert repo.get_ai_task(first.id).provider_thread_id is None
+    assert repo.get_ai_task(second.id).provider_thread_id is None
+
+
 def test_jd_source_bytes_preserve_crlf_without_decode_normalization(tmp_path: Path):
     from careerops.ai.orchestrator import AiOrchestrator
 
@@ -1867,7 +1966,7 @@ def test_analyze_fit_creates_normal_report_with_complete_provenance(tmp_path: Pa
         "privacy_mode": "local_private",
         "prompt_sha256": provider.requests[0].context_text()
         and json.loads(provider.requests[0].context_text())["prompt"]["sha256"],
-        "prompt_template_id": "analyze_fit_v1",
+        "prompt_template_id": "analyze_fit_v2",
         "provider_kind": "mock",
         "provider_identity_name": "",
         "provider_model": "fixture-v1",
@@ -1877,6 +1976,41 @@ def test_analyze_fit_creates_normal_report_with_complete_provenance(tmp_path: Pa
     }
     assert updated_application.approval_id is None
     assert updated_application.submission_state == "not_submitted"
+
+
+def test_analyze_fit_persists_provider_blockers_separately_from_warnings(
+    tmp_path: Path,
+):
+    from careerops.ai.orchestrator import AiOrchestrator
+
+    repo = make_repo(tmp_path)
+    application = create_application(repo)
+    select_resume(repo, application.id, "Python developer")
+    config = create_provider_config(repo)
+    outputs = {
+        **VALID_OUTPUTS,
+        "analyze_fit": {
+            "task_type": "analyze_fit",
+            "score": 60,
+            "matches": ["Python"],
+            "gaps": [],
+            "blockers": ["Python"],
+            "warnings": ["Python"],
+            "recommendations": ["Python"],
+        },
+    }
+    provider = ScriptedProvider(availability(), outputs=outputs)
+    orchestrator = AiOrchestrator(repo, {config.id: provider})
+
+    task = orchestrator.enqueue(application.id, "analyze_fit", config.id)
+    result = orchestrator.run(task.id)
+
+    assert result.status == "completed"
+    report = repo.get_report(repo.get_application(application.id).latest_report_id or "")
+    assert report.risks["blockers"] == ["Python"]
+    assert report.risks["warnings"] == ["Python"]
+    assert report.blocking_issue_count == 1
+    assert report.warning_count == 1
 
 
 def test_analyze_jd_preserves_user_corrections_in_provenance_groups(tmp_path: Path):

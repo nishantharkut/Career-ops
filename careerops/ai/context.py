@@ -57,7 +57,7 @@ _REDACTION_MARKER_PATTERN = re.compile(
 )
 _PROMPT_PATHS: dict[str, str] = {
     "analyze_jd": "analyze_jd_v1.txt",
-    "analyze_fit": "analyze_fit_v1.txt",
+    "analyze_fit": "analyze_fit_v2.txt",
     "suggest_resume_edits": "suggest_resume_edits_v1.txt",
     "draft_cover_letter": "draft_cover_letter_v1.txt",
     "review_claims": "review_claims_v1.txt",
@@ -195,10 +195,11 @@ def _load_templates() -> Mapping[str, PromptTemplate]:
         except (OSError, UnicodeError, TypeError, ValueError):
             failed = True
             break
+        version = "2" if task_type == "analyze_fit" else "1"
         templates[task_type] = PromptTemplate(
-            id=f"{task_type}_v1",
+            id=f"{task_type}_v{version}",
             task_type=task_type,  # type: ignore[arg-type]
-            version="1",
+            version=version,
             path=path,
             text=text,
             sha256=hashlib.sha256(prompt_bytes).hexdigest(),

@@ -29,9 +29,22 @@ type ReviewPanelProps = {
 
 type DownloadClient = (applicationId: string) => Promise<DownloadedArtifact>;
 
-function warningHasContent(warning: RiskIssue | string): boolean {
-  if (typeof warning === "string") return warning.trim().length > 0;
-  return [warning.label, warning.why, warning.next_action].some((value) => value.trim().length > 0);
+function issueHasContent(issue: RiskIssue | string): boolean {
+  if (typeof issue === "string") return issue.trim().length > 0;
+  return [issue.label, issue.why, issue.next_action].some((value) => value.trim().length > 0);
+}
+
+function ReportIssue({ issue, index, kind }: { issue: RiskIssue | string; index: number; kind: string }) {
+  if (typeof issue === "string") {
+    return <li key={`${kind}-${index}`}><span>{issue}</span></li>;
+  }
+  return (
+    <li key={`${issue.label}-${issue.source}-${index}`}>
+      {issue.label && <strong>{issue.label}</strong>}
+      {issue.why && <span>{issue.why}</span>}
+      {issue.next_action && <span>{issue.next_action}</span>}
+    </li>
+  );
 }
 
 function ExportAction({
@@ -73,7 +86,12 @@ export default function ReviewPanel({
   const [exportError, setExportError] = useState("");
   const hasCleanReport = Boolean(report && report.blocking_issue_count === 0);
   const canApprove = hasCleanReport && approvalEligibility.eligible;
-  const warnings = report?.risks.warnings.filter(warningHasContent) ?? [];
+  const blockers = report?.risks.blockers.filter(issueHasContent) ?? [];
+  const warnings = report?.risks.warnings.filter(issueHasContent) ?? [];
+  const score = report?.fit.score ?? report?.fit.summary_score;
+  const matches = report?.fit.matches ?? report?.fit.matched_requirements ?? [];
+  const gaps = report?.fit.gaps ?? report?.fit.missing_requirements ?? [];
+  const recommendations = report?.fit.recommendations ?? [];
 
   async function exportArtifact(label: string, download: DownloadClient) {
     if (!applicationId || exportBusy) return;
@@ -109,29 +127,44 @@ export default function ReviewPanel({
         <div className="report">
           <p><strong>{report.blocking_issue_count}</strong> blockers</p>
           <p><strong>{report.warning_count}</strong> warnings</p>
-          {report.risks.blockers.length > 0 && (
+          {score !== undefined && (
+            <dl className="meta">
+              <div><dt>Fit score</dt><dd>{score}</dd></div>
+            </dl>
+          )}
+          {matches.length > 0 && (
+            <section aria-label="Fit matches">
+              <h3>Matches</h3>
+              <ul className="issue-list">{matches.map((match, index) => <li key={`match-${index}`}><span>{match}</span></li>)}</ul>
+            </section>
+          )}
+          {gaps.length > 0 && (
+            <section aria-label="Fit gaps">
+              <h3>Gaps</h3>
+              <ul className="issue-list">{gaps.map((gap, index) => <li key={`gap-${index}`}><span>{gap}</span></li>)}</ul>
+            </section>
+          )}
+          {blockers.length > 0 && (
+            <section aria-label="Fit blockers">
+              <h3>Blockers</h3>
             <ul className="issue-list">
-              {report.risks.blockers.map((issue, index) => (
-                <li key={`${issue.label}-${issue.source}-${index}`}>
-                  <strong>{issue.label}</strong>
-                  <span>{issue.why}</span>
-                  <span>{issue.next_action}</span>
-                </li>
-              ))}
+                {blockers.map((issue, index) => <ReportIssue issue={issue} index={index} kind="blocker" key={`blocker-${index}`} />)}
             </ul>
+            </section>
           )}
           {warnings.length > 0 && (
+            <section aria-label="Fit warnings">
+              <h3>Warnings</h3>
             <ul className="issue-list">
-              {warnings.map((warning, index) => typeof warning === "string" ? (
-                <li key={`ai-warning-${index}`}><span>{warning}</span></li>
-              ) : (
-                <li key={`${warning.label}-${warning.source}-${index}`}>
-                  {warning.label && <strong>{warning.label}</strong>}
-                  {warning.why && <span>{warning.why}</span>}
-                  {warning.next_action && <span>{warning.next_action}</span>}
-                </li>
-              ))}
+                {warnings.map((issue, index) => <ReportIssue issue={issue} index={index} kind="warning" key={`warning-${index}`} />)}
             </ul>
+            </section>
+          )}
+          {recommendations.length > 0 && (
+            <section aria-label="Fit recommendations">
+              <h3>Recommendations</h3>
+              <ul className="issue-list">{recommendations.map((item, index) => <li key={`recommendation-${index}`}><span>{item}</span></li>)}</ul>
+            </section>
           )}
           {canApprove && <p className="notice"><ShieldCheck aria-hidden="true" size={16} /> Ready to review</p>}
         </div>

@@ -235,7 +235,10 @@ def _default_provider_registry(
         "yes",
         "on",
     }:
-        for provider in discover_codex_providers(environment=environment):
+        for provider in discover_codex_providers(
+            environment=environment,
+            session_root=repository.vault_path / "codex-sessions",
+        ):
             identity_name = provider.availability().identity_name
             _register_provider(
                 repository,
@@ -1504,6 +1507,8 @@ def _ai_task_payload(task: AiTask) -> dict[str, Any]:
         "privacy_mode": task.privacy_mode.value,
         "cloud_transfer_acknowledged": task.cloud_transfer_acknowledged,
         "cloud_transfer_acknowledged_at": task.cloud_transfer_acknowledged_at,
+        "provider_thread_id": task.provider_thread_id,
+        "provider_thread_mode": task.provider_thread_mode,
         "started_at": task.started_at,
         "completed_at": task.completed_at,
         "error_summary": task.error_summary,

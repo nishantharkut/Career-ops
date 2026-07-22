@@ -69,6 +69,10 @@ SECRET_PATTERNS = (
     (re.compile(r"(?i)\bbearer\s+[A-Za-z0-9._~+/=-]+"), "Bearer [REDACTED]"),
 )
 SECRET_KEY_PATTERN = re.compile(r"(?i)(password|secret|token|api[_-]?key|authorization)")
+PROVIDER_THREAD_ID_PATTERN = re.compile(
+    r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
+)
+PROVIDER_THREAD_MODES = frozenset({"started", "continued", "rebuilt"})
 PROVIDER_ERROR_CATEGORIES = frozenset(
     {
         "provider_unavailable",
@@ -1034,10 +1038,117 @@ class CareerOpsRepository:
                     error_summary = '', claim_token = ?, claim_expires_at = ?,
                     updated_at = ?
                 WHERE id = ? AND status = 'pending'
+                  AND (
+                    NOT EXISTS (
+                      SELECT 1
+                      FROM ai_provider_configs AS serialized_provider
+                      WHERE serialized_provider.id = ai_tasks.provider_config_id
+                        AND serialized_provider.provider_kind = 'codex'
+                    )
+                    OR NOT EXISTS (
+                      SELECT 1
+                      FROM ai_tasks AS active
+                      WHERE active.id != ai_tasks.id
+                        AND active.application_id = ai_tasks.application_id
+                        AND active.provider_config_id = ai_tasks.provider_config_id
+                        AND active.provider_binding_sha256
+                            = ai_tasks.provider_binding_sha256
+                        AND active.status = 'running'
+                    )
+                  )
                 """,
                 (now, claim_token, expires_at, now, task_id),
             )
         return claim_token if cursor.rowcount == 1 else None
+
+    def record_ai_task_provider_thread(
+        self,
+        task_id: str,
+        claim_token: str,
+        *,
+        provider_thread_id: str,
+        provider_thread_mode: str,
+    ) -> AiTask:
+        if not PROVIDER_THREAD_ID_PATTERN.fullmatch(provider_thread_id):
+            raise ValueError("AI provider thread ID is invalid")
+        if provider_thread_mode not in PROVIDER_THREAD_MODES:
+            raise ValueError("AI provider thread mode is invalid")
+        with self.connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            now = utc_now()
+            task = connection.execute(
+                "SELECT * FROM ai_tasks WHERE id = ?", (task_id,)
+            ).fetchone()
+            if task is None:
+                raise KeyError("No AI task with that ID")
+            if (
+                task["status"] != AiTaskStatus.RUNNING.value
+                or task["claim_token"] != claim_token
+                or task["invocation_started_at"] is None
+                or task["claim_expires_at"] is None
+                or task["claim_expires_at"] <= now
+            ):
+                raise ValueError("AI task invocation is not active")
+            if task["provider_thread_id"] is not None:
+                if (
+                    task["provider_thread_id"] == provider_thread_id
+                    and task["provider_thread_mode"] == provider_thread_mode
+                ):
+                    return self._ai_task_from_row(
+                        task,
+                        self._ai_task_input_artifact_ids(connection, task_id),
+                    )
+                raise ValueError("AI task provider thread metadata is immutable")
+            connection.execute(
+                """
+                UPDATE ai_tasks
+                SET provider_thread_id = ?, provider_thread_mode = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (provider_thread_id, provider_thread_mode, now, task_id),
+            )
+            self._write_audit(
+                connection,
+                "ai_task.provider_thread_recorded",
+                "ai_task",
+                task_id,
+                {"provider_thread_id": None, "provider_thread_mode": None},
+                {
+                    "provider_thread_id": provider_thread_id,
+                    "provider_thread_mode": provider_thread_mode,
+                },
+            )
+        return self.get_ai_task(task_id)
+
+    def latest_ai_provider_thread(
+        self,
+        *,
+        application_id: str,
+        provider_config_id: str,
+        provider_binding_sha256: str,
+    ) -> str | None:
+        if not SHA256_PATTERN.fullmatch(provider_binding_sha256):
+            raise ValueError("AI provider binding SHA-256 is invalid")
+        with self.connection() as connection:
+            row = connection.execute(
+                """
+                SELECT provider_thread_id
+                FROM ai_tasks
+                WHERE application_id = ?
+                  AND provider_config_id = ?
+                  AND provider_binding_sha256 = ?
+                  AND provider_thread_id IS NOT NULL
+                  AND status != 'pending'
+                ORDER BY updated_at DESC, created_at DESC, id DESC
+                LIMIT 1
+                """,
+                (
+                    application_id,
+                    provider_config_id,
+                    provider_binding_sha256,
+                ),
+            ).fetchone()
+        return None if row is None else str(row["provider_thread_id"])
 
     def start_ai_task(self, task_id: str) -> str:
         claim_token = self.claim_ai_task(task_id)
@@ -5249,6 +5360,16 @@ class CareerOpsRepository:
             cloud_transfer_acknowledged_at=(
                 row["cloud_transfer_acknowledged_at"]
                 if "cloud_transfer_acknowledged_at" in row_columns
+                else None
+            ),
+            provider_thread_id=(
+                row["provider_thread_id"]
+                if "provider_thread_id" in row_columns
+                else None
+            ),
+            provider_thread_mode=(
+                row["provider_thread_mode"]
+                if "provider_thread_mode" in row_columns
                 else None
             ),
             started_at=row["started_at"],

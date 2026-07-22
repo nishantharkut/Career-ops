@@ -54,6 +54,9 @@ export type ReportRecord = {
   blocking_issue_count: number;
   warning_count: number;
   fit: {
+    matches?: string[];
+    gaps?: string[];
+    recommendations?: string[];
     matched_requirements?: string[];
     missing_requirements?: string[];
     exact_keyword_gaps?: string[];
@@ -62,7 +65,7 @@ export type ReportRecord = {
     [key: string]: unknown;
   };
   risks: {
-    blockers: RiskIssue[];
+    blockers: Array<RiskIssue | string>;
     warnings: Array<RiskIssue | string>;
     [key: string]: unknown;
   };
@@ -117,6 +120,8 @@ export type AiTaskRecord = {
   privacy_mode: string;
   cloud_transfer_acknowledged: boolean;
   cloud_transfer_acknowledged_at: string | null;
+  provider_thread_id: string | null;
+  provider_thread_mode: "started" | "continued" | "rebuilt" | null;
   started_at: string | null;
   completed_at: string | null;
   error_summary: string;

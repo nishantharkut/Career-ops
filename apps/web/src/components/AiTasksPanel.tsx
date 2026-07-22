@@ -58,6 +58,13 @@ function bounded(value: string): string {
   return `${value.slice(0, 16)}...${value.slice(-8)}`;
 }
 
+function contextLabel(mode: AiTaskRecord["provider_thread_mode"]): string {
+  if (mode === "started") return "Started";
+  if (mode === "continued") return "Continued";
+  if (mode === "rebuilt") return "Rebuilt";
+  return "Not started";
+}
+
 export default function AiTasksPanel({ applicationId, initialTask, readOnly = false, onPacketChanged }: AiTasksPanelProps) {
   const [providers, setProviders] = useState<AiProviderRecord[]>([]);
   const [providersLoaded, setProvidersLoaded] = useState(false);
@@ -99,7 +106,7 @@ export default function AiTasksPanel({ applicationId, initialTask, readOnly = fa
 
   useEffect(() => {
     setActiveTask(initialTask);
-  }, [applicationId, initialTask?.id, initialTask?.status]);
+  }, [applicationId, initialTask?.id, initialTask?.status, initialTask?.provider_thread_mode]);
 
   useEffect(() => {
     if (!activeTask || !TERMINAL_STATUSES.has(activeTask.status)) return;
@@ -277,6 +284,7 @@ export default function AiTasksPanel({ applicationId, initialTask, readOnly = fa
             <div><dt>Model</dt><dd>{taskProvider?.model || "Not reported"}</dd></div>
             <div><dt>Privacy</dt><dd>{activeTask.privacy_mode}</dd></div>
             <div><dt>Task</dt><dd>{activeTask.task_type} / {bounded(activeTask.id)}</dd></div>
+            <div><dt>Context</dt><dd>{contextLabel(activeTask.provider_thread_mode)}</dd></div>
             <div><dt>Prompt</dt><dd>{activeTask.prompt_template_id || "Not reported"}</dd></div>
             <div><dt>Checksum</dt><dd>{bounded(activeTask.prompt_sha256 || "Not reported")}</dd></div>
           </dl>

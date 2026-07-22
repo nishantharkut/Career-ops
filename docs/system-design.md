@@ -82,10 +82,10 @@ Risk analysis compares the current source bytes with the recorded source checksu
 4. The orchestrator snapshots current JD/resume identity and builds a bounded `ContextPacket` from task-relevant records. For `analyze_fit`, it stable-reads the rendered PDF, requires parsed nonempty text, and sends that extracted text with the exact PDF SHA-256 instead of reviewing the LaTeX source.
 5. Prompt, context, and the exact checked-in JSON schema are written atomically to a task attempt directory and sealed into `ProviderRequest` snapshots.
 6. The selected provider reports current availability. It must match the task's persisted provider binding before invocation.
-7. The invocation fence is written before the external provider call.
-8. Raw provider output is bounded, parsed as strict JSON, and validated against the selected task model.
+7. The invocation fence is written before the external provider call. For Codex, the repository supplies only the latest thread for the same application, provider configuration, and exact provider-binding checksum.
+8. Raw provider output is bounded, parsed as strict JSON, and validated against the selected task model. Codex JSONL must begin with a valid `thread.started` UUID; the UUID and `Started`, `Continued`, or `Rebuilt` mode are persisted on the task before verification.
 9. Result metadata and invocation provenance must exactly match current availability and the persisted provider binding.
-10. The deterministic verifier produces safe or blocked findings.
+10. The deterministic verifier produces statement-specific blocked or `needs_evidence` findings. `analyze_fit_v2` separates provider blockers from warnings and retains score, matches, gaps, and recommendations in the report.
 11. Context, raw output, validated output, and optional draft text are published as checksummed artifacts.
 12. One repository transaction finalizes status, findings, artifacts, report/JD side effects, audit events, and application history only if the claim and current JD/resume IDs still match. Fit-report finalization also requires the selected resume's current PDF SHA-256 to match the immutable context; render drift aborts the report.
 
@@ -117,13 +117,12 @@ Invocation uses the native executable directly with:
 - ignored user config and rules plus strict config
 - explicit model and reasoning effort
 - no inherited shell environment
-- read-only sandbox
-- isolated `--cd` task attempt
+- read-only sandbox and a stable empty CareerOps-owned application workspace for a new thread
 - no repository requirement
-- ephemeral session
+- JSONL thread events and persisted session files
 - exact output schema and output file
 
-Arguments are a list with `shell=False`; task content is bounded stdin. Stdout/stderr are not used as output. The output file is read with path, link, size, and identity checks. The executable hash is checked before and after execution. Provider metadata records identity, endpoint, executable/hash/version, Codex home, model, effort, command, and raw output checksum.
+Later calls use `codex exec resume <thread UUID> -` for only the latest matching application/provider binding. A failed resume gets one fresh invocation from the complete current context; a failed fresh invocation is terminal. Arguments are a list with `shell=False`; task content is bounded stdin. Only the leading bounded JSONL event is read from stdout for thread identity. The structured output file is read with path, link, size, and identity checks. The executable hash is checked before and after execution. Provider metadata records identity, endpoint, executable/hash/version, Codex home, model, effort, command, thread UUID/mode, and raw output checksum.
 
 `codex2` and `codex` are separate records and never fallback within a task. Both are `cloud_external`; the UI requires a per-run transfer acknowledgement, and the API rejects a task unless that acknowledgement is present and persisted on the task.
 
@@ -145,7 +144,7 @@ The deterministic provider implements the same typed task interface but has `is_
 
 ## Concurrency And Recovery
 
-Task claims use compare-and-set row updates, claim tokens, finite leases, and heartbeats. Artifact rows carry claim ownership. Finalization verifies the active claim, current provider binding, current application state, and expected JD/resume IDs in one transaction.
+Task claims use compare-and-set row updates, claim tokens, finite leases, and heartbeats. Codex claims are serialized for the same application and exact provider binding so two workers cannot write the same conversation concurrently; other providers retain normal concurrency. Artifact rows carry claim ownership. Finalization verifies the active claim, current provider binding, current application state, and expected JD/resume IDs in one transaction.
 
 Expired claims return to pending. Invocation fencing prevents automatic provider replay after an external call may have started. A stale worker cannot publish business state after losing its claim. Runner polling recovers pending work after restart. Historical report approval uses the immutable provider binding captured by the completed task; refreshing or disabling the current managed-runtime availability row after an API restart does not invalidate that historical authority.
 

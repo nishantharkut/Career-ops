@@ -60,6 +60,8 @@ The provider menu shows only registered provider records. `Codex account 2 (code
 
 For Codex, the panel states `Selected task data is sent through your signed-in Codex account`. Check `Acknowledge Codex data transfer for this run` before each launch. Codex is `cloud_external` and receives only the selected task's bounded prompt and context. CareerOps records that one-run acknowledgement on the task; direct requests without it are rejected.
 
+Codex continuity is scoped to the application and exact selected account/provider binding. The first successful task shows `Context: Started`; later tasks for that same application and binding show `Continued`. `Rebuilt` means the saved thread was unavailable and CareerOps made one fresh read-only invocation using the complete current context. A different application or Codex identity starts a different conversation. CareerOps replays the complete current context on every turn; conversation memory cannot authorize a stale or unsupported claim.
+
 Verified managed Ollama is `local_private`. Unmanaged Ollama is unavailable rather than being trusted from a localhost address. `Deterministic verifier` uses `Run verifier` and is explicitly not AI.
 
 ## 6. Launch And Inspect Provenance
@@ -70,6 +72,7 @@ Select the task command once. The run button is disabled while the task is pendi
 - model
 - privacy mode
 - task type and task ID
+- context state (`Started`, `Continued`, `Rebuilt`, or `Not started`)
 - prompt template ID
 - prompt checksum
 
@@ -79,8 +82,9 @@ Provider binding, invocation metadata, context, raw output, validated output, an
 
 Completed and blocked tasks show persisted findings:
 
-- `Verified suggestion` or `Verified finding` can be accepted or rejected.
-- `Blocked by verifier` cannot be accepted and can be rejected.
+- Actionable `Verified suggestion` and claim-review findings can be accepted or rejected.
+- `Needs evidence` identifies an advisory analysis sentence that should be checked but does not invalidate the whole private report.
+- `Blocked by verifier` identifies the exact unsafe output sentence and cannot be accepted. Analysis diagnostics do not show fake suggestion-decision controls.
 - A saved decision remains after reload.
 
 AI confidence does not override schema, evidence, privacy, secret, rejected-claim, or exact-edit checks.
@@ -99,7 +103,7 @@ The child becomes selected with no PDF. The UI reports `Draft created. Render it
 
 1. Select `Render PDF` for the child.
 2. Run `Run AI review` again.
-3. Resolve every blocker by uploading corrected source, creating another verified child, correcting requirements, adding evidence, rejecting unsafe findings, or selecting another resume.
+3. Resolve every blocker by uploading corrected source, creating another verified child, correcting requirements, adding evidence, or selecting another resume.
 4. Render and rerun whenever a new child or newly uploaded resume becomes selected.
 
 The current report is bound to the current application, JD snapshot, and selected resume. Changing requirements or the selected resume invalidates the previous current report. A report with blockers keeps `Approve packet` disabled.

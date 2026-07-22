@@ -22,7 +22,10 @@ function isDecisionEligible(finding: AiFindingRecord): boolean {
 }
 
 function isRejectionEligible(finding: AiFindingRecord): boolean {
-  return finding.verifier_state === "verified" || finding.verifier_state === "blocked";
+  return (
+    ["resume_edit_suggestion", "claim_review_decision"].includes(finding.finding_type) &&
+    (finding.verifier_state === "verified" || finding.verifier_state === "blocked")
+  );
 }
 
 function isDraftEligible(finding: AiFindingRecord): boolean {
@@ -32,6 +35,15 @@ function isDraftEligible(finding: AiFindingRecord): boolean {
 function payloadText(finding: AiFindingRecord, key: string): string {
   const value = finding.payload[key];
   return typeof value === "string" ? value : "";
+}
+
+function verifierLabel(finding: AiFindingRecord, resumeSuggestion: boolean): string {
+  if (finding.verifier_state === "verified") {
+    return resumeSuggestion ? "Verified suggestion" : "Verified finding";
+  }
+  if (finding.verifier_state === "needs_evidence") return "Needs evidence";
+  if (finding.verifier_state === "blocked") return "Blocked by verifier";
+  return finding.verifier_state.replaceAll("_", " ");
 }
 
 export default function FindingsPanel({
@@ -116,11 +128,10 @@ export default function FindingsPanel({
                 {payloadText(finding, "replacement_text") && (
                   <span>{payloadText(finding, "replacement_text")}</span>
                 )}
-                {decisionEligible ? (
-                  <span><ShieldCheck aria-hidden="true" size={16} /> {resumeSuggestion ? "Verified suggestion" : "Verified finding"}</span>
-                ) : (
-                  <span>Blocked by verifier</span>
-                )}
+                <span>
+                  {decisionEligible && <ShieldCheck aria-hidden="true" size={16} />}
+                  {verifierLabel(finding, resumeSuggestion)}
+                </span>
                 {(decisionEligible || rejectionEligible) && finding.decision === "pending" && (
                   <div className="actions">
                     {decisionEligible && (

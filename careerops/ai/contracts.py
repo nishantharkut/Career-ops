@@ -75,6 +75,15 @@ Sha256Text = Annotated[
     str,
     StringConstraints(pattern=r"^[0-9a-f]{64}$"),
 ]
+ProviderThreadId = Annotated[
+    str,
+    StringConstraints(
+        pattern=(
+            r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-"
+            r"[0-9a-f]{4}-[0-9a-f]{12}$"
+        )
+    ),
+]
 ContainerImageReference = Annotated[
     str,
     StringConstraints(
@@ -253,7 +262,8 @@ class AnalyzeFitOutput(StrictModel):
     score: int = Field(ge=0, le=100)
     matches: tuple[ListText, ...] = Field(max_length=30)
     gaps: tuple[ListText, ...] = Field(max_length=30)
-    risks: tuple[ListText, ...] = Field(max_length=30)
+    blockers: tuple[ListText, ...] = Field(max_length=30)
+    warnings: tuple[ListText, ...] = Field(max_length=30)
     recommendations: tuple[ListText, ...] = Field(max_length=30)
 
 
@@ -423,12 +433,14 @@ def _seal_regular_file(path: Path, task_dir: Path, size_limit: int) -> tuple[Pat
 
 class ProviderRequest(StrictModel):
     task_id: Identifier
+    application_id: Identifier
     task_type: TaskType
     task_dir: Path
     prompt_path: Path
     context_path: Path
     schema_path: Path
     expected_claim_ids: tuple[Identifier, ...] = Field(default=(), max_length=40)
+    provider_thread_id: ProviderThreadId | None = None
 
     _prompt_snapshot: bytes = PrivateAttr(default=b"")
     _context_snapshot: bytes = PrivateAttr(default=b"")
@@ -563,7 +575,15 @@ class InvocationMetadata(StrictModel):
     isolation_evidence_signature: Sha256Text | Literal[""] = ""
     reasoning_effort: MetadataText = ""
     raw_output_sha256: Sha256Text | Literal[""] = ""
+    provider_thread_id: ProviderThreadId | Literal[""] = ""
+    provider_thread_mode: Literal["", "started", "continued", "rebuilt"] = ""
     command: tuple[MetadataText, ...] = Field(default=(), max_length=40)
+
+    @model_validator(mode="after")
+    def validate_provider_thread_metadata(self) -> InvocationMetadata:
+        if bool(self.provider_thread_id) != bool(self.provider_thread_mode):
+            raise ValueError("Provider thread metadata must be complete")
+        return self
 
 
 class ProviderAvailability(StrictModel):

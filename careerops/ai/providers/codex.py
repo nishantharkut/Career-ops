@@ -63,6 +63,10 @@ _SAFE_ENVIRONMENT_KEYS = (
 )
 _WRAPPER_HOME = "%USERPROFILE%\\codex-account2\\.codex"
 _CODEX_IDENTITIES = frozenset({"codex2", "codex"})
+_PROVIDER_THREAD_ID = re.compile(
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+)
+_CODEX_EVENT_CAPTURE_BYTES = 16_384
 
 
 def codex_identity_endpoint(identity_name: str) -> str:
@@ -453,9 +457,28 @@ def _read_codex_output(path: Path, attempt_dir: Path) -> bytes:
     return b"".join(chunks)
 
 
+def _codex_thread_id(raw_events: bytes) -> str:
+    try:
+        first_line = next(
+            line for line in raw_events.decode("utf-8").splitlines() if line.strip()
+        )
+        event = json.loads(first_line)
+    except (StopIteration, UnicodeError, ValueError, TypeError) as error:
+        raise ProviderOutputError("Codex did not report a valid thread") from error
+    thread_id = event.get("thread_id") if isinstance(event, dict) else None
+    if (
+        event.get("type") != "thread.started"
+        if isinstance(event, dict)
+        else True
+    ) or not isinstance(thread_id, str) or _PROVIDER_THREAD_ID.fullmatch(thread_id) is None:
+        raise ProviderOutputError("Codex did not report a valid thread")
+    return thread_id
+
+
 @dataclass(frozen=True)
 class CodexProvider:
     executable: str
+    session_root: Path = Path("data/vault/codex-sessions")
     executable_name: str | None = None
     model: str | None = None
     reasoning_effort: str | None = None
@@ -492,6 +515,11 @@ class CodexProvider:
         if effort not in {"low", "medium", "high", "xhigh"}:
             raise ValueError("CAREEROPS_CODEX_REASONING_EFFORT was invalid")
         object.__setattr__(self, "executable", configured)
+        object.__setattr__(
+            self,
+            "session_root",
+            self.session_root.expanduser().absolute(),
+        )
         object.__setattr__(self, "environment", environment)
         object.__setattr__(self, "model", model)
         object.__setattr__(self, "reasoning_effort", effort)
@@ -690,16 +718,37 @@ class CodexProvider:
             reasoning_effort=self.reasoning_effort,
         )
 
+    def _session_workspace(self, identity: _CodexIdentity, application_id: str) -> Path:
+        try:
+            self.session_root.mkdir(parents=True, exist_ok=True)
+            root_state = self.session_root.lstat()
+            root = self.session_root.resolve(strict=True)
+            if stat.S_ISLNK(root_state.st_mode) or not stat.S_ISDIR(root_state.st_mode):
+                raise OSError("unsafe session root")
+            identity_root = root / identity.name
+            identity_root.mkdir(exist_ok=True)
+            workspace = identity_root / application_id
+            workspace.mkdir(exist_ok=True)
+            for candidate in (identity_root, workspace):
+                state = candidate.lstat()
+                if stat.S_ISLNK(state.st_mode) or not stat.S_ISDIR(state.st_mode):
+                    raise OSError("unsafe session workspace")
+                candidate.resolve(strict=True).relative_to(root)
+        except (OSError, ValueError) as error:
+            raise ProviderInvocationError(
+                "Could not create the Codex session workspace"
+            ) from error
+        return workspace.resolve(strict=True)
+
     def build_command(
         self,
         identity: _CodexIdentity,
-        attempt_dir: Path,
+        workspace: Path,
         schema_path: Path,
         output_path: Path,
+        provider_thread_id: str | None,
     ) -> list[str]:
-        return [
-            str(identity.native_executable),
-            "exec",
+        shared = [
             "--ignore-user-config",
             "--ignore-rules",
             "--strict-config",
@@ -709,16 +758,34 @@ class CodexProvider:
             f'model_reasoning_effort="{self.reasoning_effort}"',
             "-c",
             'shell_environment_policy.inherit="none"',
-            "--sandbox",
-            "read-only",
-            "--cd",
-            str(attempt_dir),
+        ]
+        output = [
             "--skip-git-repo-check",
-            "--ephemeral",
+            "--json",
             "--output-schema",
             str(schema_path),
             "--output-last-message",
             str(output_path),
+        ]
+        if provider_thread_id is not None:
+            return [
+                str(identity.native_executable),
+                "exec",
+                "resume",
+                *shared,
+                *output,
+                provider_thread_id,
+                "-",
+            ]
+        return [
+            str(identity.native_executable),
+            "exec",
+            *shared,
+            "--sandbox",
+            "read-only",
+            "--cd",
+            str(workspace),
+            *output,
         ]
 
     def run(self, request: ProviderRequest) -> ProviderResult:
@@ -733,19 +800,26 @@ class CodexProvider:
         deadline = time.monotonic() + self.timeout_seconds
         identity = self._resolved_identity(deadline)
         version, digest = self._probe_identity(identity, deadline)
+        workspace = self._session_workspace(identity, request.application_id)
         attempt = _create_attempt_directory(request.task_dir)
         schema_path = attempt.path / "schema.json"
         output_path = attempt.path / "output.json"
         try:
             _write_exclusive(schema_path, request.schema_snapshot)
-            command = self.build_command(
-                identity, attempt.path, schema_path, output_path
-            )
             stdin = (
                 request.prompt_snapshot
                 + b"\n\n<careerops_context>\n"
                 + request.context_snapshot
                 + b"\n</careerops_context>"
+            )
+            provider_thread_id = request.provider_thread_id
+            provider_thread_mode = "continued" if provider_thread_id else "started"
+            command = self.build_command(
+                identity,
+                workspace,
+                schema_path,
+                output_path,
+                provider_thread_id,
             )
             self._verify_identity_unchanged(identity, deadline)
             completed = self._run_boundary(
@@ -753,13 +827,37 @@ class CodexProvider:
                 command,
                 input_bytes=stdin,
                 deadline=deadline,
-                capture_limit=0,
+                capture_limit=_CODEX_EVENT_CAPTURE_BYTES,
             )
+            if completed.returncode != 0 and provider_thread_id is not None:
+                output_path.unlink(missing_ok=True)
+                provider_thread_mode = "rebuilt"
+                command = self.build_command(
+                    identity,
+                    workspace,
+                    schema_path,
+                    output_path,
+                    None,
+                )
+                self._verify_identity_unchanged(identity, deadline)
+                completed = self._run_boundary(
+                    identity,
+                    command,
+                    input_bytes=stdin,
+                    deadline=deadline,
+                    capture_limit=_CODEX_EVENT_CAPTURE_BYTES,
+                )
             if completed.returncode != 0:
                 self._verify_identity_unchanged(identity, deadline)
                 raise ProviderInvocationError(
                     f"Codex provider failed with exit code {completed.returncode}"
                 )
+            observed_thread_id = _codex_thread_id(completed.stdout)
+            if (
+                provider_thread_mode == "continued"
+                and observed_thread_id != provider_thread_id
+            ):
+                raise ProviderOutputError("Codex resumed an unexpected thread")
             raw = _read_codex_output(output_path, attempt.path)
             # A same-user process that swaps and perfectly restores the executable
             # between checks remains outside the app's local-user threat model.
@@ -784,6 +882,8 @@ class CodexProvider:
                     executable_version=version,
                     codex_home=str(identity.codex_home),
                     reasoning_effort=self.reasoning_effort,
+                    provider_thread_id=observed_thread_id,
+                    provider_thread_mode=provider_thread_mode,
                     command=tuple(command),
                 ),
             )
@@ -820,12 +920,18 @@ def discover_codex_providers(
     environment: Mapping[str, str] | None = None,
     timeout_seconds: float = 180,
     process_runner: Any | None = None,
+    session_root: Path | None = None,
 ) -> list[CodexProvider]:
     environment = dict(os.environ if environment is None else environment)
     providers: list[CodexProvider] = []
     for configured in _configured_commands(environment):
         provider = CodexProvider(
             executable=configured,
+            session_root=(
+                session_root
+                if session_root is not None
+                else Path("data/vault/codex-sessions")
+            ),
             executable_name=(
                 Path(configured).stem
                 if Path(configured).is_absolute()

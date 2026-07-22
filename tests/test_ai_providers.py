@@ -70,7 +70,8 @@ VALID_OUTPUTS: dict[str, dict[str, Any]] = {
         "score": 78,
         "matches": ["Python experience"],
         "gaps": ["No confirmed Kubernetes evidence"],
-        "risks": ["Role level is unclear"],
+        "blockers": [],
+        "warnings": ["Role level is unclear"],
         "recommendations": ["Lead with backend project evidence"],
     },
     "suggest_resume_edits": {
@@ -151,6 +152,8 @@ def make_request(
     tmp_path: Path,
     task_type: str = "analyze_fit",
     expected_claim_ids: list[str] | None = None,
+    *,
+    provider_thread_id: str | None = None,
 ) -> ProviderRequest:
     task_dir = tmp_path / f"task-{task_type}"
     task_dir.mkdir(parents=True)
@@ -164,6 +167,7 @@ def make_request(
     )
     values: dict[str, Any] = {
         "task_id": "task_123",
+        "application_id": "app_123",
         "task_type": task_type,
         "task_dir": task_dir,
         "prompt_path": prompt_path,
@@ -172,6 +176,8 @@ def make_request(
     }
     if expected_claim_ids is not None:
         values["expected_claim_ids"] = expected_claim_ids
+    if provider_thread_id is not None:
+        values["provider_thread_id"] = provider_thread_id
     return ProviderRequest(
         **values,
     )
@@ -206,12 +212,13 @@ def test_all_five_task_outputs_validate_and_match_checked_in_schema(task_type: s
     assert isinstance(output, MODEL_BY_TASK[task_type])
 
     schema = output_schema_for_task(task_type)
+    version = "2" if task_type == "analyze_fit" else "1"
     schema_path = (
         Path(__file__).parents[1]
         / "careerops"
         / "ai"
         / "schemas"
-        / f"{task_type}_v1.json"
+        / f"{task_type}_v{version}.json"
     )
     assert json.loads(schema_path.read_text(encoding="utf-8")) == schema
     assert schema["$schema"] == "https://json-schema.org/draft/2020-12/schema"
@@ -1489,10 +1496,11 @@ def test_ollama_escape_expanded_envelope_allows_bounded_inner_output(
     payload = {
         "task_type": "analyze_fit",
         "score": 80,
-        "matches": [astral * 333] * 30,
-        "gaps": [astral * 333] * 30,
-        "risks": [astral * 333] * 30,
-        "recommendations": [astral * 333] * 30,
+        "matches": [astral * 250] * 30,
+        "gaps": [astral * 250] * 30,
+        "blockers": [astral * 250] * 30,
+        "warnings": [astral * 250] * 30,
+        "recommendations": [astral * 250] * 30,
     }
     inner = json.dumps(payload, separators=(",", ":"))
     envelope = json.dumps(
@@ -1908,7 +1916,8 @@ def test_largest_schema_valid_outputs_fit_the_canonical_byte_limit():
             "score": 100,
             "matches": [wide * 500] * 30,
             "gaps": [wide * 500] * 30,
-            "risks": [wide * 500] * 30,
+            "blockers": [wide * 500] * 30,
+            "warnings": [wide * 500] * 30,
             "recommendations": [wide * 500] * 30,
         },
         "suggest_resume_edits": {
@@ -2109,6 +2118,8 @@ class FakeCodexRunner:
         self.output_mode = output_mode
         self.native_to_replace: Path | None = None
         self.calls: list[dict[str, Any]] = []
+        self.thread_id = "019f9ef0-c752-7d31-91f6-29a91f6ee8e0"
+        self.rebuilt_thread_id = "019f9ef1-0263-72ba-8de6-1125ead43a37"
 
     def run(self, command: list[str], **values: Any):
         call = {"command": command, **values}
@@ -2130,6 +2141,8 @@ class FakeCodexRunner:
             raise process_helpers().ProcessDeadlineExceeded()
         if self.output_mode == "nonzero":
             return outcome(7, b"private prompt echo", b"api_key=private-secret")
+        if self.output_mode == "resume_nonzero_once" and "resume" in command:
+            return outcome(7, b"", b"resume failed")
         schema_path = Path(command[command.index("--output-schema") + 1])
         call["schema_bytes"] = schema_path.read_bytes()
         output_path = Path(command[command.index("--output-last-message") + 1])
@@ -2141,7 +2154,12 @@ class FakeCodexRunner:
             outside = output_path.parent.parent / "outside.json"
             outside.write_text(json.dumps(self.output), encoding="utf-8")
             os.link(outside, output_path)
-        elif self.output_mode == "valid":
+        elif self.output_mode in {
+            "valid",
+            "resume_nonzero_once",
+            "missing_thread_event",
+            "mismatched_thread",
+        }:
             output_path.write_bytes(
                 (self.raw_output_text or json.dumps(self.output)).encode("utf-8")
             )
@@ -2155,7 +2173,15 @@ class FakeCodexRunner:
                 "do not recursively delete",
                 encoding="utf-8",
             )
-        return outcome(0, b"discarded", b"discarded")
+        if self.output_mode == "missing_thread_event":
+            return outcome(0, b'{"type":"turn.completed"}\n', b"")
+        thread_id = (
+            self.rebuilt_thread_id
+            if self.output_mode in {"resume_nonzero_once", "mismatched_thread"}
+            else self.thread_id
+        )
+        event = json.dumps({"type": "thread.started", "thread_id": thread_id})
+        return outcome(0, f"{event}\n".encode(), b"")
 
 
 def make_hardened_codex_provider(
@@ -2168,6 +2194,7 @@ def make_hardened_codex_provider(
     environment = {**fixture["environment"], **environment_overrides}
     provider = CodexProvider(
         executable=identity,
+        session_root=tmp_path / "sessions",
         which=fixture["which"],
         environment=environment,
         process_runner=runner,
@@ -2457,17 +2484,21 @@ def test_hardened_codex_invokes_native_exe_with_pinned_isolated_command(
         "--sandbox",
         "read-only",
         "--skip-git-repo-check",
-        "--ephemeral",
+        "--json",
         "--output-schema",
         "--output-last-message",
     ):
         assert required in command
     assert 'shell_environment_policy.inherit="none"' in command
     assert 'model_reasoning_effort="xhigh"' in command
-    attempt_dir = Path(command[command.index("--cd") + 1])
+    assert "--ephemeral" not in command
+    session_dir = Path(command[command.index("--cd") + 1])
+    assert session_dir == (provider.session_root / "codex2" / "app_123").resolve()
+    assert session_dir.is_dir()
+    schema_path = Path(command[command.index("--output-schema") + 1])
+    attempt_dir = schema_path.parent
     assert attempt_dir.parent == request.task_dir
     assert attempt_dir.name.startswith(".careerops-attempt-")
-    schema_path = Path(command[command.index("--output-schema") + 1])
     assert schema_path.parent == attempt_dir
     assert execution_call["schema_bytes"] == request.schema_snapshot
     assert execution_call["input_bytes"] == (
@@ -2476,7 +2507,7 @@ def test_hardened_codex_invokes_native_exe_with_pinned_isolated_command(
         b'{"resume":"Python"}\n'
         b"</careerops_context>"
     )
-    assert execution_call["capture_limit"] == 0
+    assert execution_call["capture_limit"] == 16_384
     process_env = execution_call["environment"]
     assert process_env["CODEX_HOME"] == str(fixture["account2_home"].resolve())
     assert "CAREEROPS_TEST_SECRET" not in process_env
@@ -2491,7 +2522,74 @@ def test_hardened_codex_invokes_native_exe_with_pinned_isolated_command(
     assert result.invocation.executable_version == "codex-cli 0.144.5"
     assert result.invocation.codex_home == str(fixture["account2_home"].resolve())
     assert result.invocation.reasoning_effort == "xhigh"
+    assert result.invocation.provider_thread_id == runner.thread_id
+    assert result.invocation.provider_thread_mode == "started"
     assert result.invocation.command == tuple(command)
+
+
+def test_codex_resumes_the_exact_application_thread(tmp_path: Path):
+    runner = FakeCodexRunner()
+    provider, _fixture = make_hardened_codex_provider(tmp_path / "provider", runner)
+    request = make_request(
+        tmp_path / "request",
+        provider_thread_id=runner.thread_id,
+    )
+
+    result = provider.run(request)
+
+    command = runner.calls[-1]["command"]
+    assert command[1:3] == ["exec", "resume"]
+    assert command[-2:] == [runner.thread_id, "-"]
+    assert "--cd" not in command
+    assert "--sandbox" not in command
+    assert "--ephemeral" not in command
+    assert result.invocation.provider_thread_id == runner.thread_id
+    assert result.invocation.provider_thread_mode == "continued"
+
+
+def test_codex_rebuilds_once_when_the_saved_thread_cannot_resume(tmp_path: Path):
+    runner = FakeCodexRunner(output_mode="resume_nonzero_once")
+    provider, _fixture = make_hardened_codex_provider(tmp_path / "provider", runner)
+    request = make_request(
+        tmp_path / "request",
+        provider_thread_id=runner.thread_id,
+    )
+
+    result = provider.run(request)
+
+    execution_calls = [call for call in runner.calls if "exec" in call["command"]]
+    assert len(execution_calls) == 2
+    assert "resume" in execution_calls[0]["command"]
+    assert "resume" not in execution_calls[1]["command"]
+    assert result.invocation.provider_thread_id == runner.rebuilt_thread_id
+    assert result.invocation.provider_thread_mode == "rebuilt"
+
+
+def test_codex_rejects_success_without_a_thread_started_event(tmp_path: Path):
+    runner = FakeCodexRunner(output_mode="missing_thread_event")
+    provider, _fixture = make_hardened_codex_provider(tmp_path / "provider", runner)
+
+    with pytest.raises(ProviderOutputError, match="valid thread"):
+        provider.run(make_request(tmp_path / "request"))
+
+    execution_calls = [call for call in runner.calls if "exec" in call["command"]]
+    assert len(execution_calls) == 1
+
+
+def test_codex_rejects_a_different_thread_from_resume(tmp_path: Path):
+    runner = FakeCodexRunner(output_mode="mismatched_thread")
+    provider, _fixture = make_hardened_codex_provider(tmp_path / "provider", runner)
+
+    with pytest.raises(ProviderOutputError, match="unexpected thread"):
+        provider.run(
+            make_request(
+                tmp_path / "request",
+                provider_thread_id=runner.thread_id,
+            )
+        )
+
+    execution_calls = [call for call in runner.calls if "exec" in call["command"]]
+    assert len(execution_calls) == 1
 
 
 def test_codex_preserves_exact_output_and_sha256(tmp_path: Path):

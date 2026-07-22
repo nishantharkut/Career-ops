@@ -19,8 +19,13 @@ from careerops.core.status import PrivacyMode
 pytestmark = pytest.mark.live_provider
 
 
-def synthetic_analyze_jd_request(tmp_path: Path) -> ProviderRequest:
-    task_dir = tmp_path / "synthetic-analyze-jd"
+def synthetic_analyze_jd_request(
+    tmp_path: Path,
+    *,
+    task_id: str = "ait_synthetic_live_001",
+    provider_thread_id: str | None = None,
+) -> ProviderRequest:
+    task_dir = tmp_path / task_id
     task_dir.mkdir(parents=True)
     prompt = load_prompt_template("analyze_jd")
     context = build_context_packet(
@@ -50,12 +55,14 @@ def synthetic_analyze_jd_request(tmp_path: Path) -> ProviderRequest:
         encoding="utf-8",
     )
     return ProviderRequest(
-        task_id="ait_synthetic_live_001",
+        task_id=task_id,
+        application_id="app_synthetic_live_001",
         task_type="analyze_jd",
         task_dir=task_dir,
         prompt_path=prompt_path,
         context_path=context_path,
         schema_path=schema_path,
+        provider_thread_id=provider_thread_id,
     )
 
 
@@ -69,6 +76,7 @@ def test_codex2_real_structured_invocation_uses_only_account2(tmp_path: Path):
     providers = discover_codex_providers(
         environment=environment,
         timeout_seconds=120,
+        session_root=tmp_path / "codex-sessions",
     )
     if not providers:
         pytest.skip(
@@ -97,6 +105,21 @@ def test_codex2_real_structured_invocation_uses_only_account2(tmp_path: Path):
     assert result.invocation.identity_name == "codex2"
     assert result.invocation.endpoint == "codex-identity://codex2"
     assert result.invocation.command[1] == "exec"
+    assert result.invocation.provider_thread_mode == "started"
+    assert result.invocation.provider_thread_id
+
+    continued = provider.run(
+        synthetic_analyze_jd_request(
+            tmp_path,
+            task_id="ait_synthetic_live_002",
+            provider_thread_id=result.invocation.provider_thread_id,
+        )
+    )
+
+    assert continued.structured_output.task_type == "analyze_jd"
+    assert continued.invocation.provider_thread_id == result.invocation.provider_thread_id
+    assert continued.invocation.provider_thread_mode == "continued"
+    assert continued.invocation.command[1:3] == ("exec", "resume")
 
 
 def test_managed_ollama_real_structured_invocation_requires_verified_runtime(

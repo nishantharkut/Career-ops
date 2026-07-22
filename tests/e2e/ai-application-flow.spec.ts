@@ -11,6 +11,7 @@ import {
 
 const API_ORIGIN = "http://127.0.0.1:8765";
 const MOCK_PROVIDER_LABEL = "E2E mock provider";
+const unsupportedOutputMetric = unsafeMetricClaim.replace("70+", "95+");
 const E2E_CONTROL_HEADERS = { "X-CareerOps-E2E-Control": "careerops-e2e-control-v1" };
 
 type JsonObject = Record<string, unknown>;
@@ -266,25 +267,25 @@ test("real mock provider completes the day-one application workflow with durable
     await expect(page.getByText(profileFactKey, { exact: true })).toBeVisible();
   });
 
-  await test.step("block the unsafe 70+ output and reject the risky resume", async () => {
+  await test.step("block an altered unsupported metric from the risky resume", async () => {
     await uploadResume(page, "Risky 70+ resume", riskyResumePath);
     await renderSelectedResume(page);
     await runAiTask(page, "analyze_fit", "Run AI review", "Blocked");
     let unsupportedMetric = page
       .locator("section[aria-label='AI findings'] li")
-      .filter({ hasText: "unsupported_metric in provider output" });
-    await expect(unsupportedMetric.getByText("Blocked by verifier", { exact: true })).toBeVisible();
-    await expect(page.getByText(unsafeMetricClaim, { exact: true })).toHaveCount(0);
+      .filter({ hasText: unsupportedOutputMetric });
+    await expect(unsupportedMetric).toHaveCount(2);
+    await expect(unsupportedMetric.first().getByText("Blocked by verifier", { exact: true })).toBeVisible();
+    await expect(page.getByText(unsupportedOutputMetric, { exact: true }).first()).toBeVisible();
     await expect(unsupportedMetric.getByRole("button", { name: /Accept/ })).toHaveCount(0);
-    await unsupportedMetric.getByRole("button", { name: "Reject suggestion" }).click();
-    await expect(unsupportedMetric.getByText("Decision: rejected", { exact: true })).toBeVisible();
+    await expect(unsupportedMetric.getByRole("button", { name: /Reject/ })).toHaveCount(0);
 
     const blockedTask = (await packet(page, applicationId)).latest_ai_task!;
     const blockedFindings = await apiJson<AiFindingRecord[]>(page, `/ai-tasks/${blockedTask.id}/findings`);
     expect(blockedFindings).toContainEqual(expect.objectContaining({
-      claim_text: "unsupported_metric in provider output",
+      claim_text: unsupportedOutputMetric,
       verifier_state: "blocked",
-      decision: "rejected"
+      decision: "pending"
     }));
 
     await page.reload();
@@ -292,9 +293,9 @@ test("real mock provider completes the day-one application workflow with durable
     await expect(page.getByRole("heading", { name: "Swiggy" })).toBeVisible();
     unsupportedMetric = page
       .locator("section[aria-label='AI findings'] li")
-      .filter({ hasText: "unsupported_metric in provider output" });
-    await expect(unsupportedMetric.getByText("Blocked by verifier", { exact: true })).toBeVisible();
-    await expect(unsupportedMetric.getByText("Decision: rejected", { exact: true })).toBeVisible();
+      .filter({ hasText: unsupportedOutputMetric });
+    await expect(unsupportedMetric).toHaveCount(2);
+    await expect(unsupportedMetric.first().getByText("Blocked by verifier", { exact: true })).toBeVisible();
     await expect(unsupportedMetric.getByRole("button", { name: /Accept|Reject/ })).toHaveCount(0);
   });
 
