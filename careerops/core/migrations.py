@@ -1,8 +1,12 @@
 from collections.abc import Callable
+from datetime import UTC, datetime
 import hashlib
 import json
 import os
+from pathlib import Path
 import sqlite3
+import stat
+import uuid
 
 
 Migration = Callable[[sqlite3.Connection], None]
@@ -877,6 +881,539 @@ def _add_provider_container_image_bindings(connection: sqlite3.Connection) -> No
     _add_ai_prompt_and_artifact_authority(connection)
 
 
+_V17_REPORT_PROVENANCE_FIELDS = frozenset(
+    {
+        "ai_task_id",
+        "context_sha256",
+        "output_checksums",
+        "privacy_mode",
+        "prompt_sha256",
+        "prompt_template_id",
+        "provider_binding",
+        "provider_binding_sha256",
+        "provider_config_id",
+        "provider_identity_name",
+        "provider_kind",
+        "provider_model",
+    }
+)
+_V17_PROVIDER_BINDING_FIELDS = (
+    "provider_kind",
+    "model",
+    "privacy_mode",
+    "data_leaves_machine",
+    "is_ai",
+    "endpoint",
+    "identity_name",
+    "executable",
+    "executable_sha256",
+    "executable_version",
+    "codex_home",
+    "reasoning_effort",
+    "model_digest",
+    "model_metadata_sha256",
+    "show_metadata_sha256",
+    "attestation_version",
+    "runtime_instance_id",
+    "runtime_handle",
+    "container_image_reference",
+    "container_image_id",
+    "issuer_instance_id",
+    "egress_policy",
+    "cloud_disabled",
+    "egress_enforced",
+    "isolation_evidence_sha256",
+    "isolation_evidence_signature",
+)
+_V17_PROVIDER_BOOLEAN_FIELDS = frozenset(
+    {"data_leaves_machine", "is_ai", "cloud_disabled", "egress_enforced"}
+)
+_V17_MAX_AUTHORITY_FILE_BYTES = 16_000_000
+
+
+def _v17_json(value: object) -> str:
+    return json.dumps(
+        value,
+        ensure_ascii=False,
+        allow_nan=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+
+
+def _v17_is_sha256(value: object) -> bool:
+    return (
+        isinstance(value, str)
+        and len(value) == 64
+        and value == value.lower()
+        and all(character in "0123456789abcdef" for character in value)
+    )
+
+
+def _v17_contains_reserved_provenance(
+    value: object, *, allow_root: bool = False
+) -> bool:
+    if isinstance(value, dict):
+        if "provenance" in value and not allow_root:
+            return True
+        return any(
+            _v17_contains_reserved_provenance(inner)
+            for key, inner in value.items()
+            if not (allow_root and key == "provenance")
+        )
+    if isinstance(value, (list, tuple)):
+        return any(_v17_contains_reserved_provenance(inner) for inner in value)
+    return False
+
+
+def _v17_provider_binding(raw_json: object, expected_sha256: object) -> dict | None:
+    if not isinstance(raw_json, str) or not _v17_is_sha256(expected_sha256):
+        return None
+    try:
+        value = json.loads(raw_json)
+    except (TypeError, json.JSONDecodeError):
+        return None
+    if not isinstance(value, dict) or set(value) != set(_V17_PROVIDER_BINDING_FIELDS):
+        return None
+    for field in _V17_PROVIDER_BINDING_FIELDS:
+        field_value = value[field]
+        if field in _V17_PROVIDER_BOOLEAN_FIELDS:
+            if type(field_value) is not bool:
+                return None
+        elif not isinstance(field_value, str):
+            return None
+    if _v17_json(value) != raw_json:
+        return None
+    if hashlib.sha256(raw_json.encode("utf-8")).hexdigest() != expected_sha256:
+        return None
+    return value
+
+
+def _v17_read_authority_file(raw_path: object) -> tuple[bytes, str] | None:
+    if not isinstance(raw_path, str) or not raw_path:
+        return None
+    path = Path(raw_path)
+    try:
+        canonical_path = Path(os.path.realpath(path))
+        if not path.is_absolute() or str(canonical_path) != raw_path:
+            return None
+        path_stat = canonical_path.lstat()
+        if (
+            stat.S_ISLNK(path_stat.st_mode)
+            or not stat.S_ISREG(path_stat.st_mode)
+            or path_stat.st_nlink != 1
+            or path_stat.st_size > _V17_MAX_AUTHORITY_FILE_BYTES
+        ):
+            return None
+        flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(canonical_path, flags)
+        try:
+            opened = os.fstat(descriptor)
+            identity = (
+                opened.st_dev,
+                opened.st_ino,
+                opened.st_size,
+                opened.st_mtime_ns,
+                opened.st_nlink,
+            )
+            if (
+                not stat.S_ISREG(opened.st_mode)
+                or opened.st_nlink != 1
+                or opened.st_size > _V17_MAX_AUTHORITY_FILE_BYTES
+            ):
+                return None
+            chunks: list[bytes] = []
+            digest = hashlib.sha256()
+            total = 0
+            while True:
+                chunk = os.read(descriptor, 64 * 1024)
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > _V17_MAX_AUTHORITY_FILE_BYTES:
+                    return None
+                chunks.append(chunk)
+                digest.update(chunk)
+            after_read = os.fstat(descriptor)
+        finally:
+            os.close(descriptor)
+        after_path = canonical_path.lstat()
+        if identity != (
+            after_read.st_dev,
+            after_read.st_ino,
+            after_read.st_size,
+            after_read.st_mtime_ns,
+            after_read.st_nlink,
+        ) or identity != (
+            after_path.st_dev,
+            after_path.st_ino,
+            after_path.st_size,
+            after_path.st_mtime_ns,
+            after_path.st_nlink,
+        ):
+            return None
+    except (OSError, ValueError):
+        return None
+    return b"".join(chunks), digest.hexdigest()
+
+
+def _v17_artifact_path_matches(
+    raw_path: object, task_id: str, artifact_id: str
+) -> bool:
+    if not isinstance(raw_path, str):
+        return False
+    parts = Path(raw_path).parts
+    expected = ("ai-artifacts", task_id, artifact_id)
+    if len(parts) < 4 or not parts[-1]:
+        return False
+    return tuple(os.path.normcase(part) for part in parts[-4:-1]) == tuple(
+        os.path.normcase(part) for part in expected
+    )
+
+
+def _v17_report_authority(
+    connection: sqlite3.Connection,
+    application: sqlite3.Row,
+    report: sqlite3.Row,
+    resume: sqlite3.Row,
+) -> tuple[str, str] | None:
+    try:
+        if (
+            application["latest_report_id"] != report["id"]
+            or application["id"] != report["application_id"]
+            or application["selected_resume_version_id"] != report["resume_version_id"]
+            or application["jd_snapshot_id"] != report["jd_snapshot_id"]
+            or resume["id"] != report["resume_version_id"]
+            or not _v17_is_sha256(resume["pdf_sha256"])
+            or not _v17_is_sha256(resume["tex_sha256"])
+        ):
+            return None
+
+        pdf_file = _v17_read_authority_file(resume["pdf_path"])
+        source_file = _v17_read_authority_file(resume["tex_path"])
+        if (
+            pdf_file is None
+            or pdf_file[1] != resume["pdf_sha256"]
+            or source_file is None
+            or source_file[1] != resume["tex_sha256"]
+        ):
+            return None
+
+        fit = json.loads(report["fit_json"])
+        risks = json.loads(report["risks_json"])
+        if not isinstance(fit, dict) or not isinstance(risks, dict):
+            return None
+        if (
+            set(fit).intersection(_V17_REPORT_PROVENANCE_FIELDS)
+            or set(risks).intersection(_V17_REPORT_PROVENANCE_FIELDS)
+            or _v17_contains_reserved_provenance(fit, allow_root=True)
+            or _v17_contains_reserved_provenance(risks, allow_root=True)
+        ):
+            return None
+        fit_provenance = fit.get("provenance")
+        if (
+            not isinstance(fit_provenance, dict)
+            or set(fit_provenance) != _V17_REPORT_PROVENANCE_FIELDS
+            or risks.get("provenance") != fit_provenance
+        ):
+            return None
+        blockers = risks.get("blockers")
+        warnings = risks.get("warnings")
+        if (
+            not isinstance(blockers, list)
+            or not isinstance(warnings, list)
+            or blockers
+            or len(blockers) != report["blocking_issue_count"]
+            or len(warnings) != report["warning_count"]
+        ):
+            return None
+
+        authority_snapshots: list[dict] = []
+        versions = connection.execute(
+            """
+            SELECT snapshot_json FROM application_versions
+            WHERE application_id = ? AND event_type = 'ai_task.completed'
+            """,
+            (application["id"],),
+        ).fetchall()
+        for version in versions:
+            try:
+                snapshot = json.loads(version["snapshot_json"])
+            except (TypeError, json.JSONDecodeError):
+                continue
+            if (
+                isinstance(snapshot, dict)
+                and isinstance(snapshot.get("side_effect"), dict)
+                and snapshot["side_effect"].get("report_id") == report["id"]
+            ):
+                authority_snapshots.append(snapshot)
+        if len(authority_snapshots) != 1:
+            return None
+        authority = authority_snapshots[0]
+        task_snapshot = authority.get("ai_task")
+        if not isinstance(task_snapshot, dict):
+            return None
+        task_id = task_snapshot.get("id")
+        if not isinstance(task_id, str) or fit_provenance.get("ai_task_id") != task_id:
+            return None
+        if authority.get("provenance") != fit_provenance:
+            return None
+
+        task = connection.execute(
+            "SELECT * FROM ai_tasks WHERE id = ?", (task_id,)
+        ).fetchone()
+        if (
+            task is None
+            or task["application_id"] != application["id"]
+            or task["task_type"] != "analyze_fit"
+            or task["status"] != "completed"
+            or not task["completed_at"]
+            or not _v17_is_sha256(task["prompt_sha256"])
+        ):
+            return None
+        provider = connection.execute(
+            "SELECT * FROM ai_provider_configs WHERE id = ?",
+            (task["provider_config_id"],),
+        ).fetchone()
+        if provider is None or provider["enabled"] != 1:
+            return None
+        task_binding = _v17_provider_binding(
+            task["provider_binding_json"], task["provider_binding_sha256"]
+        )
+        provider_binding = _v17_provider_binding(
+            provider["availability_binding_json"],
+            provider["availability_binding_sha256"],
+        )
+        if (
+            task_binding is None
+            or provider_binding is None
+            or task_binding != provider_binding
+            or task["provider_binding_sha256"]
+            != provider["availability_binding_sha256"]
+            or task_binding["is_ai"] is not True
+            or task["privacy_mode"] != provider["privacy_mode"]
+            or task_binding["provider_kind"] != provider["provider_kind"]
+            or task_binding["model"] != provider["model"]
+            or task_binding["endpoint"] != provider["endpoint"]
+            or task_binding["identity_name"] != provider["identity_name"]
+        ):
+            return None
+
+        normalized_input_ids = [
+            row["artifact_id"]
+            for row in connection.execute(
+                """
+                SELECT artifact_id FROM ai_task_input_artifacts
+                WHERE task_id = ? ORDER BY ordinal ASC
+                """,
+                (task_id,),
+            ).fetchall()
+        ]
+        declared_input_ids = json.loads(task["input_artifact_ids_json"])
+        if (
+            declared_input_ids != normalized_input_ids
+            or task_snapshot.get("input_artifact_ids") != normalized_input_ids
+            or task_snapshot.get("provider_config_id") != provider["id"]
+            or task_snapshot.get("status") != "completed"
+            or task_snapshot.get("task_type") != "analyze_fit"
+        ):
+            return None
+
+        manifest = authority.get("artifacts")
+        if not isinstance(manifest, list):
+            return None
+        manifest_by_id: dict[str, dict] = {}
+        manifest_by_type: dict[str, dict] = {}
+        for item in manifest:
+            if (
+                not isinstance(item, dict)
+                or set(item) != {"artifact_type", "id", "sha256"}
+                or any(type(item.get(field)) is not str for field in item)
+                or not _v17_is_sha256(item["sha256"])
+                or item["id"] in manifest_by_id
+                or item["artifact_type"] in manifest_by_type
+            ):
+                return None
+            manifest_by_id[item["id"]] = item
+            manifest_by_type[item["artifact_type"]] = item
+        if set(manifest_by_type) != {"context", "raw_output", "validated_output"}:
+            return None
+        placeholders = ", ".join("?" for _ in manifest_by_id)
+        artifact_rows = connection.execute(
+            f"SELECT * FROM ai_artifacts WHERE id IN ({placeholders})",
+            tuple(manifest_by_id),
+        ).fetchall()
+        if len(artifact_rows) != len(manifest_by_id):
+            return None
+        artifacts = {row["id"]: row for row in artifact_rows}
+        context_row = artifacts[manifest_by_type["context"]["id"]]
+        claim_token = context_row["claim_token"]
+        if not isinstance(claim_token, str) or not claim_token:
+            return None
+        artifact_contents: dict[str, bytes] = {}
+        for artifact_id, item in manifest_by_id.items():
+            artifact = artifacts[artifact_id]
+            file_contents = _v17_read_authority_file(artifact["path"])
+            if (
+                artifact["task_id"] != task_id
+                or artifact["claim_token"] != claim_token
+                or artifact["artifact_type"] != item["artifact_type"]
+                or artifact["sha256"] != item["sha256"]
+                or artifact["schema_version"] != "1"
+                or artifact["storage_version"] != 2
+                or not _v17_artifact_path_matches(
+                    artifact["path"], task_id, artifact_id
+                )
+                or file_contents is None
+                or file_contents[1] != artifact["sha256"]
+            ):
+                return None
+            artifact_contents[artifact["artifact_type"]] = file_contents[0]
+        attempt_artifact_ids = {
+            row["id"]
+            for row in connection.execute(
+                "SELECT id FROM ai_artifacts WHERE task_id = ? AND claim_token = ?",
+                (task_id, claim_token),
+            ).fetchall()
+        }
+        if attempt_artifact_ids != set(manifest_by_id):
+            return None
+
+        context = json.loads(artifact_contents["context"])
+        if (
+            not isinstance(context, dict)
+            or context.get("task_type") != "analyze_fit"
+            or not isinstance(context.get("job_description"), dict)
+            or context["job_description"].get("snapshot_id")
+            != report["jd_snapshot_id"]
+            or not isinstance(context.get("selected_resume"), dict)
+            or context["selected_resume"].get("version_id")
+            != report["resume_version_id"]
+        ):
+            return None
+
+        finding_ids = authority.get("finding_ids")
+        if (
+            not isinstance(finding_ids, list)
+            or any(type(finding_id) is not str for finding_id in finding_ids)
+            or len(set(finding_ids)) != len(finding_ids)
+        ):
+            return None
+        finding_rows = connection.execute(
+            "SELECT * FROM ai_findings WHERE task_id = ? AND claim_token = ?",
+            (task_id, claim_token),
+        ).fetchall()
+        if {row["id"] for row in finding_rows} != set(finding_ids):
+            return None
+        if any(
+            row["severity"] == "blocking"
+            or row["verifier_state"]
+            in {"blocked", "needs_evidence", "rejected"}
+            for row in finding_rows
+        ):
+            return None
+
+        expected_provenance = {
+            "ai_task_id": task_id,
+            "context_sha256": manifest_by_type["context"]["sha256"],
+            "output_checksums": {
+                "raw_output": manifest_by_type["raw_output"]["sha256"],
+                "validated_output": manifest_by_type["validated_output"]["sha256"],
+            },
+            "privacy_mode": task["privacy_mode"],
+            "prompt_sha256": task["prompt_sha256"],
+            "prompt_template_id": task["prompt_template_id"],
+            "provider_binding": task_binding,
+            "provider_binding_sha256": task["provider_binding_sha256"],
+            "provider_config_id": provider["id"],
+            "provider_identity_name": provider["identity_name"],
+            "provider_kind": provider["provider_kind"],
+            "provider_model": provider["model"],
+        }
+        if fit_provenance != expected_provenance:
+            return None
+    except (KeyError, OSError, TypeError, ValueError, json.JSONDecodeError):
+        return None
+    return task_id, resume["pdf_sha256"]
+
+
+def _v17_recover_unprovable_approvals(connection: sqlite3.Connection) -> None:
+    reason = "AI approval authority could not be proven during v17 migration"
+    applications = connection.execute(
+        """
+        SELECT * FROM applications
+        WHERE approval_id IS NOT NULL
+          AND submission_state = 'not_submitted'
+        """
+    ).fetchall()
+    for application in applications:
+        report = connection.execute(
+            "SELECT * FROM reports WHERE id = ?", (application["latest_report_id"],)
+        ).fetchone()
+        resume = connection.execute(
+            "SELECT * FROM resume_versions WHERE id = ?",
+            (application["selected_resume_version_id"],),
+        ).fetchone()
+        approval = connection.execute(
+            "SELECT * FROM approvals WHERE id = ?", (application["approval_id"],)
+        ).fetchone()
+        authority = (
+            _v17_report_authority(connection, application, report, resume)
+            if report is not None and resume is not None
+            else None
+        )
+        preserve = (
+            application["status"] == "approved"
+            and authority is not None
+            and report["ai_task_id"] == authority[0]
+            and report["pdf_sha256"] == authority[1]
+            and approval is not None
+            and approval["application_id"] == application["id"]
+            and approval["report_id"] == report["id"]
+            and approval["resume_version_id"] == resume["id"]
+            and approval["pdf_sha256"] == resume["pdf_sha256"]
+        )
+        if preserve:
+            continue
+        now = datetime.now(UTC).isoformat()
+        before = {
+            "approval_id": application["approval_id"],
+            "latest_report_id": application["latest_report_id"],
+            "status": application["status"],
+        }
+        after = {
+            "approval_id": None,
+            "latest_report_id": None,
+            "reason": reason,
+            "status": "ready_for_review",
+        }
+        connection.execute(
+            """
+            UPDATE applications
+            SET approval_id = NULL, latest_report_id = NULL,
+                status = 'ready_for_review', updated_at = ?
+            WHERE id = ?
+            """,
+            (now, application["id"]),
+        )
+        connection.execute(
+            """
+            INSERT INTO audit_events (
+                id, event_type, entity_type, entity_id,
+                before_json, after_json, created_at
+            ) VALUES (?, ?, 'application', ?, ?, ?, ?)
+            """,
+            (
+                f"aud_{uuid.uuid4().hex}",
+                "application.approval_invalidated_by_ai_authority_migration",
+                application["id"],
+                _v17_json(before),
+                _v17_json(after),
+                now,
+            ),
+        )
+
+
 def _add_report_ai_approval_authority(connection: sqlite3.Connection) -> None:
     report_columns = _column_names(connection, "reports")
     if "ai_task_id" not in report_columns:
@@ -888,6 +1425,44 @@ def _add_report_ai_approval_authority(connection: sqlite3.Connection) -> None:
     connection.execute(
         "CREATE INDEX IF NOT EXISTS idx_reports_ai_task ON reports(ai_task_id)"
     )
+    previous_row_factory = connection.row_factory
+    connection.row_factory = sqlite3.Row
+    try:
+        applications = connection.execute(
+            """
+            SELECT * FROM applications
+            WHERE latest_report_id IS NOT NULL
+            """
+        ).fetchall()
+        for application in applications:
+            report = connection.execute(
+                """
+                SELECT * FROM reports
+                WHERE id = ? AND ai_task_id IS NULL AND pdf_sha256 IS NULL
+                """,
+                (application["latest_report_id"],),
+            ).fetchone()
+            resume = connection.execute(
+                "SELECT * FROM resume_versions WHERE id = ?",
+                (application["selected_resume_version_id"],),
+            ).fetchone()
+            if report is None or resume is None:
+                continue
+            authority = _v17_report_authority(
+                connection, application, report, resume
+            )
+            if authority is None:
+                continue
+            connection.execute(
+                """
+                UPDATE reports SET ai_task_id = ?, pdf_sha256 = ?
+                WHERE id = ? AND ai_task_id IS NULL AND pdf_sha256 IS NULL
+                """,
+                (*authority, report["id"]),
+            )
+        _v17_recover_unprovable_approvals(connection)
+    finally:
+        connection.row_factory = previous_row_factory
 
 
 MIGRATIONS: tuple[tuple[int, Migration], ...] = (

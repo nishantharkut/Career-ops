@@ -2306,6 +2306,331 @@ def create_approved_application(repo: CareerOpsRepository, tmp_path: Path):
     return application, resume, report, approval
 
 
+def downgrade_approved_packet_to_v16(
+    repo: CareerOpsRepository,
+    application_id: str,
+) -> None:
+    with repo.connection() as connection:
+        connection.execute("DROP INDEX IF EXISTS idx_reports_ai_task")
+        connection.execute("ALTER TABLE reports RENAME TO reports_v17")
+        connection.execute(
+            """
+            CREATE TABLE reports (
+                id TEXT PRIMARY KEY,
+                application_id TEXT NOT NULL,
+                resume_version_id TEXT NOT NULL,
+                jd_snapshot_id TEXT NOT NULL,
+                fit_json TEXT NOT NULL,
+                risks_json TEXT NOT NULL,
+                blocking_issue_count INTEGER NOT NULL,
+                warning_count INTEGER NOT NULL,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO reports (
+                id, application_id, resume_version_id, jd_snapshot_id,
+                fit_json, risks_json, blocking_issue_count, warning_count,
+                created_at
+            )
+            SELECT id, application_id, resume_version_id, jd_snapshot_id,
+                   fit_json, risks_json, blocking_issue_count, warning_count,
+                   created_at
+            FROM reports_v17
+            """
+        )
+        connection.execute("DROP TABLE reports_v17")
+        connection.execute("PRAGMA user_version = 16")
+        assert connection.execute(
+            "SELECT approval_id FROM applications WHERE id = ?",
+            (application_id,),
+        ).fetchone()[0]
+
+
+def mutate_v16_authority_fixture(
+    repo: CareerOpsRepository,
+    *,
+    application_id: str,
+    report_id: str,
+    task_id: str,
+    mismatch: str,
+) -> None:
+    with repo.connection() as connection:
+        report = connection.execute(
+            "SELECT * FROM reports WHERE id = ?", (report_id,)
+        ).fetchone()
+        version = connection.execute(
+            """
+            SELECT * FROM application_versions
+            WHERE application_id = ? AND event_type = 'ai_task.completed'
+            """,
+            (application_id,),
+        ).fetchone()
+        assert report is not None and version is not None
+        fit = json.loads(report["fit_json"])
+        risks = json.loads(report["risks_json"])
+        snapshot = json.loads(version["snapshot_json"])
+
+        if mismatch == "ambiguous_versions":
+            connection.execute(
+                """
+                INSERT INTO application_versions (
+                    id, application_id, version_number, event_type,
+                    snapshot_json, created_at
+                ) VALUES (?, ?, ?, 'ai_task.completed', ?, ?)
+                """,
+                (
+                    "appv_duplicate_authority",
+                    application_id,
+                    version["version_number"] + 1,
+                    version["snapshot_json"],
+                    version["created_at"],
+                ),
+            )
+        elif mismatch == "missing_report_provenance":
+            fit.pop("provenance")
+            risks.pop("provenance")
+            connection.execute(
+                "UPDATE reports SET fit_json = ?, risks_json = ? WHERE id = ?",
+                (
+                    json.dumps(fit, separators=(",", ":"), sort_keys=True),
+                    json.dumps(risks, separators=(",", ":"), sort_keys=True),
+                    report_id,
+                ),
+            )
+        elif mismatch == "deterministic_report":
+            connection.execute(
+                "UPDATE reports SET fit_json = ?, risks_json = ? WHERE id = ?",
+                (
+                    '{"method":"deterministic","score":100}',
+                    '{"blockers":[],"warnings":[]}',
+                    report_id,
+                ),
+            )
+            connection.execute(
+                "DELETE FROM application_versions WHERE id = ?", (version["id"],)
+            )
+        elif mismatch == "report_json_only":
+            connection.execute(
+                "DELETE FROM application_versions WHERE id = ?", (version["id"],)
+            )
+        elif mismatch == "nested_report_provenance":
+            fit["details"] = {"provenance": {"ai_task_id": task_id}}
+            connection.execute(
+                "UPDATE reports SET fit_json = ? WHERE id = ?",
+                (
+                    json.dumps(fit, separators=(",", ":"), sort_keys=True),
+                    report_id,
+                ),
+            )
+        elif mismatch == "verifier_only_provider":
+            binding = dict(snapshot["provenance"]["provider_binding"])
+            binding["is_ai"] = False
+            binding_json = json.dumps(binding, separators=(",", ":"), sort_keys=True)
+            binding_sha256 = hashlib.sha256(binding_json.encode("utf-8")).hexdigest()
+            connection.execute("DROP TRIGGER validate_ai_task_authority_immutable")
+            connection.execute(
+                """
+                UPDATE ai_provider_configs
+                SET availability_binding_json = ?, availability_binding_sha256 = ?
+                WHERE id = (SELECT provider_config_id FROM ai_tasks WHERE id = ?)
+                """,
+                (binding_json, binding_sha256, task_id),
+            )
+            connection.execute(
+                """
+                UPDATE ai_tasks
+                SET provider_binding_json = ?, provider_binding_sha256 = ?
+                WHERE id = ?
+                """,
+                (binding_json, binding_sha256, task_id),
+            )
+            for provenance in (
+                fit["provenance"],
+                risks["provenance"],
+                snapshot["provenance"],
+            ):
+                provenance["provider_binding"] = binding
+                provenance["provider_binding_sha256"] = binding_sha256
+            connection.execute(
+                "UPDATE reports SET fit_json = ?, risks_json = ? WHERE id = ?",
+                (
+                    json.dumps(fit, separators=(",", ":"), sort_keys=True),
+                    json.dumps(risks, separators=(",", ":"), sort_keys=True),
+                    report_id,
+                ),
+            )
+            connection.execute(
+                "UPDATE application_versions SET snapshot_json = ? WHERE id = ?",
+                (
+                    json.dumps(snapshot, separators=(",", ":"), sort_keys=True),
+                    version["id"],
+                ),
+            )
+            next(
+                migration
+                for migration_version, migration in MIGRATIONS
+                if migration_version == 14
+            )(connection)
+        elif mismatch == "stale_task":
+            connection.execute(
+                "UPDATE ai_tasks SET status = 'failed' WHERE id = ?", (task_id,)
+            )
+        elif mismatch == "wrong_task_type":
+            snapshot["ai_task"]["task_type"] = "analyze_jd"
+            connection.execute(
+                "UPDATE ai_tasks SET task_type = 'analyze_jd' WHERE id = ?",
+                (task_id,),
+            )
+            connection.execute(
+                "UPDATE application_versions SET snapshot_json = ? WHERE id = ?",
+                (
+                    json.dumps(snapshot, separators=(",", ":"), sort_keys=True),
+                    version["id"],
+                ),
+            )
+        elif mismatch == "stale_pdf":
+            stale_sha256 = "f" * 64
+            connection.execute(
+                "UPDATE resume_versions SET pdf_sha256 = ? WHERE id = ?",
+                (stale_sha256, report["resume_version_id"]),
+            )
+            connection.execute(
+                "UPDATE approvals SET pdf_sha256 = ? WHERE report_id = ?",
+                (stale_sha256, report_id),
+            )
+        elif mismatch == "mismatched_packet":
+            connection.execute(
+                "UPDATE reports SET jd_snapshot_id = 'jd_stale' WHERE id = ?",
+                (report_id,),
+            )
+        else:
+            raise AssertionError(f"Unknown fixture mismatch: {mismatch}")
+
+
+def create_v16_approved_packet(
+    tmp_path: Path,
+    *,
+    mismatch: str | None = None,
+):
+    database_path = tmp_path / "careerops-v16.db"
+    vault_path = tmp_path / "vault-v16"
+    repo = CareerOpsRepository(database_path, vault_path)
+    repo.initialize()
+    application, resume, report, approval = create_approved_application(repo, tmp_path)
+    assert report.ai_task_id is not None
+    if mismatch is not None:
+        mutate_v16_authority_fixture(
+            repo,
+            application_id=application.id,
+            report_id=report.id,
+            task_id=report.ai_task_id,
+            mismatch=mismatch,
+        )
+    downgrade_approved_packet_to_v16(repo, application.id)
+    with closing(sqlite3.connect(database_path)) as connection:
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 16
+        assert "ai_task_id" not in {
+            row[1] for row in connection.execute("PRAGMA table_info(reports)")
+        }
+    return database_path, vault_path, application, resume, report, approval
+
+
+def test_v17_migration_preserves_provable_ai_approval_and_submission(
+    tmp_path: Path,
+):
+    database_path, vault_path, application, resume, report, approval = (
+        create_v16_approved_packet(tmp_path)
+    )
+
+    migrated = CareerOpsRepository(database_path, vault_path)
+    migrated.initialize()
+    migrated.initialize()
+
+    restored_report = migrated.get_report(report.id)
+    restored_application = migrated.get_application(application.id)
+    assert restored_report.ai_task_id == report.ai_task_id
+    assert restored_report.pdf_sha256 == resume.pdf_sha256
+    assert restored_application.status == "approved"
+    assert restored_application.approval_id == approval.id
+    assert not any(
+        event.event_type == "application.approval_invalidated_by_ai_authority_migration"
+        for event in migrated.list_audit_events()
+    )
+
+    submitted = migrated.mark_submitted_manual(application.id, "Submitted after v17")
+
+    assert submitted.status == "submitted_manual"
+    assert submitted.approval_id == approval.id
+
+
+@pytest.mark.parametrize(
+    "mismatch",
+    [
+        "ambiguous_versions",
+        "missing_report_provenance",
+        "deterministic_report",
+        "report_json_only",
+        "nested_report_provenance",
+        "verifier_only_provider",
+        "stale_task",
+        "wrong_task_type",
+        "stale_pdf",
+        "mismatched_packet",
+    ],
+)
+def test_v17_migration_refuses_unsafe_authority_and_recovers_approved_packet(
+    tmp_path: Path,
+    mismatch: str,
+):
+    database_path, vault_path, application, _resume, report, approval = (
+        create_v16_approved_packet(tmp_path, mismatch=mismatch)
+    )
+
+    migrated = CareerOpsRepository(database_path, vault_path)
+    migrated.initialize()
+
+    restored_report = migrated.get_report(report.id)
+    restored_application = migrated.get_application(application.id)
+    assert restored_report.ai_task_id is None
+    assert restored_report.pdf_sha256 is None
+    assert restored_application.status == "ready_for_review"
+    assert restored_application.approval_id is None
+    assert restored_application.latest_report_id is None
+    assert migrated.get_approval(approval.id).id == approval.id
+    recovery_events = [
+        event
+        for event in migrated.list_audit_events()
+        if event.event_type
+        == "application.approval_invalidated_by_ai_authority_migration"
+    ]
+    assert len(recovery_events) == 1
+    assert recovery_events[0].before_json["approval_id"] == approval.id
+    assert recovery_events[0].after_json == {
+        "approval_id": None,
+        "latest_report_id": None,
+        "reason": "AI approval authority could not be proven during v17 migration",
+        "status": "ready_for_review",
+    }
+
+    replacement_binding = provider_binding(
+        model="replacement-v1", endpoint="test://replacement"
+    )
+    replacement = migrated.upsert_ai_provider(
+        provider_kind="mock",
+        display_name="Replacement AI",
+        privacy_mode="local_private",
+        endpoint="test://replacement",
+        model="replacement-v1",
+        enabled=True,
+        availability_binding=replacement_binding,
+    )
+    replacement_task = create_task(migrated, application.id, replacement.id)
+    assert replacement_task.status == "pending"
+
+
 @pytest.mark.parametrize("submitted", [False, True], ids=["approved", "submitted"])
 def test_create_ai_task_rejects_read_only_application_transactionally(
     tmp_path: Path, submitted: bool
