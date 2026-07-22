@@ -13,6 +13,7 @@ from fastapi.testclient import TestClient
 from apps.api.careerops_api.main import create_app
 from careerops.core.repository import CareerOpsRepository, MAX_PERSISTED_JSON_BYTES
 from tests.ai_approval_helpers import create_ai_approval_report
+from tests.pdf_helpers import write_pdf
 
 
 def make_repo(tmp_path: Path) -> CareerOpsRepository:
@@ -37,7 +38,7 @@ def select_resume(repo: CareerOpsRepository, application_id: str):
     tex = directory / "resume.tex"
     pdf = directory / "resume.pdf"
     tex.write_text("Python developer", encoding="utf-8")
-    pdf.write_bytes(b"%PDF-1.4\nfixture")
+    write_pdf(pdf, "Python developer resume")
     resume = repo.create_resume_version(
         name="Resume",
         role_family="software",
@@ -69,6 +70,51 @@ def seed_requirements(repo: CareerOpsRepository, snapshot_id: str) -> None:
             "UPDATE jd_snapshots SET extracted_requirements_json = ? WHERE id = ?",
             (json.dumps(seeded_requirements()), snapshot_id),
         )
+
+
+def test_application_creation_populates_deterministic_jd_requirements(
+    tmp_path: Path,
+):
+    repo = make_repo(tmp_path)
+
+    application = repo.create_application(
+        company="Swiggy",
+        role_title="Data Science Intern",
+        location="Bengaluru",
+        source_url="https://example.com/job",
+        jd_text=(
+            "Company: Swiggy\n"
+            "Title: Data Science Intern\n"
+            "Location: Bengaluru\n"
+            "Work mode: Hybrid\n"
+            "Required skills:\n- Python\n- SQL\n"
+            "Responsibilities:\n- Build data analysis workflows\n"
+            "Eligibility:\n- Graduation year 2027 required\n"
+        ),
+    )
+
+    snapshot = repo.get_jd_snapshot(application.jd_snapshot_id)
+    requirements = snapshot.extracted_requirements_json
+    assert snapshot.parser_version == "careerops-jd-parser-v1"
+    assert set(requirements) == {
+        "raw_ai",
+        "deterministic",
+        "user_corrected",
+        "uncertainty",
+    }
+    assert requirements["raw_ai"] == {}
+    assert requirements["user_corrected"] == {}
+    assert requirements["uncertainty"] == {}
+    assert requirements["deterministic"]["company"] == "Swiggy"
+    assert requirements["deterministic"]["required_skills"] == ["Python", "SQL"]
+    assert requirements["deterministic"]["exact_keywords"] == [
+        "python",
+        "sql",
+        "data analysis",
+    ]
+    assert requirements["deterministic"]["knockout_conditions"] == [
+        "Graduation year 2027 required"
+    ]
 
 
 def canonical_json_size(value: object) -> int:
@@ -539,6 +585,73 @@ def test_evidence_create_link_and_list_keeps_private_and_rejected_visible(tmp_pa
     }
     assert client.get(f"/applications/{other.id}/evidence").json() == []
     assert "source_path" not in str(listed.json())
+
+
+def test_linking_evidence_invalidates_current_report_and_records_version(
+    tmp_path: Path,
+):
+    repo = make_repo(tmp_path)
+    application = create_application(repo)
+    resume = select_resume(repo, application.id)
+    report = create_ai_approval_report(repo, application.id, resume.id)
+    evidence = repo.create_evidence_item(
+        claim_text="Verified project",
+        evidence_type="project",
+        verification_state="verified",
+        privacy_level="public",
+    )
+
+    linked = repo.link_application_evidence(application.id, evidence.id)
+
+    updated = repo.get_application(application.id)
+    assert linked.id == evidence.id
+    assert updated.latest_report_id is None
+    assert updated.status == "needs_resume_update"
+    assert repo.get_report(report.id).id == report.id
+    version = repo.list_application_versions(application.id)[-1]
+    assert version.event_type == "application.evidence_linked"
+    assert version.snapshot["invalidated_report_id"] == report.id
+
+
+@pytest.mark.parametrize("terminal_state", ["approved", "submitted"])
+def test_evidence_api_rejects_packet_mutation_after_approval(
+    tmp_path: Path, terminal_state: str
+):
+    repo = make_repo(tmp_path)
+    application = create_application(repo)
+    resume = select_resume(repo, application.id)
+    existing = repo.create_evidence_item(
+        claim_text="Existing evidence",
+        evidence_type="note",
+        verification_state="verified",
+        privacy_level="public",
+    )
+    report = create_ai_approval_report(repo, application.id, resume.id)
+    repo.approve_application(application.id, report.id, "Reviewed")
+    if terminal_state == "submitted":
+        repo.mark_submitted_manual(application.id, "Submitted")
+    before_packet = repo.get_application_packet_snapshot(application.id)
+    before_evidence_ids = [item.id for item in repo.list_evidence_items()]
+    client = TestClient(create_app(repo, provider_registry={}))
+
+    created = client.post(
+        f"/applications/{application.id}/evidence",
+        json={
+            "claim_text": "Late evidence",
+            "evidence_type": "note",
+            "verification_state": "verified",
+            "privacy_level": "public",
+        },
+    )
+    linked = client.post(
+        f"/applications/{application.id}/evidence",
+        json={"evidence_id": existing.id},
+    )
+
+    assert created.status_code == 409
+    assert linked.status_code == 409
+    assert [item.id for item in repo.list_evidence_items()] == before_evidence_ids
+    assert repo.get_application_packet_snapshot(application.id) == before_packet
 
 
 @pytest.mark.parametrize(

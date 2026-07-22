@@ -21,6 +21,7 @@ from careerops.core.database import connect_database, initialize_database
 from careerops.core.migrations import LATEST_SCHEMA_VERSION, MIGRATIONS
 from careerops.core.repository import CareerOpsRepository
 from careerops.ai.context import load_prompt_template
+from tests.pdf_helpers import write_pdf
 
 
 def make_repo(tmp_path: Path) -> CareerOpsRepository:
@@ -303,6 +304,31 @@ def create_provider(repo: CareerOpsRepository):
     )
 
 
+@pytest.mark.parametrize(
+    ("privacy_mode", "data_leaves_machine"),
+    [("local_private", True), ("cloud_external", False)],
+)
+def test_provider_rejects_transfer_flag_that_conflicts_with_privacy_mode(
+    tmp_path: Path, privacy_mode: str, data_leaves_machine: bool
+):
+    repo = make_repo(tmp_path)
+
+    with pytest.raises(ValueError, match="data transfer"):
+        repo.upsert_ai_provider(
+            provider_kind="mock",
+            display_name="Inconsistent provider",
+            privacy_mode=privacy_mode,
+            endpoint="test://inconsistent",
+            model="fixture-v1",
+            enabled=True,
+            availability_binding=provider_binding(
+                privacy_mode=privacy_mode,
+                endpoint="test://inconsistent",
+                data_leaves_machine=data_leaves_machine,
+            ),
+        )
+
+
 def create_task(
     repo: CareerOpsRepository,
     application_id: str,
@@ -458,8 +484,10 @@ def finalize_fit_report(
     provider_id: str,
     *,
     findings: list[dict[str, Any]] | None = None,
+    cloud_transfer_acknowledged: bool = False,
 ):
     application = repo.get_application(application_id)
+    resume = repo.get_resume_version(resume_id)
     provider = repo.get_ai_provider(provider_id)
     prompt = load_prompt_template("analyze_fit")
     task = repo.create_ai_task(
@@ -472,6 +500,7 @@ def finalize_fit_report(
         privacy_mode=provider.privacy_mode.value,
         expected_provider_binding=provider.availability_binding,
         expected_provider_binding_sha256=provider.availability_binding_sha256,
+        cloud_transfer_acknowledged=cloud_transfer_acknowledged,
     )
     claim = claim_task(repo, task.id)
     assert repo.begin_ai_task_invocation(task.id, claim) is True
@@ -479,7 +508,11 @@ def finalize_fit_report(
         {
             "task_type": "analyze_fit",
             "job_description": {"snapshot_id": application.jd_snapshot_id},
-            "selected_resume": {"version_id": resume_id},
+            "selected_resume": {
+                "version_id": resume_id,
+                "source_kind": "rendered_pdf",
+                "pdf_sha256": resume.pdf_sha256,
+            },
         },
         separators=(",", ":"),
         sort_keys=True,
@@ -596,9 +629,8 @@ def test_finalization_builds_provenance_from_repository_rows(tmp_path: Path):
     pdf_path = resume_dir / "resume.pdf"
     tex_path = resume_dir / "resume.tex"
     tex_bytes = b"repository-owned provenance source"
-    pdf_bytes = b"%PDF-1.4\nrepository-owned provenance"
     tex_path.write_bytes(tex_bytes)
-    pdf_path.write_bytes(pdf_bytes)
+    pdf_bytes = write_pdf(pdf_path, "Repository-owned provenance resume")
     resume = repo.create_resume_version(
         name="Current resume",
         role_family="software",
@@ -606,6 +638,9 @@ def test_finalization_builds_provenance_from_repository_rows(tmp_path: Path):
         tex_sha256=hashlib.sha256(tex_bytes).hexdigest(),
         pdf_path=pdf_path,
         pdf_sha256=hashlib.sha256(pdf_bytes).hexdigest(),
+        render_status="rendered",
+        parse_status="parsed",
+        page_count=1,
     )
     repo.select_resume(application.id, resume.id)
     provider = create_provider(repo)
@@ -616,7 +651,11 @@ def test_finalization_builds_provenance_from_repository_rows(tmp_path: Path):
         {
             "task_type": "analyze_fit",
             "job_description": {"snapshot_id": application.jd_snapshot_id},
-            "selected_resume": {"version_id": resume.id},
+            "selected_resume": {
+                "version_id": resume.id,
+                "source_kind": "rendered_pdf",
+                "pdf_sha256": resume.pdf_sha256,
+            },
         },
         separators=(",", ":"),
         sort_keys=True,
@@ -675,6 +714,90 @@ def test_finalization_builds_provenance_from_repository_rows(tmp_path: Path):
     assert version.snapshot["provenance"] == expected_provenance
     approval = repo.approve_application(application.id, report.id, "Reviewed")
     assert approval.report_id == report.id
+
+
+@pytest.mark.parametrize("mutation", ["render_record", "file_bytes"])
+def test_analyze_fit_finalization_rejects_pdf_changed_after_context_capture(
+    tmp_path: Path,
+    mutation: str,
+):
+    repo = make_repo(tmp_path)
+    application = create_application(repo)
+    resume_dir = repo.vault_path / "resumes" / "pdf-drift"
+    resume_dir.mkdir(parents=True)
+    tex_path = resume_dir / "resume.tex"
+    tex_bytes = b"LaTeX source"
+    tex_path.write_bytes(tex_bytes)
+    first_pdf_path = resume_dir / "first.pdf"
+    first_pdf_bytes = write_pdf(first_pdf_path, "First rendered resume")
+    first_pdf_sha256 = hashlib.sha256(first_pdf_bytes).hexdigest()
+    resume = repo.create_resume_version(
+        name="Current resume",
+        role_family="software",
+        tex_path=tex_path,
+        tex_sha256=hashlib.sha256(tex_bytes).hexdigest(),
+        pdf_path=first_pdf_path,
+        pdf_sha256=first_pdf_sha256,
+        render_status="rendered",
+        parse_status="parsed",
+        page_count=1,
+    )
+    repo.select_resume(application.id, resume.id)
+    provider = create_provider(repo)
+    task = create_task(repo, application.id, provider.id)
+    claim = claim_task(repo, task.id)
+    assert repo.begin_ai_task_invocation(task.id, claim) is True
+    context = json.dumps(
+        {
+            "task_type": "analyze_fit",
+            "job_description": {"snapshot_id": application.jd_snapshot_id},
+            "selected_resume": {
+                "version_id": resume.id,
+                "source_kind": "rendered_pdf",
+                "pdf_sha256": first_pdf_sha256,
+            },
+        },
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    for artifact_type, content in (
+        ("context", context),
+        ("raw_output", b'{"task_type":"analyze_fit","score":90}'),
+        ("validated_output", b'{"task_type":"analyze_fit","score":90}'),
+    ):
+        write_attempt_artifact(repo, task.id, claim, artifact_type, content)
+
+    replacement_pdf_path = resume_dir / "replacement.pdf"
+    replacement_pdf_bytes = write_pdf(replacement_pdf_path, "Replacement resume")
+    if mutation == "render_record":
+        repo.update_resume_render(
+            resume.id,
+            pdf_path=replacement_pdf_path,
+            pdf_sha256=hashlib.sha256(replacement_pdf_bytes).hexdigest(),
+            render_status="rendered",
+            parse_status="parsed",
+            page_count=1,
+        )
+    else:
+        first_pdf_path.write_bytes(replacement_pdf_bytes)
+
+    with pytest.raises(ValueError, match="PDF changed during AI task"):
+        repo.finalize_ai_task_attempt(
+            task_id=task.id,
+            claim_token=claim,
+            terminal_status="completed",
+            error_summary="",
+            expected_jd_snapshot_id=application.jd_snapshot_id,
+            expected_resume_version_id=resume.id,
+            findings=[],
+            success_payload={
+                "fit": {"score": 90},
+                "risks": {"blockers": [], "warnings": []},
+            },
+        )
+
+    assert repo.get_ai_task(task.id).status == "running"
+    assert repo.get_application(application.id).latest_report_id is None
 
 
 def test_verification_failed_block_requires_all_output_artifacts(tmp_path: Path):
@@ -2281,9 +2404,8 @@ def prepare_approvable_application(repo: CareerOpsRepository, tmp_path: Path):
     tex_path = source_dir / "approved.tex"
     pdf_path = source_dir / "approved.pdf"
     tex_bytes = b"approved resume"
-    pdf_bytes = b"%PDF-1.4\napproved"
     tex_path.write_bytes(tex_bytes)
-    pdf_path.write_bytes(pdf_bytes)
+    pdf_bytes = write_pdf(pdf_path, "Approved resume")
     resume = repo.create_resume_version(
         name="Approved resume",
         role_family="software",
@@ -2291,6 +2413,9 @@ def prepare_approvable_application(repo: CareerOpsRepository, tmp_path: Path):
         tex_sha256=hashlib.sha256(tex_bytes).hexdigest(),
         pdf_path=pdf_path,
         pdf_sha256=hashlib.sha256(pdf_bytes).hexdigest(),
+        render_status="rendered",
+        parse_status="parsed",
+        page_count=1,
     )
     repo.select_resume(application.id, resume.id)
     provider = create_provider(repo)
@@ -2304,6 +2429,73 @@ def create_approved_application(repo: CareerOpsRepository, tmp_path: Path):
     application, resume, report = prepare_approvable_application(repo, tmp_path)
     approval = repo.approve_application(application.id, report.id, "Reviewed")
     return application, resume, report, approval
+
+
+@pytest.mark.parametrize("submitted", [False, True], ids=["approved", "submitted"])
+def test_v18_migration_does_not_invent_historical_cloud_consent(
+    tmp_path: Path, submitted: bool
+):
+    repo = make_repo(tmp_path)
+    application, resume, _local_report = prepare_approvable_application(repo, tmp_path)
+    cloud_binding = provider_binding(
+        model="cloud-fixture-v1",
+        privacy_mode="cloud_external",
+        endpoint="test://cloud-fixture",
+    )
+    cloud_provider = repo.upsert_ai_provider(
+        provider_kind="mock",
+        display_name="Cloud fixture",
+        privacy_mode="cloud_external",
+        endpoint="test://cloud-fixture",
+        model="cloud-fixture-v1",
+        enabled=True,
+        availability_binding=cloud_binding,
+    )
+    _task, cloud_report = finalize_fit_report(
+        repo,
+        application.id,
+        resume.id,
+        cloud_provider.id,
+        cloud_transfer_acknowledged=True,
+    )
+    approval = repo.approve_application(application.id, cloud_report.id, "Reviewed")
+    if submitted:
+        repo.mark_submitted_manual(application.id, "Submitted")
+
+    with repo.connection() as connection:
+        connection.execute("DROP TRIGGER validate_ai_task_cloud_ack_insert")
+        connection.execute("DROP TRIGGER validate_ai_task_cloud_ack_update")
+        connection.execute("DROP TRIGGER validate_ai_task_authority_immutable")
+        connection.execute(
+            "ALTER TABLE ai_tasks DROP COLUMN cloud_transfer_acknowledged_at"
+        )
+        connection.execute(
+            "ALTER TABLE ai_tasks DROP COLUMN cloud_transfer_acknowledged"
+        )
+        connection.execute("PRAGMA user_version = 17")
+
+    migrated = CareerOpsRepository(repo.database_path, repo.vault_path)
+    migrated.initialize()
+    restored = migrated.get_application(application.id)
+    events = migrated.list_audit_events()
+
+    if submitted:
+        assert restored.approval_id == approval.id
+        assert restored.latest_report_id == cloud_report.id
+        assert any(
+            event.event_type
+            == "application.submitted_cloud_ack_unprovable_by_migration"
+            for event in events
+        )
+    else:
+        assert restored.approval_id is None
+        assert restored.latest_report_id is None
+        assert restored.status == "needs_resume_update"
+        assert any(
+            event.event_type
+            == "application.approval_invalidated_by_cloud_ack_migration"
+            for event in events
+        )
 
 
 def downgrade_approved_packet_to_v16(
@@ -2667,7 +2859,10 @@ def test_v17_migration_recovers_outside_vault_artifact_suffix_forgery(
         artifact_row["id"] for artifact_row in artifact_rows
     }
     with connect_database(database_path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 17
+        assert (
+            connection.execute("PRAGMA user_version").fetchone()[0]
+            == LATEST_SCHEMA_VERSION
+        )
         assert connection.execute(
             "SELECT COUNT(*) FROM ai_artifacts WHERE task_id = ?",
             (report.ai_task_id,),
@@ -2726,7 +2921,10 @@ def test_v17_migration_recovers_invalid_current_authority_artifact_metadata(
         "rejection_reasons"
     ] == ["schema_version"]
     with connect_database(database_path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 17
+        assert (
+            connection.execute("PRAGMA user_version").fetchone()[0]
+            == LATEST_SCHEMA_VERSION
+        )
         assert connection.execute(
             "SELECT COUNT(*) FROM ai_artifacts WHERE id = ?", (artifact_id,)
         ).fetchone()[0] == 0
@@ -2767,7 +2965,10 @@ def test_v17_migration_audits_blob_metadata_without_blocking_recovery(
         "value": b"forged".hex(),
     }
     with connect_database(database_path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 17
+        assert (
+            connection.execute("PRAGMA user_version").fetchone()[0]
+            == LATEST_SCHEMA_VERSION
+        )
         assert connection.execute(
             "SELECT COUNT(*) FROM ai_artifacts WHERE id = ?", (artifact_id,)
         ).fetchone()[0] == 0
@@ -3304,7 +3505,11 @@ def test_approval_waits_for_ai_report_and_task_completion_to_commit_together(
         {
             "task_type": "analyze_fit",
             "job_description": {"snapshot_id": application.jd_snapshot_id},
-            "selected_resume": {"version_id": resume.id},
+            "selected_resume": {
+                "version_id": resume.id,
+                "source_kind": "rendered_pdf",
+                "pdf_sha256": resume.pdf_sha256,
+            },
         },
         separators=(",", ":"),
         sort_keys=True,
@@ -3679,13 +3884,63 @@ def test_completed_ai_fit_report_for_current_pdf_is_approval_eligible(tmp_path: 
     assert approval.report_id == report.id
 
 
+def test_approval_and_submission_survive_current_provider_runtime_refresh(
+    tmp_path: Path,
+):
+    repo = make_repo(tmp_path)
+    application, _resume, report = prepare_approvable_application(repo, tmp_path)
+    assert report.ai_task_id is not None
+    task = repo.get_ai_task(report.ai_task_id)
+    provider = repo.get_ai_provider(task.provider_config_id)
+
+    refreshed_binding = {
+        **provider.availability_binding,
+        "runtime_instance_id": "runtime-after-api-restart",
+        "runtime_handle": "handle-after-api-restart",
+        "issuer_instance_id": "issuer-after-api-restart",
+        "isolation_evidence_sha256": "e" * 64,
+        "isolation_evidence_signature": "new-runtime-signature",
+    }
+    refreshed = repo.upsert_ai_provider(
+        provider_kind=provider.provider_kind,
+        display_name=provider.display_name,
+        privacy_mode=provider.privacy_mode.value,
+        endpoint=provider.endpoint,
+        identity_name=provider.identity_name,
+        model=provider.model,
+        enabled=True,
+        availability_binding=refreshed_binding,
+    )
+    assert refreshed.id == provider.id
+    assert refreshed.availability_binding_sha256 != task.provider_binding_sha256
+
+    approval = repo.approve_application(application.id, report.id, "Reviewed")
+    repo.upsert_ai_provider(
+        provider_kind=provider.provider_kind,
+        display_name=provider.display_name,
+        privacy_mode=provider.privacy_mode.value,
+        endpoint=provider.endpoint,
+        identity_name=provider.identity_name,
+        model=provider.model,
+        enabled=False,
+        availability_binding={
+            **refreshed_binding,
+            "runtime_instance_id": "runtime-after-second-restart",
+        },
+    )
+
+    submitted = repo.mark_submitted_manual(application.id, "Submitted")
+
+    assert approval.report_id == report.id
+    assert submitted.submission_state == "submitted_manual"
+
+
 @pytest.mark.parametrize(
     "mismatch",
     [
         "task_status",
         "task_type",
         "report_task",
-        "provider_binding",
         "report_pdf",
     ],
 )
@@ -3718,21 +3973,6 @@ def test_approval_rejects_stale_ai_task_report_and_provider_bindings(
             connection.execute(
                 "UPDATE reports SET ai_task_id = ? WHERE id = ?",
                 (other_task.id, report.id),
-            )
-        elif mismatch == "provider_binding":
-            changed = provider_binding(is_ai=False)
-            changed_json = json.dumps(changed, separators=(",", ":"), sort_keys=True)
-            connection.execute(
-                """
-                UPDATE ai_provider_configs
-                SET availability_binding_json = ?, availability_binding_sha256 = ?
-                WHERE id = ?
-                """,
-                (
-                    changed_json,
-                    hashlib.sha256(changed_json.encode("utf-8")).hexdigest(),
-                    provider.id,
-                ),
             )
         elif mismatch == "report_pdf":
             connection.execute(
@@ -3797,7 +4037,7 @@ def test_approval_rejects_nested_reserved_provenance_forged_in_database(
     assert repo.get_application(application.id).approval_id is None
 
 
-def test_approval_and_submission_require_current_vault_pdf_bytes(tmp_path: Path):
+def test_fit_report_and_submission_require_current_vault_pdf_bytes(tmp_path: Path):
     repo = make_repo(tmp_path)
     application = create_application(repo)
     source_dir = repo.vault_path / "resumes" / "packet"
@@ -3815,16 +4055,11 @@ def test_approval_and_submission_require_current_vault_pdf_bytes(tmp_path: Path)
         pdf_sha256=hashlib.sha256(b"expected").hexdigest(),
     )
     repo.select_resume(application.id, resume.id)
-    provider = create_provider(repo)
-    _task, missing_pdf_report = finalize_fit_report(
-        repo, application.id, resume.id, provider.id
-    )
-
     with pytest.raises(ValueError, match="PDF integrity"):
-        repo.approve_application(application.id, missing_pdf_report.id, "Reviewed")
+        repo.read_verified_resume_pdf(resume.id)
+    assert repo.get_application(application.id).latest_report_id is None
 
-    pdf_bytes = b"%PDF-1.4\ncurrent"
-    missing_pdf.write_bytes(pdf_bytes)
+    pdf_bytes = write_pdf(missing_pdf, "Current packet resume")
     repo.update_resume_render(
         resume.id,
         pdf_path=missing_pdf,
@@ -3833,6 +4068,7 @@ def test_approval_and_submission_require_current_vault_pdf_bytes(tmp_path: Path)
         parse_status="parsed",
         page_count=1,
     )
+    provider = create_provider(repo)
     _task, report = finalize_fit_report(
         repo, application.id, resume.id, provider.id
     )
@@ -3866,6 +4102,33 @@ def test_update_resume_render_rejects_approved_selected_resume(tmp_path: Path):
 
     assert repo.get_resume_version(resume.id).pdf_path == resume.pdf_path
     assert repo.get_application(application.id).approval_id is not None
+
+
+def test_fit_analysis_rejects_pdf_without_extractable_text(tmp_path: Path):
+    repo = make_repo(tmp_path)
+    application = create_application(repo)
+    source_dir = repo.vault_path / "resumes" / "blank-pdf"
+    source_dir.mkdir(parents=True)
+    tex_path = source_dir / "resume.tex"
+    tex_bytes = b"resume source"
+    tex_path.write_bytes(tex_bytes)
+    pdf_path = source_dir / "resume.pdf"
+    pdf_content = write_pdf(pdf_path, None)
+    resume = repo.create_resume_version(
+        name="Blank rendered resume",
+        role_family="software",
+        tex_path=tex_path,
+        tex_sha256=hashlib.sha256(tex_bytes).hexdigest(),
+        pdf_path=pdf_path,
+        pdf_sha256=hashlib.sha256(pdf_content).hexdigest(),
+        render_status="rendered",
+        parse_status="parsed",
+        page_count=1,
+    )
+    repo.select_resume(application.id, resume.id)
+    with pytest.raises(ValueError, match="extractable text"):
+        repo.read_verified_resume_pdf(resume.id)
+    assert repo.get_application(application.id).latest_report_id is None
 
 
 def test_select_resume_rejects_change_after_submission(tmp_path: Path):
@@ -3984,14 +4247,17 @@ def test_approval_validation_holds_write_lock_until_audit_commit(
     first_pdf = resume_dir / "first.pdf"
     first_tex.write_bytes(b"first source")
     second_tex.write_bytes(b"second source")
-    first_pdf.write_bytes(b"%PDF-1.4\nfirst")
+    first_pdf_bytes = write_pdf(first_pdf, "First resume")
     first = repo.create_resume_version(
         name="First",
         role_family="software",
         tex_path=first_tex,
         tex_sha256=hashlib.sha256(first_tex.read_bytes()).hexdigest(),
         pdf_path=first_pdf,
-        pdf_sha256=hashlib.sha256(first_pdf.read_bytes()).hexdigest(),
+        pdf_sha256=hashlib.sha256(first_pdf_bytes).hexdigest(),
+        render_status="rendered",
+        parse_status="parsed",
+        page_count=1,
     )
     second = repo.create_resume_version(
         name="Second",
@@ -4278,11 +4544,24 @@ def test_expired_claim_requeues_but_invocation_fence_survives(tmp_path: Path):
 def test_task_start_complete_and_failure_are_durable_and_audited(tmp_path: Path):
     repo = make_repo(tmp_path)
     application = create_application(repo)
+    resume_dir = repo.vault_path / "resumes" / "durable-task"
+    resume_dir.mkdir(parents=True)
+    tex_path = resume_dir / "resume.tex"
+    tex_bytes = b"Durable task resume"
+    tex_path.write_bytes(tex_bytes)
+    pdf_path = resume_dir / "resume.pdf"
+    pdf_bytes = write_pdf(pdf_path, "Durable task resume")
+    pdf_sha256 = hashlib.sha256(pdf_bytes).hexdigest()
     resume = repo.create_resume_version(
         name="Current resume",
         role_family="software",
-        tex_path=tmp_path / "resume.tex",
-        tex_sha256="a" * 64,
+        tex_path=tex_path,
+        tex_sha256=hashlib.sha256(tex_bytes).hexdigest(),
+        pdf_path=pdf_path,
+        pdf_sha256=pdf_sha256,
+        render_status="rendered",
+        parse_status="parsed",
+        page_count=1,
     )
     repo.select_resume(application.id, resume.id)
     provider = create_provider(repo)
@@ -4291,13 +4570,30 @@ def test_task_start_complete_and_failure_are_durable_and_audited(tmp_path: Path)
 
     completed_token = repo.start_ai_task(completed_task.id)
     assert repo.begin_ai_task_invocation(completed_task.id, completed_token) is True
-    for artifact_type in ("context", "raw_output", "validated_output"):
+    context = json.dumps(
+        {
+            "task_type": "analyze_fit",
+            "job_description": {"snapshot_id": application.jd_snapshot_id},
+            "selected_resume": {
+                "version_id": resume.id,
+                "source_kind": "rendered_pdf",
+                "pdf_sha256": pdf_sha256,
+            },
+        },
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    for artifact_type, content in (
+        ("context", context),
+        ("raw_output", b"raw_output"),
+        ("validated_output", b"validated_output"),
+    ):
         write_attempt_artifact(
             repo,
             completed_task.id,
             completed_token,
             artifact_type,
-            artifact_type.encode("ascii"),
+            content,
         )
     completed = repo.finalize_ai_task_attempt(
         task_id=completed_task.id,
@@ -5454,9 +5750,8 @@ def approve_existing_application(
     tex_path = source_dir / "decision-race.tex"
     pdf_path = source_dir / "decision-race.pdf"
     tex_bytes = b"decision race resume"
-    pdf_bytes = b"%PDF-1.4\ndecision race"
     tex_path.write_bytes(tex_bytes)
-    pdf_path.write_bytes(pdf_bytes)
+    pdf_bytes = write_pdf(pdf_path, "Decision race resume")
     resume = repo.create_resume_version(
         name="Decision race resume",
         role_family="software",
@@ -5464,6 +5759,9 @@ def approve_existing_application(
         tex_sha256=hashlib.sha256(tex_bytes).hexdigest(),
         pdf_path=pdf_path,
         pdf_sha256=hashlib.sha256(pdf_bytes).hexdigest(),
+        render_status="rendered",
+        parse_status="parsed",
+        page_count=1,
     )
     repo.select_resume(application_id, resume.id)
     provider = create_provider(repo)
@@ -5531,9 +5829,8 @@ def test_finding_decision_waiting_on_approval_transaction_observes_read_only_sta
     tex_path = source_dir / "concurrent-decision.tex"
     pdf_path = source_dir / "concurrent-decision.pdf"
     tex_bytes = b"concurrent decision resume"
-    pdf_bytes = b"%PDF-1.4\nconcurrent decision"
     tex_path.write_bytes(tex_bytes)
-    pdf_path.write_bytes(pdf_bytes)
+    pdf_bytes = write_pdf(pdf_path, "Concurrent decision resume")
     resume = repo.create_resume_version(
         name="Concurrent decision resume",
         role_family="software",
@@ -5541,6 +5838,9 @@ def test_finding_decision_waiting_on_approval_transaction_observes_read_only_sta
         tex_sha256=hashlib.sha256(tex_bytes).hexdigest(),
         pdf_path=pdf_path,
         pdf_sha256=hashlib.sha256(pdf_bytes).hexdigest(),
+        render_status="rendered",
+        parse_status="parsed",
+        page_count=1,
     )
     repo.select_resume(application.id, resume.id)
     _review_task, report = finalize_fit_report(
@@ -6008,6 +6308,47 @@ def test_evidence_items_enforce_states_and_link_idempotently(tmp_path: Path):
         )
 
 
+@pytest.mark.parametrize("task_state", ["pending", "running"])
+@pytest.mark.parametrize("operation", ["link_existing", "create_and_link"])
+def test_evidence_link_mutation_is_rejected_while_ai_work_is_active(
+    tmp_path: Path,
+    task_state: str,
+    operation: str,
+):
+    repo = make_repo(tmp_path)
+    application = create_application(repo)
+    existing = repo.create_evidence_item(
+        claim_text="Rejected late evidence",
+        evidence_type="note",
+        verification_state="rejected",
+        privacy_level="public",
+    )
+    provider = create_provider(repo)
+    task = create_task(repo, application.id, provider.id)
+    if task_state == "running":
+        claim = claim_task(repo, task.id)
+        assert repo.begin_ai_task_invocation(task.id, claim) is True
+    before_items = repo.list_evidence_items()
+    before_links = repo.list_application_evidence(application.id)
+    before_application = repo.get_application(application.id)
+
+    with pytest.raises(ValueError, match="pending or running AI task"):
+        if operation == "link_existing":
+            repo.link_application_evidence(application.id, existing.id)
+        else:
+            repo.create_and_link_evidence_item(
+                application_id=application.id,
+                claim_text="New late evidence",
+                evidence_type="note",
+                verification_state="rejected",
+                privacy_level="public",
+            )
+
+    assert repo.list_evidence_items() == before_items
+    assert repo.list_application_evidence(application.id) == before_links
+    assert repo.get_application(application.id) == before_application
+
+
 def test_atomic_evidence_create_and_link_rolls_back_item_when_link_audit_fails(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
@@ -6413,11 +6754,10 @@ def test_f32e429_v11_database_repairs_fences_and_legacy_codex(tmp_path: Path):
     assert provider.enabled is False
     assert provider.identity_name == ""
     assert task.invocation_started_at == "2026-02-02T00:00:00+00:00"
-    assert task.status == "pending"
+    assert task.status == "failed"
+    assert task.error_summary == "cloud_transfer_acknowledgement_required"
     assert repo.requeue_interrupted_ai_tasks() == 0
-    make_legacy_application_pristine_for_claim(repo)
-    recovered_claim = claim_task(repo, task.id)
-    assert repo.begin_ai_task_invocation(task.id, recovered_claim) is False
+    assert repo.claim_ai_task(task.id) is None
 
 
 def test_v12_database_quarantines_unbound_configs_and_fences_running_tasks(
@@ -6552,7 +6892,7 @@ def test_v15_upgrade_preserves_bindings_while_adding_container_image_identity(
             "SELECT * FROM ai_tasks WHERE id = ?", (task.id,)
         ).fetchone()
 
-    assert LATEST_SCHEMA_VERSION == 17
+    assert LATEST_SCHEMA_VERSION == 18
     assert upgraded_provider["enabled"] == 0
     assert upgraded_provider["availability_binding_json"] == expected_json
     assert upgraded_provider["availability_binding_sha256"] == expected_sha256

@@ -510,32 +510,90 @@ def create_app(
     @api.post("/resumes/{resume_id}/render")
     def render_resume(resume_id: ResumeId) -> dict[str, Any]:
         try:
-            resume = repo.get_resume_version(resume_id)
+            resume = repo.require_resume_render_mutable(resume_id)
         except KeyError as exc:
             raise HTTPException(status_code=404, detail="Resume not found") from exc
-        result = render_latex(resume.tex_path, repo.vault_path / "resumes" / resume.id / "render")
-        if not result.success:
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        attempt_dir = (
+            repo.vault_path
+            / "resumes"
+            / resume.id
+            / "render"
+            / f"attempt_{uuid4().hex}"
+        )
+        retain_attempt = False
+        try:
+            result = render_latex(resume.tex_path, attempt_dir)
+            if not result.success:
+                updated = repo.update_resume_render(
+                    resume.id,
+                    pdf_path=None,
+                    pdf_sha256=None,
+                    render_status="failed",
+                    parse_status="not_parsed",
+                    page_count=None,
+                )
+                payload = _resume_payload(updated)
+                payload["render_error"] = result.error_summary
+                retain_attempt = True
+                return payload
+            pdf_path = (
+                Path(os.path.abspath(result.pdf_path))
+                if result.pdf_path is not None
+                else None
+            )
+            try:
+                relative_pdf = (
+                    pdf_path.relative_to(Path(os.path.abspath(attempt_dir)))
+                    if pdf_path is not None
+                    else None
+                )
+                valid_pdf_path = bool(
+                    relative_pdf is not None
+                    and len(relative_pdf.parts) == 1
+                    and pdf_path is not None
+                    and pdf_path.is_file()
+                    and not pdf_path.is_symlink()
+                )
+                actual_pdf_sha256 = sha256_file(pdf_path) if valid_pdf_path else None
+                parsed = parse_pdf(pdf_path) if valid_pdf_path else None
+            except Exception:
+                parsed = None
+                actual_pdf_sha256 = None
+            if (
+                parsed is None
+                or parsed.page_count < 1
+                or not parsed.text.strip()
+                or actual_pdf_sha256 != result.pdf_sha256
+            ):
+                updated = repo.update_resume_render(
+                    resume.id,
+                    pdf_path=None,
+                    pdf_sha256=None,
+                    render_status="failed",
+                    parse_status="not_parsed",
+                    page_count=None,
+                )
+                payload = _resume_payload(updated)
+                payload["render_error"] = "Rendered PDF validation failed"
+                retain_attempt = True
+                return payload
             updated = repo.update_resume_render(
                 resume.id,
-                pdf_path=None,
-                pdf_sha256=None,
-                render_status="failed",
-                parse_status="not_parsed",
-                page_count=None,
+                pdf_path=pdf_path,
+                pdf_sha256=actual_pdf_sha256,
+                render_status="rendered",
+                parse_status="parsed",
+                page_count=parsed.page_count,
             )
-            payload = _resume_payload(updated)
-            payload["render_error"] = result.error_summary
-            return payload
-        parsed = parse_pdf(result.pdf_path)
-        updated = repo.update_resume_render(
-            resume.id,
-            pdf_path=result.pdf_path,
-            pdf_sha256=result.pdf_sha256,
-            render_status="rendered",
-            parse_status="parsed",
-            page_count=parsed.page_count,
-        )
-        return _resume_payload(updated)
+            retain_attempt = True
+            return _resume_payload(updated)
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        finally:
+            if not retain_attempt:
+                shutil.rmtree(attempt_dir, ignore_errors=True)
 
     @api.post("/applications/{application_id}/resume-drafts", status_code=201)
     def create_resume_draft(
@@ -639,6 +697,7 @@ def create_app(
                 payload.task_type.value,
                 payload.provider_config_id,
                 payload.input_artifact_ids,
+                cloud_transfer_acknowledged=payload.cloud_transfer_acknowledged,
             )
         except ValueError as exc:
             if "artifact" in str(exc).lower():
@@ -758,6 +817,10 @@ def create_app(
                 repo.link_application_evidence(application_id, evidence.id)
             except KeyError as exc:
                 raise HTTPException(status_code=404, detail="Evidence not found") from exc
+            except ValueError as exc:
+                raise HTTPException(
+                    status_code=409, detail="Evidence cannot be linked"
+                ) from exc
             return _json_response(_evidence_payload(evidence), status_code=200)
         try:
             evidence = repo.create_and_link_evidence_item(
@@ -771,7 +834,7 @@ def create_app(
                 notes=payload.notes or "",
             )
         except ValueError as exc:
-            raise HTTPException(status_code=400, detail="Evidence is invalid") from exc
+            raise HTTPException(status_code=409, detail="Evidence cannot be created") from exc
         return _json_response(_evidence_payload(evidence), status_code=201)
 
     @api.get("/applications/{application_id}/evidence")
@@ -1439,6 +1502,8 @@ def _ai_task_payload(task: AiTask) -> dict[str, Any]:
         "input_artifact_ids": task.input_artifact_ids,
         "status": task.status.value,
         "privacy_mode": task.privacy_mode.value,
+        "cloud_transfer_acknowledged": task.cloud_transfer_acknowledged,
+        "cloud_transfer_acknowledged_at": task.cloud_transfer_acknowledged_at,
         "started_at": task.started_at,
         "completed_at": task.completed_at,
         "error_summary": task.error_summary,

@@ -52,7 +52,8 @@ describe("workbench API client", () => {
     await createAiTask("app_1", {
       task_type: "analyze_fit",
       provider_config_id: "provider_codex2",
-      input_artifact_ids: []
+      input_artifact_ids: [],
+      cloud_transfer_acknowledged: true
     });
 
     expect(fetchMock).toHaveBeenCalledWith(
@@ -62,7 +63,8 @@ describe("workbench API client", () => {
         body: JSON.stringify({
           task_type: "analyze_fit",
           provider_config_id: "provider_codex2",
-          input_artifact_ids: []
+          input_artifact_ids: [],
+          cloud_transfer_acknowledged: true
         })
       })
     );

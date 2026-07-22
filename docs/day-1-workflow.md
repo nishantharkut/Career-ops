@@ -31,6 +31,8 @@ Corrections are stored separately under `User corrected`; the raw AI group remai
 
 Only evidence and facts admitted by the bounded context builder are sent to a provider. Rejected, private, or unverified material remains available to deterministic verification and redaction rules but is not silently treated as publishable support.
 
+Wait for pending/running AI work to finish before linking new evidence. CareerOps rejects evidence-link mutations while a task is active so an in-flight review cannot omit a newly linked item; rerun the intended task after the evidence is linked.
+
 ## 4. Import And Render A Resume
 
 1. Open `Resume`.
@@ -41,6 +43,8 @@ Only evidence and facts admitted by the bounded context builder are sent to a pr
 The renderer uses local `latexmk` or `pdflatex`, writes `render.log`, stores the PDF checksum, parses the text layer, and records page count and render/parse status. A failed render has no usable PDF and cannot produce an approvable packet.
 
 The recorded source checksum is the PDF freshness boundary. If the vaulted source changes after import, the next analysis reports `PDF is stale`. Do not edit the vaulted copy. Restore its recorded bytes or upload the corrected `.tex` as a new resume version, then render and rerun.
+
+`Analyze fit` reads the text extracted from this rendered PDF, not the LaTeX source. Its persisted context records the PDF SHA-256. Replacing or rerendering the PDF after the run starts prevents that run from creating an approvable report.
 
 ## 5. Choose A Provider And Task
 
@@ -54,7 +58,7 @@ The task menu contains:
 
 The provider menu shows only registered provider records. `Codex account 2 (codex2)` is preferred when available; `Codex default (codex)` remains a separate choice. A task never changes to another identity after launch.
 
-For Codex, the panel states `Selected task data is sent through your signed-in Codex account`. Check `Acknowledge Codex data transfer for this run` before each launch. Codex is `cloud_external` and receives only the selected task's bounded prompt and context.
+For Codex, the panel states `Selected task data is sent through your signed-in Codex account`. Check `Acknowledge Codex data transfer for this run` before each launch. Codex is `cloud_external` and receives only the selected task's bounded prompt and context. CareerOps records that one-run acknowledgement on the task; direct requests without it are rejected.
 
 Verified managed Ollama is `local_private`. Unmanaged Ollama is unavailable rather than being trusted from a localhost address. `Deterministic verifier` uses `Run verifier` and is explicitly not AI.
 
@@ -119,6 +123,7 @@ The API rechecks that:
 - the report belongs to the application
 - the report's resume ID is the selected resume ID
 - the report's JD snapshot ID is the current JD snapshot ID
+- the fit-analysis context identifies the rendered PDF and carries the report's PDF SHA-256
 - the rendered PDF exists and its current checksum matches the resume record
 - the report has no blocking issues
 - no prior approval or submission already closes the packet

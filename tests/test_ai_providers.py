@@ -2816,6 +2816,7 @@ def test_hardened_codex_result_privacy_persists_to_repository(tmp_path: Path):
         privacy_mode=result.privacy_mode,
         expected_provider_binding=config.availability_binding,
         expected_provider_binding_sha256=config.availability_binding_sha256,
+        cloud_transfer_acknowledged=True,
     )
 
     assert repo.get_ai_provider(config.id).privacy_mode is PrivacyMode.CLOUD_EXTERNAL

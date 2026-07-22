@@ -342,7 +342,7 @@ def _resume(value: Any, restricted_material: Sequence[str] = ()) -> dict[str, st
     item = _mapping(value)
     if item is None:
         raise ContextBuildError("Context input was invalid")
-    return {
+    resume = {
         "version_id": _identifier(item.get("version_id")),
         "source_kind": _provider_text(
             _source_string(item.get("source_kind", "latex")), restricted_material
@@ -352,6 +352,12 @@ def _resume(value: Any, restricted_material: Sequence[str] = ()) -> dict[str, st
             restricted_material,
         ),
     }
+    if "pdf_sha256" in item:
+        pdf_sha256 = _source_string(item.get("pdf_sha256"))
+        if not re.fullmatch(r"[0-9a-f]{64}", pdf_sha256):
+            raise ContextBuildError("Context input was invalid")
+        resume["pdf_sha256"] = pdf_sha256
+    return resume
 
 
 def _bounded_values(

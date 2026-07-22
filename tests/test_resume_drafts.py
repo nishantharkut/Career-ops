@@ -28,6 +28,7 @@ from careerops.core.repository import CareerOpsRepository
 from careerops.core.status import PrivacyMode
 from careerops.resumes.drafts import create_verified_resume_draft
 from tests.ai_approval_helpers import create_ai_approval_report
+from tests.pdf_helpers import write_pdf
 
 
 PARENT_SOURCE = (
@@ -1648,8 +1649,7 @@ def _make_application_approved(
     parent_id: str,
 ) -> None:
     pdf_path = repo.vault_path / "resumes" / application_id / "resume.pdf"
-    pdf_bytes = b"%PDF-1.4\nfixture"
-    pdf_path.write_bytes(pdf_bytes)
+    pdf_bytes = write_pdf(pdf_path, "Approved resume")
     repo.update_resume_render(
         parent_id,
         pdf_path=pdf_path,

@@ -7,6 +7,7 @@ from typing import Any
 
 from careerops.ai.context import load_prompt_template
 from careerops.core.repository import CareerOpsRepository
+from tests.pdf_helpers import pdf_bytes as make_pdf_bytes
 
 
 def _provider_binding() -> dict[str, Any]:
@@ -85,7 +86,7 @@ def create_ai_approval_report(
         pdf_path = owned_dir / "resume.pdf"
     if pdf_path == owned_dir / "resume.pdf":
         if not pdf_bytes:
-            pdf_bytes = b"%PDF-1.4\napproval fixture"
+            pdf_bytes = make_pdf_bytes("Approval fixture resume")
         pdf_path.write_bytes(pdf_bytes)
 
     source_sha256 = hashlib.sha256(source_bytes).hexdigest()
@@ -134,7 +135,11 @@ def create_ai_approval_report(
         {
             "task_type": "analyze_fit",
             "job_description": {"snapshot_id": application.jd_snapshot_id},
-            "selected_resume": {"version_id": resume_id},
+            "selected_resume": {
+                "version_id": resume_id,
+                "source_kind": "rendered_pdf",
+                "pdf_sha256": pdf_sha256,
+            },
         },
         separators=(",", ":"),
         sort_keys=True,

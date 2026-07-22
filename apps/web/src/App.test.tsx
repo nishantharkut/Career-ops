@@ -134,6 +134,8 @@ describe("Application Desk UI", () => {
         input_artifact_ids: [],
         status: "completed",
         privacy_mode: "cloud_external",
+        cloud_transfer_acknowledged: true,
+        cloud_transfer_acknowledged_at: "2026-07-21T00:00:00Z",
         started_at: "2026-07-21T00:00:00Z",
         completed_at: "2026-07-21T00:01:00Z",
         error_summary: "",
@@ -219,7 +221,7 @@ describe("Application Desk UI", () => {
     const resume = { id: "res_1", name: "Application resume", role_family: "general", tex_sha256: "tex", pdf_sha256: "pdf", parent_resume_version_id: null, render_status: "rendered", parse_status: "parsed", page_count: 1, created_at: "", updated_at: "" };
     const verifierReport = { id: "rep_verifier", application_id: "app_1", resume_version_id: "res_1", jd_snapshot_id: "jd_app_1", ai_task_id: null, pdf_sha256: "pdf", blocking_issue_count: 0, warning_count: 0, fit: { score: 100 }, risks: { blockers: [], warnings: [] }, created_at: "" };
     const aiReport = { ...verifierReport, id: "rep_ai", ai_task_id: "ait_1" };
-    const completedTask = { id: "ait_1", application_id: "app_1", task_type: "analyze_fit" as const, provider_config_id: "aip_mock", prompt_template_id: "analyze_fit_v1", prompt_sha256: "a".repeat(64), input_artifact_ids: [], status: "completed" as const, privacy_mode: "local_private", started_at: "", completed_at: "", error_summary: "", created_at: "", updated_at: "" };
+    const completedTask = { id: "ait_1", application_id: "app_1", task_type: "analyze_fit" as const, provider_config_id: "aip_mock", prompt_template_id: "analyze_fit_v1", prompt_sha256: "a".repeat(64), input_artifact_ids: [], status: "completed" as const, privacy_mode: "local_private", cloud_transfer_acknowledged: false, cloud_transfer_acknowledged_at: null, started_at: "", completed_at: "", error_summary: "", created_at: "", updated_at: "" };
     let currentPacket = packet(record, { selected_resume: resume, latest_report: verifierReport });
     let approved = false;
     vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
@@ -578,6 +580,8 @@ describe("Application Desk UI", () => {
       input_artifact_ids: [],
       status: "completed" as const,
       privacy_mode: "local_private",
+      cloud_transfer_acknowledged: false,
+      cloud_transfer_acknowledged_at: null,
       started_at: "",
       completed_at: "",
       error_summary: "",

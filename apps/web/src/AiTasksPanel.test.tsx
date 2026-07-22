@@ -38,6 +38,8 @@ const task = (overrides: Partial<AiTaskRecord> = {}): AiTaskRecord => ({
   input_artifact_ids: [],
   status: "completed",
   privacy_mode: "cloud_external",
+  cloud_transfer_acknowledged: true,
+  cloud_transfer_acknowledged_at: "",
   started_at: "",
   completed_at: "",
   error_summary: "",
@@ -79,7 +81,7 @@ describe("AI tasks panel", () => {
 
   test("requires a fresh acknowledgement for every cloud run", async () => {
     let createCount = 0;
-    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, _init?: RequestInit) => {
       const url = String(input);
       if (url.endsWith("/ai/providers")) {
         return jsonResponse([provider({ id: "provider_account2", identity_name: "codex2" })]);
@@ -100,6 +102,12 @@ describe("AI tasks panel", () => {
     await userEvent.click(screen.getByRole("button", { name: "Suggest resume edits" }));
 
     await waitFor(() => expect(createCount).toBe(1));
+    const firstCreate = fetchMock.mock.calls.find(([input]) =>
+      String(input).endsWith("/applications/app_1/ai-tasks")
+    );
+    expect(JSON.parse(String(firstCreate?.[1]?.body))).toMatchObject({
+      cloud_transfer_acknowledged: true
+    });
     expect(acknowledgement).not.toBeChecked();
     expect(screen.getByRole("button", { name: "Suggest resume edits" })).toBeDisabled();
     await userEvent.click(acknowledgement);

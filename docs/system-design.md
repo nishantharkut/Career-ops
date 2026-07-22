@@ -66,20 +66,20 @@ Provider attempt files are separate from published AI artifacts. Published artif
 
 ### Create And Correct JD
 
-The API writes the pasted JD to the vault and stores its checksum before returning the application. Deterministic parsing populates initial requirement groups. `analyze_jd` can add a raw AI group and uncertainty group. User corrections are stored separately and invalidate a current report based on older requirements.
+The API writes the pasted JD to the vault and stores its checksum before returning the application. Deterministic parser `careerops-jd-parser-v1` populates the initial `deterministic` requirement group; `raw_ai`, `user_corrected`, and `uncertainty` begin separately. `analyze_jd` can add a raw AI group and uncertainty group. User corrections are stored separately and invalidate a current report based on older requirements.
 
 ### Import And Render Resume
 
-Upload copies a single regular `.tex` file into a new resume version and selects it for the application. Rendering runs `latexmk` when available, otherwise `pdflatex`, inside a controlled output directory. The adapter stores stdout/stderr in `render.log`, requires a PDF on success, computes its SHA-256, parses its text, and records page count and status.
+Upload copies a single regular `.tex` file into a new resume version and selects it for the application. Rendering runs `latexmk` when available, otherwise `pdflatex`, inside a unique attempt directory. The adapter stores stdout/stderr in `render.log`, requires a PDF with extractable text on success, computes its SHA-256, parses its text, and records page count and status. The repository checks packet mutability before rendering and again when adopting the staged artifact, so a concurrent or repeated render cannot overwrite an approved PDF.
 
 Risk analysis compares the current source bytes with the recorded source checksum. A mismatch is `PDF is stale` and blocks approval. Recovery restores the recorded source bytes or imports the corrected source as a new resume version before render and review are repeated.
 
 ### Run Task
 
-1. The API validates application/provider/task compatibility and persists a `pending` task with provider and prompt bindings.
+1. The API validates application/provider/task compatibility and persists a `pending` task with provider and prompt bindings. A provider whose data leaves the machine also requires an explicit per-run acknowledgement; the boolean and server timestamp are immutable task authority.
 2. The background runner submits the task. Repository compare-and-set changes one pending row to `running` with a claim token and lease.
 3. A heartbeat renews the claim during provider execution and artifact/finding finalization.
-4. The orchestrator snapshots current JD/resume identity and builds a bounded `ContextPacket` from task-relevant records.
+4. The orchestrator snapshots current JD/resume identity and builds a bounded `ContextPacket` from task-relevant records. For `analyze_fit`, it stable-reads the rendered PDF, requires parsed nonempty text, and sends that extracted text with the exact PDF SHA-256 instead of reviewing the LaTeX source.
 5. Prompt, context, and the exact checked-in JSON schema are written atomically to a task attempt directory and sealed into `ProviderRequest` snapshots.
 6. The selected provider reports current availability. It must match the task's persisted provider binding before invocation.
 7. The invocation fence is written before the external provider call.
@@ -87,19 +87,19 @@ Risk analysis compares the current source bytes with the recorded source checksu
 9. Result metadata and invocation provenance must exactly match current availability and the persisted provider binding.
 10. The deterministic verifier produces safe or blocked findings.
 11. Context, raw output, validated output, and optional draft text are published as checksummed artifacts.
-12. One repository transaction finalizes status, findings, artifacts, report/JD side effects, audit events, and application history only if the claim and current JD/resume IDs still match.
+12. One repository transaction finalizes status, findings, artifacts, report/JD side effects, audit events, and application history only if the claim and current JD/resume IDs still match. Fit-report finalization also requires the selected resume's current PDF SHA-256 to match the immutable context; render drift aborts the report.
 
 Terminal task states are `completed`, `blocked`, and `failed`. Public error summaries are limited to categories such as `provider_unavailable`, `provider_timeout`, `provider_error`, `invalid_output`, and `verification_failed`.
 
 ### Decide And Draft
 
-Verified findings can move from `pending` to `accepted` or `rejected`; blocked findings cannot be accepted. Decisions are durable.
+Verified findings can move from `pending` to `accepted` or `rejected`; blocked findings cannot be accepted. Decisions are durable. Linking new evidence invalidates the current report and records an application version because the AI context changed. Both evidence-link paths reject mutation while any application AI task is pending or running, inside the same database write transaction, so an in-flight report cannot omit newly linked evidence. Evidence links also cannot mutate an approved or submitted packet.
 
 Draft creation takes a completed `suggest_resume_edits` task and accepted verified finding IDs. It revalidates task/resume ownership, parent source checksum, evidence, rejected/private material, and exact single occurrence of each source span. All replacements are applied in memory and atomically published as a new child resume. The parent is not modified. Selecting the child clears current report/approval state and requires render/review again.
 
 ### Approve, Export, Submit
 
-Approval revalidates report provenance, zero blockers, selected resume ID, current JD snapshot ID, PDF path and checksum, and current packet state. The report must be the side effect of a completed `analyze_fit` task whose persisted provider binding has `is_ai=true`; verifier-only output cannot authorize approval or the submission that depends on it. Approval records application ID, resume ID, report ID, and PDF SHA-256.
+Approval revalidates report provenance, zero blockers, selected resume ID, current JD snapshot ID, PDF path and checksum, parse state, page count, extractable text, and current packet state from the same stable PDF bytes. The report must be the side effect of a completed `analyze_fit` task whose immutable context identifies `rendered_pdf` and carries the same PDF SHA-256; its persisted provider binding must also have `is_ai=true`. Verifier-only output and reports produced from a different PDF cannot authorize approval or the submission that depends on it. Approval records application ID, resume ID, report ID, and PDF SHA-256.
 
 JD, PDF, report, and approval exports revalidate that each artifact is current. Manual submission checks the complete approval/report/resume/JD relationship and current PDF bytes before recording `submitted_manual`.
 
@@ -125,7 +125,7 @@ Invocation uses the native executable directly with:
 
 Arguments are a list with `shell=False`; task content is bounded stdin. Stdout/stderr are not used as output. The output file is read with path, link, size, and identity checks. The executable hash is checked before and after execution. Provider metadata records identity, endpoint, executable/hash/version, Codex home, model, effort, command, and raw output checksum.
 
-`codex2` and `codex` are separate records and never fallback within a task. Both are `cloud_external`; the UI requires a per-run transfer acknowledgement.
+`codex2` and `codex` are separate records and never fallback within a task. Both are `cloud_external`; the UI requires a per-run transfer acknowledgement, and the API rejects a task unless that acknowledgement is present and persisted on the task.
 
 ### Managed Ollama
 
@@ -147,7 +147,7 @@ The deterministic provider implements the same typed task interface but has `is_
 
 Task claims use compare-and-set row updates, claim tokens, finite leases, and heartbeats. Artifact rows carry claim ownership. Finalization verifies the active claim, current provider binding, current application state, and expected JD/resume IDs in one transaction.
 
-Expired claims return to pending. Invocation fencing prevents automatic provider replay after an external call may have started. A stale worker cannot publish business state after losing its claim. Runner polling recovers pending work after restart.
+Expired claims return to pending. Invocation fencing prevents automatic provider replay after an external call may have started. A stale worker cannot publish business state after losing its claim. Runner polling recovers pending work after restart. Historical report approval uses the immutable provider binding captured by the completed task; refreshing or disabling the current managed-runtime availability row after an API restart does not invalidate that historical authority.
 
 File operations use exclusive creation, stable file identity checks, checksums, bounded reads, fsync, and atomic rename where required. The implementation rejects links, reparse points, hard links, path swaps, and changed identities at trust boundaries.
 

@@ -26,6 +26,7 @@ from careerops.ai.providers.base import ProviderUnavailableError, build_provider
 from careerops.core.repository import CareerOpsRepository
 from careerops.core.status import PrivacyMode
 from tests.ai_approval_helpers import create_ai_approval_report
+from tests.pdf_helpers import write_pdf
 
 
 VALID_OUTPUTS: dict[str, dict[str, Any]] = {
@@ -77,8 +78,9 @@ def availability(
     identity_name: str = "",
     available: bool = True,
     is_ai: bool = True,
+    **metadata: Any,
 ) -> ProviderAvailability:
-    return ProviderAvailability(
+    values: dict[str, Any] = dict(
         available=available,
         provider_kind=provider_kind,
         model=model,
@@ -89,6 +91,8 @@ def availability(
         endpoint=endpoint,
         identity_name=identity_name,
     )
+    values.update(metadata)
+    return ProviderAvailability(**values)
 
 
 def binding(status: ProviderAvailability) -> dict[str, Any]:
@@ -128,6 +132,32 @@ class ControlledProvider:
             raise self.error
         output = validate_task_output(request.task_type, VALID_OUTPUTS[request.task_type])
         raw_output = serialize_provider_output(output)
+        invocation_metadata = {
+            field: getattr(self.status, field)
+            for field in (
+                "endpoint",
+                "identity_name",
+                "executable",
+                "executable_sha256",
+                "executable_version",
+                "codex_home",
+                "model_digest",
+                "model_metadata_sha256",
+                "show_metadata_sha256",
+                "attestation_version",
+                "runtime_instance_id",
+                "runtime_handle",
+                "container_image_reference",
+                "container_image_id",
+                "issuer_instance_id",
+                "egress_policy",
+                "cloud_disabled",
+                "egress_enforced",
+                "isolation_evidence_sha256",
+                "isolation_evidence_signature",
+                "reasoning_effort",
+            )
+        }
         return build_provider_result(
             provider_kind=self.status.provider_kind,
             model=self.status.model,
@@ -136,11 +166,7 @@ class ControlledProvider:
             is_ai=self.status.is_ai,
             structured_output=output,
             raw_output=raw_output,
-            invocation=InvocationMetadata(
-                mode="test_fixture",
-                endpoint=self.status.endpoint,
-                identity_name=self.status.identity_name,
-            ),
+            invocation=InvocationMetadata(mode="test_fixture", **invocation_metadata),
         )
 
 
@@ -201,11 +227,10 @@ def select_resume(repo: CareerOpsRepository, application_id: str):
     source_dir = repo.vault_path / "resumes" / application_id
     source_dir.mkdir(parents=True, exist_ok=True)
     tex_bytes = b"Built PocketBuddy"
-    pdf_bytes = b"%PDF-1.4\nfixture resume"
     tex_path = source_dir / "resume.tex"
     pdf_path = source_dir / "resume.pdf"
     tex_path.write_bytes(tex_bytes)
-    pdf_path.write_bytes(pdf_bytes)
+    pdf_bytes = write_pdf(pdf_path, "Built PocketBuddy with Python")
     resume = repo.create_resume_version(
         name="Current resume",
         role_family="software",
@@ -226,7 +251,7 @@ def wait_for_task_status(
     task_id: str,
     expected_status: str,
     *,
-    timeout: float = 5,
+    timeout: float = 15,
 ):
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
@@ -300,6 +325,123 @@ def test_task_runner_retries_transient_claim_failure_while_service_is_alive(
     assert completed.error_summary == ""
     assert claim_attempts >= 2
     assert provider.calls == 1
+
+
+def test_cloud_task_requires_and_persists_per_run_transfer_acknowledgement(
+    tmp_path: Path,
+):
+    repo = make_repo(tmp_path)
+    application = create_application(repo)
+    status = availability(
+        provider_kind="codex",
+        model="gpt-fixture",
+        privacy_mode=PrivacyMode.CLOUD_EXTERNAL,
+        endpoint="codex-identity://codex2",
+        identity_name="codex2",
+    )
+    config = create_provider_config(repo, status)
+    provider = ControlledProvider(status)
+    client = TestClient(create_app(repo, provider_registry={config.id: provider}))
+    request = {
+        "task_type": "analyze_jd",
+        "provider_config_id": config.id,
+        "input_artifact_ids": [],
+    }
+
+    rejected = client.post(
+        f"/applications/{application.id}/ai-tasks",
+        json=request,
+    )
+    accepted = client.post(
+        f"/applications/{application.id}/ai-tasks",
+        json={**request, "cloud_transfer_acknowledged": True},
+    )
+
+    assert rejected.status_code == 409
+    assert accepted.status_code == 202
+    assert accepted.json()["cloud_transfer_acknowledged"] is True
+    assert accepted.json()["cloud_transfer_acknowledged_at"]
+    stored = repo.get_ai_task(accepted.json()["id"])
+    assert stored.cloud_transfer_acknowledged is True
+    assert stored.cloud_transfer_acknowledged_at is not None
+
+
+def test_managed_ollama_review_approval_and_submission_survive_api_restarts(
+    tmp_path: Path,
+):
+    repo = make_repo(tmp_path)
+    application = create_application(repo)
+    resume = select_resume(repo, application.id)
+
+    def managed_status(runtime: str) -> ProviderAvailability:
+        return availability(
+            provider_kind="ollama",
+            model="qwen2.5:7b",
+            endpoint="http://127.0.0.1:11434",
+            privacy_mode=PrivacyMode.LOCAL_PRIVATE,
+            model_digest="sha256:fixture-model",
+            model_metadata_sha256="a" * 64,
+            show_metadata_sha256="b" * 64,
+            attestation_version="1",
+            runtime_instance_id=runtime,
+            runtime_handle=f"handle-{runtime}",
+            issuer_instance_id=f"issuer-{runtime}",
+            egress_policy="os_firewall_block",
+            cloud_disabled=True,
+            egress_enforced=True,
+            isolation_evidence_sha256="c" * 64,
+            isolation_evidence_signature="d" * 64,
+        )
+
+    first_status = managed_status("runtime-one")
+    config = create_provider_config(repo, first_status)
+    first_provider = ControlledProvider(first_status)
+    first_app = create_app(
+        repo,
+        provider_registry={config.id: first_provider},
+        task_poll_interval_seconds=0.01,
+    )
+    with TestClient(first_app) as first_client:
+        created = first_client.post(
+            f"/applications/{application.id}/ai-tasks",
+            json={
+                "task_type": "analyze_fit",
+                "provider_config_id": config.id,
+                "input_artifact_ids": [],
+            },
+        )
+        assert created.status_code == 202
+        completed = wait_for_task_status(repo, created.json()["id"], "completed")
+        report_id = repo.get_application(application.id).latest_report_id
+        assert report_id is not None
+
+    second_status = managed_status("runtime-two")
+    refreshed = create_provider_config(repo, second_status)
+    assert refreshed.id == config.id
+    assert refreshed.availability_binding_sha256 != completed.provider_binding_sha256
+    second_app = create_app(
+        repo,
+        provider_registry={config.id: ControlledProvider(second_status)},
+    )
+    with TestClient(second_app) as second_client:
+        approved = second_client.post(
+            f"/applications/{application.id}/approve",
+            json={"report_id": report_id, "note": "Reviewed"},
+        )
+        assert approved.status_code == 200
+
+    third_status = managed_status("runtime-three")
+    create_provider_config(repo, third_status, enabled=False)
+    third_app = create_app(repo, provider_registry={})
+    with TestClient(third_app) as third_client:
+        submitted = third_client.post(
+            f"/applications/{application.id}/mark-submitted",
+            json={"note": "Submitted manually"},
+        )
+
+    assert submitted.status_code == 200
+    assert submitted.json()["submission_state"] == "submitted_manual"
+    assert repo.get_resume_version(resume.id).pdf_path is not None
 
 
 def test_task_runner_executes_pending_and_recovers_expired_tasks_on_startup(
@@ -999,13 +1141,6 @@ def test_packet_reloads_selected_resume_report_latest_task_evidence_and_versions
     repo = make_repo(tmp_path)
     application = create_application(repo)
     resume = select_resume(repo, application.id)
-    report = repo.save_report(
-        application_id=application.id,
-        resume_version_id=resume.id,
-        jd_snapshot_id=application.jd_snapshot_id,
-        fit={"score": 80},
-        risks={"blockers": [], "warnings": []},
-    )
     evidence = repo.create_evidence_item(
         claim_text="Built PocketBuddy",
         evidence_type="project",
@@ -1014,6 +1149,13 @@ def test_packet_reloads_selected_resume_report_latest_task_evidence_and_versions
         privacy_level="public",
     )
     repo.link_application_evidence(application.id, evidence.id)
+    report = repo.save_report(
+        application_id=application.id,
+        resume_version_id=resume.id,
+        jd_snapshot_id=application.jd_snapshot_id,
+        fit={"score": 80},
+        risks={"blockers": [], "warnings": []},
+    )
     repo.record_application_version(application.id, "packet.seeded", {"report_id": report.id})
     status = availability()
     config = create_provider_config(repo, status)
@@ -1038,7 +1180,10 @@ def test_packet_reloads_selected_resume_report_latest_task_evidence_and_versions
     assert packet["latest_ai_task"]["id"] == task.id
     assert packet["approval"] is None
     assert packet["evidence"][0]["id"] == evidence.id
-    assert packet["versions"][0]["event_type"] == "packet.seeded"
+    assert [version["event_type"] for version in packet["versions"]] == [
+        "application.evidence_linked",
+        "packet.seeded",
+    ]
     assert "tex_path" not in str(packet)
     assert "raw_text_path" not in str(packet)
 

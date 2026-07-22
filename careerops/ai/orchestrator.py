@@ -90,6 +90,8 @@ class AiOrchestrator:
         task_type: str,
         provider_config_id: str,
         input_artifact_ids: Sequence[str] = (),
+        *,
+        cloud_transfer_acknowledged: bool = False,
     ) -> AiTask:
         application = self._repository.get_application(application_id)
         if (
@@ -125,6 +127,7 @@ class AiOrchestrator:
             privacy_mode=config.privacy_mode.value,
             expected_provider_binding=checked_binding,
             expected_provider_binding_sha256=checked_binding_sha256,
+            cloud_transfer_acknowledged=cloud_transfer_acknowledged,
         )
 
     def run(self, task_id: str) -> AiTask:
@@ -396,13 +399,22 @@ class AiOrchestrator:
             selected = self._repository.get_resume_version(
                 application.selected_resume_version_id
             )
-            resume = {
-                "version_id": selected.id,
-                "source_kind": "latex",
-                "source_text": self._read_checked_utf8(
-                    selected.tex_path, selected.tex_sha256
-                ),
-            }
+            if task_type == "analyze_fit":
+                rendered = self._repository.read_verified_resume_pdf(selected.id)
+                resume = {
+                    "version_id": selected.id,
+                    "source_kind": "rendered_pdf",
+                    "source_text": rendered.text,
+                    "pdf_sha256": rendered.sha256,
+                }
+            else:
+                resume = {
+                    "version_id": selected.id,
+                    "source_kind": "latex",
+                    "source_text": self._read_checked_utf8(
+                        selected.tex_path, selected.tex_sha256
+                    ),
+                }
 
         profile_facts = self._repository.list_profile_facts()
         facts = [

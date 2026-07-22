@@ -6,6 +6,7 @@ import pytest
 from careerops.core.repository import CareerOpsRepository
 from careerops.core.status import ApplicationStatus
 from tests.ai_approval_helpers import create_ai_approval_report
+from tests.pdf_helpers import write_pdf
 
 
 def make_repo(tmp_path: Path) -> CareerOpsRepository:
@@ -67,7 +68,7 @@ def test_selecting_new_resume_invalidates_existing_approval(tmp_path: Path):
         jd_text="C++ systems internship.",
     )
     first_pdf = repo.vault_path / "resumes" / "google.pdf"
-    first_pdf.write_bytes(b"%PDF-1.4\ngoogle")
+    write_pdf(first_pdf, "Google systems resume")
     first_resume = repo.create_resume_version(
         name="Google resume",
         role_family="software",
@@ -166,7 +167,7 @@ def test_atomic_resume_create_and_select_rejects_approved_application_without_in
         jd_text="Python role",
     )
     pdf_path = repo.vault_path / "resumes" / "approved.pdf"
-    pdf_path.write_bytes(b"%PDF-1.4\napproved")
+    write_pdf(pdf_path, "Approved resume")
     selected = repo.create_resume_version(
         name="Approved resume",
         role_family="software",

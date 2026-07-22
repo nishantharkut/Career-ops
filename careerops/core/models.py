@@ -136,6 +136,8 @@ class AiTask:
     privacy_mode: PrivacyMode
     provider_binding: JsonDict
     provider_binding_sha256: str
+    cloud_transfer_acknowledged: bool
+    cloud_transfer_acknowledged_at: str | None
     started_at: str | None
     claim_expires_at: str | None
     invocation_started_at: str | None

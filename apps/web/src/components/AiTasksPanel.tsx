@@ -183,7 +183,8 @@ export default function AiTasksPanel({ applicationId, initialTask, readOnly = fa
       const created = await createAiTask(applicationId, {
         task_type: taskType,
         provider_config_id: selectedProviderId,
-        input_artifact_ids: []
+        input_artifact_ids: [],
+        cloud_transfer_acknowledged: cloudCodex && acknowledged
       });
       setActiveTask(created);
       setAcknowledged(false);

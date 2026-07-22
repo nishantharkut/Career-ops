@@ -60,16 +60,21 @@ An interrupted pending task is eligible for polling again. A task whose provider
 
 Tests verify:
 
-- local LaTeX discovery, successful PDF/text parsing, and a retained render log on failure
+- local LaTeX discovery, staged rendering, successful nonempty PDF/text parsing, and a retained render log on failure
 - stale source, missing/unparseable PDF, unsupported metrics, unverified claims, NDA-sensitive wording, and unsupported titles block the deterministic report
 - a report is bound to application ID, JD snapshot ID, and selected resume ID
-- requirement or resume selection changes invalidate the current report and approval state
-- approval requires the current zero-blocker report and current PDF bytes
+- `analyze_fit` context uses extracted text from the exact rendered PDF and records its SHA-256
+- fit-report finalization rejects a PDF checksum change after context capture
+- requirement, evidence, or resume selection changes invalidate the current report and approval state
+- create-and-link and existing-item link operations are atomic no-ops while AI work is pending or running
+- approval requires the current zero-blocker report, matches its context PDF checksum, and reparses the exact current PDF bytes
 - approval rejects a report without completed AI-backed `analyze_fit` provenance, including verifier-only output
 - approval stores application ID, resume ID, report ID, and PDF SHA-256
 - export routes reject stale report/approval ownership or changed PDF bytes
 - manual submission is impossible before approval and remains bound to the approved packet
 - reload restores selected resume, parent/child history, task provenance, findings, approval, and manual submission state
+- cloud tasks reject missing per-run transfer acknowledgement and persist its server timestamp
+- managed-runtime report approval and submission survive API restarts without trusting refreshed availability as historical evidence
 
 The mock-provider Playwright flow exercises create application, analyze JD, save a correction, add evidence and a profile fact, render risky and clean resumes, block and reject an unsafe claim, create a verified child draft, rerender and rerun, export artifacts, review claims, approve, submit manually, reload, and inspect history.
 

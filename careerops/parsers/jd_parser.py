@@ -3,6 +3,7 @@ import re
 
 
 UNKNOWN = "Unknown"
+JD_PARSER_VERSION = "careerops-jd-parser-v1"
 
 
 @dataclass(frozen=True)

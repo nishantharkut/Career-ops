@@ -26,7 +26,9 @@ from careerops.ai.providers.base import (
 from careerops.ai.context import load_prompt_template
 from careerops.core.repository import CareerOpsRepository
 from careerops.core.status import PrivacyMode
+from careerops.parsers.pdf_parser import parse_pdf_bytes
 from tests.ai_approval_helpers import create_ai_approval_report
+from tests.pdf_helpers import write_pdf
 
 
 VALID_OUTPUTS: dict[str, dict[str, Any]] = {
@@ -272,8 +274,7 @@ def select_resume(repo: CareerOpsRepository, application_id: str, text: str = "P
     tex_path = source_dir / f"resume-{application_id}.tex"
     pdf_path = source_dir / f"resume-{application_id}.pdf"
     tex_path.write_text(text, encoding="utf-8")
-    pdf_bytes = b"%PDF-1.4\nfixture resume"
-    pdf_path.write_bytes(pdf_bytes)
+    pdf_bytes = write_pdf(pdf_path, text)
     resume = repo.create_resume_version(
         name="Current resume",
         role_family="software",
@@ -281,6 +282,9 @@ def select_resume(repo: CareerOpsRepository, application_id: str, text: str = "P
         tex_sha256=hashlib.sha256(text.encode("utf-8")).hexdigest(),
         pdf_path=pdf_path,
         pdf_sha256=hashlib.sha256(pdf_bytes).hexdigest(),
+        render_status="rendered",
+        parse_status="parsed",
+        page_count=1,
     )
     repo.select_resume(application_id, resume.id)
     return resume
@@ -1061,7 +1065,12 @@ def test_exact_config_selects_second_same_kind_provider_once(tmp_path: Path):
         repo,
         {preferred_config.id: preferred, alternate_config.id: alternate},
     )
-    task = orchestrator.enqueue(application.id, "analyze_jd", alternate_config.id)
+    task = orchestrator.enqueue(
+        application.id,
+        "analyze_jd",
+        alternate_config.id,
+        cloud_transfer_acknowledged=True,
+    )
 
     result = orchestrator.run(task.id)
 
@@ -1136,7 +1145,12 @@ def test_pending_task_fails_closed_after_provider_binding_reregistration(
     )
     provider = ScriptedProvider(initial)
     orchestrator = AiOrchestrator(repo, {config.id: provider})
-    task = orchestrator.enqueue(application.id, "analyze_jd", config.id)
+    task = orchestrator.enqueue(
+        application.id,
+        "analyze_jd",
+        config.id,
+        cloud_transfer_acknowledged=True,
+    )
     changed = initial.model_copy(
         update={"codex_home": "C:/Users/test/.codex"}
     )
@@ -1518,19 +1532,26 @@ def test_jd_source_bytes_preserve_crlf_without_decode_normalization(tmp_path: Pa
     assert context["job_description"]["text"] == jd_text
 
 
-def test_resume_source_bytes_preserve_crlf_latex(tmp_path: Path):
+def test_analyze_fit_context_uses_exact_rendered_pdf_text_and_checksum(tmp_path: Path):
     from careerops.ai.orchestrator import AiOrchestrator
 
     repo = make_repo(tmp_path)
     application = create_application(repo)
-    latex_bytes = b"\\section{Skills}\r\nPython\\\\\r\n"
+    latex_bytes = b"\\section{Skills}\r\nLaTeX source only\\\\\r\n"
     latex_path = repo.vault_path / "resumes" / "exact.tex"
+    pdf_path = repo.vault_path / "resumes" / "exact.pdf"
     latex_path.write_bytes(latex_bytes)
+    pdf_bytes = write_pdf(pdf_path, "Rendered PDF resume text")
     resume = repo.create_resume_version(
         name="Exact resume",
         role_family="software",
         tex_path=latex_path,
         tex_sha256=hashlib.sha256(latex_bytes).hexdigest(),
+        pdf_path=pdf_path,
+        pdf_sha256=hashlib.sha256(pdf_bytes).hexdigest(),
+        render_status="rendered",
+        parse_status="parsed",
+        page_count=1,
     )
     repo.select_resume(application.id, resume.id)
     config = create_provider_config(repo)
@@ -1542,7 +1563,12 @@ def test_resume_source_bytes_preserve_crlf_latex(tmp_path: Path):
 
     assert result.status == "completed"
     context = json.loads(provider.requests[0].context_text())
-    assert context["selected_resume"]["source_text"] == latex_bytes.decode("utf-8")
+    assert context["selected_resume"] == {
+        "version_id": resume.id,
+        "source_kind": "rendered_pdf",
+        "source_text": parse_pdf_bytes(pdf_bytes).text,
+        "pdf_sha256": hashlib.sha256(pdf_bytes).hexdigest(),
+    }
 
 
 def test_requeue_invalidates_stale_attempt_without_reinvoking_provider(tmp_path: Path):
@@ -2096,6 +2122,8 @@ def test_application_versions_capture_attempt_without_changing_resume_history(
     snapshot = versions[0].snapshot
     assert snapshot["ai_task"] == {
         "id": task.id,
+        "cloud_transfer_acknowledged": False,
+        "cloud_transfer_acknowledged_at": None,
         "input_artifact_ids": [],
         "provider_config_id": config.id,
         "status": "completed",

@@ -115,6 +115,8 @@ export type AiTaskRecord = {
   input_artifact_ids: string[];
   status: AiTaskStatus;
   privacy_mode: string;
+  cloud_transfer_acknowledged: boolean;
+  cloud_transfer_acknowledged_at: string | null;
   started_at: string | null;
   completed_at: string | null;
   error_summary: string;
@@ -335,7 +337,12 @@ export function listAiProviders(signal?: AbortSignal): Promise<AiProviderRecord[
 
 export function createAiTask(
   applicationId: string,
-  payload: { task_type: AiTaskType; provider_config_id: string; input_artifact_ids: string[] }
+  payload: {
+    task_type: AiTaskType;
+    provider_config_id: string;
+    input_artifact_ids: string[];
+    cloud_transfer_acknowledged: boolean;
+  }
 ): Promise<AiTaskRecord> {
   return request<AiTaskRecord>(
     `/applications/${id(applicationId)}/ai-tasks`,

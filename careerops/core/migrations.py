@@ -1764,6 +1764,149 @@ def _add_report_ai_approval_authority(
         connection.row_factory = previous_row_factory
 
 
+def _add_ai_task_cloud_transfer_acknowledgement(
+    connection: sqlite3.Connection,
+) -> None:
+    columns = _column_names(connection, "ai_tasks")
+    if "cloud_transfer_acknowledged" not in columns:
+        connection.execute(
+            """
+            ALTER TABLE ai_tasks
+            ADD COLUMN cloud_transfer_acknowledged INTEGER NOT NULL DEFAULT 0
+                CHECK (cloud_transfer_acknowledged IN (0, 1))
+            """
+        )
+    if "cloud_transfer_acknowledged_at" not in columns:
+        connection.execute(
+            "ALTER TABLE ai_tasks ADD COLUMN cloud_transfer_acknowledged_at TEXT"
+        )
+    now = datetime.now(UTC).isoformat()
+    connection.execute(
+        """
+        UPDATE ai_tasks
+        SET status = 'failed', completed_at = COALESCE(completed_at, ?),
+            error_summary = 'cloud_transfer_acknowledgement_required',
+            claim_token = NULL, claim_expires_at = NULL, updated_at = ?
+        WHERE privacy_mode = 'cloud_external'
+          AND cloud_transfer_acknowledged = 0
+          AND status IN ('pending', 'running')
+        """,
+        (now, now),
+    )
+    previous_row_factory = connection.row_factory
+    connection.row_factory = sqlite3.Row
+    try:
+        affected = connection.execute(
+            """
+            SELECT application.*
+            FROM applications AS application
+            JOIN reports AS report ON report.id = application.latest_report_id
+            JOIN ai_tasks AS task ON task.id = report.ai_task_id
+            WHERE application.approval_id IS NOT NULL
+              AND task.privacy_mode = 'cloud_external'
+              AND task.cloud_transfer_acknowledged = 0
+            """
+        ).fetchall()
+        for application in affected:
+            submitted = (
+                application["submission_state"] != "not_submitted"
+                or application["submitted_at"] is not None
+            )
+            event_type = (
+                "application.submitted_cloud_ack_unprovable_by_migration"
+                if submitted
+                else "application.approval_invalidated_by_cloud_ack_migration"
+            )
+            before = {
+                "approval_id": application["approval_id"],
+                "latest_report_id": application["latest_report_id"],
+                "status": application["status"],
+            }
+            after = {
+                **before,
+                "reason": "cloud_transfer_acknowledgement_missing",
+            }
+            if not submitted:
+                after.update(
+                    {
+                        "approval_id": None,
+                        "latest_report_id": None,
+                        "status": "needs_resume_update",
+                    }
+                )
+                connection.execute(
+                    """
+                    UPDATE applications
+                    SET approval_id = NULL, latest_report_id = NULL,
+                        status = 'needs_resume_update', updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (now, application["id"]),
+                )
+            connection.execute(
+                """
+                INSERT INTO audit_events (
+                    id, event_type, entity_type, entity_id,
+                    before_json, after_json, created_at
+                ) VALUES (?, ?, 'application', ?, ?, ?, ?)
+                """,
+                (
+                    f"aud_{uuid.uuid4().hex}",
+                    event_type,
+                    application["id"],
+                    _v17_json(_v17_audit_value(before)),
+                    _v17_json(_v17_audit_value(after)),
+                    now,
+                ),
+            )
+    finally:
+        connection.row_factory = previous_row_factory
+
+    connection.execute("DROP TRIGGER IF EXISTS validate_ai_task_authority_immutable")
+    connection.execute(
+        """
+        CREATE TRIGGER validate_ai_task_authority_immutable
+        BEFORE UPDATE ON ai_tasks
+        WHEN NEW.provider_config_id != OLD.provider_config_id
+          OR NEW.prompt_template_id != OLD.prompt_template_id
+          OR NEW.prompt_sha256 != OLD.prompt_sha256
+          OR NEW.privacy_mode != OLD.privacy_mode
+          OR NEW.provider_binding_json != OLD.provider_binding_json
+          OR NEW.provider_binding_sha256 != OLD.provider_binding_sha256
+          OR NEW.cloud_transfer_acknowledged != OLD.cloud_transfer_acknowledged
+          OR NEW.cloud_transfer_acknowledged_at IS NOT OLD.cloud_transfer_acknowledged_at
+        BEGIN
+            SELECT RAISE(ABORT, 'AI task authority is immutable');
+        END
+        """
+    )
+    for operation in ("INSERT", "UPDATE"):
+        trigger = f"validate_ai_task_cloud_ack_{operation.lower()}"
+        connection.execute(f"DROP TRIGGER IF EXISTS {trigger}")
+        connection.execute(
+            f"""
+            CREATE TRIGGER {trigger}
+            BEFORE {operation} ON ai_tasks
+            WHEN (
+                NEW.privacy_mode = 'cloud_external'
+                AND (
+                    NEW.cloud_transfer_acknowledged != 1
+                    OR NEW.cloud_transfer_acknowledged_at IS NULL
+                )
+            ) OR (
+                NEW.privacy_mode != 'cloud_external'
+                AND (
+                    NEW.cloud_transfer_acknowledged != 0
+                    OR NEW.cloud_transfer_acknowledged_at IS NOT NULL
+                )
+            )
+            BEGIN
+                SELECT RAISE(ABORT, 'invalid AI task cloud transfer acknowledgement');
+            END
+            """
+        )
+
+
 MIGRATIONS: tuple[tuple[int, Migration], ...] = (
     (1, _add_application_role_type),
     (2, _add_application_submitted_at),
@@ -1782,6 +1925,7 @@ MIGRATIONS: tuple[tuple[int, Migration], ...] = (
     (15, _add_ai_artifact_storage_version),
     (16, _add_provider_container_image_bindings),
     (17, _add_report_ai_approval_authority),
+    (18, _add_ai_task_cloud_transfer_acknowledgement),
 )
 
 LATEST_SCHEMA_VERSION = MIGRATIONS[-1][0]

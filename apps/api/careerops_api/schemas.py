@@ -82,6 +82,7 @@ class CreateAiTaskRequest(ApiRequest):
     task_type: AiTaskType
     provider_config_id: Identifier
     input_artifact_ids: list[Identifier] = Field(default_factory=list, max_length=64)
+    cloud_transfer_acknowledged: StrictBool = False
 
     @field_validator("input_artifact_ids")
     @classmethod

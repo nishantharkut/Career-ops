@@ -13,7 +13,8 @@ CareerOps is a private, single-user application desk for India-focused internshi
 - Providers are ChatGPT-authenticated Codex, verified managed Ollama, and a deterministic verifier that is explicitly not AI.
 - Every task is bound to one provider configuration, model, privacy mode, prompt ID, prompt checksum, and provider provenance snapshot.
 - Accepted resume edits create a child resume version. The parent source is unchanged.
-- Approval is user-controlled and binds the current application, resume version, report, and PDF checksum. Submission is recorded only after the user submits outside CareerOps.
+- `analyze_fit` reads text extracted from the exact rendered PDF and binds its SHA-256 into the task context and report.
+- Approval is user-controlled and revalidates that same PDF binding. Submission is recorded only after the user submits outside CareerOps.
 
 See [docs/day-1-workflow.md](docs/day-1-workflow.md) for the exact UI sequence.
 
@@ -78,7 +79,7 @@ exit /b %ERRORLEVEL%
 
 The native executable remains `codex.exe`; CareerOps validates and hashes it, validates `codex-cli` version output, checks `codex login status`, and invokes the native executable directly with an argument list. The default implemented model is `gpt-5.6-sol` with `xhigh` reasoning effort. `CAREEROPS_CODEX_MODEL` and `CAREEROPS_CODEX_REASONING_EFFORT` override those values.
 
-Codex is `cloud_external`: the bounded selected task prompt and context leave the machine through the selected signed-in ChatGPT account. The UI disables the run command until `Acknowledge Codex data transfer for this run` is checked. The acknowledgement resets after a launch or provider/task change. No API key or account secret is stored in source.
+Codex is `cloud_external`: the bounded selected task prompt and context leave the machine through the selected signed-in ChatGPT account. The UI disables the run command until `Acknowledge Codex data transfer for this run` is checked. The API also requires that acknowledgement and persists it with a server timestamp on the immutable task record. The acknowledgement resets after a launch or provider/task change. No API key or account secret is stored in source.
 
 The provider label identifies `Codex account 2 (codex2)` or `Codex default (codex)`. The task panel shows the selected provider identity, model, privacy mode, task ID, prompt ID, and prompt checksum. Provider output and invocation provenance are checksummed in the task vault.
 

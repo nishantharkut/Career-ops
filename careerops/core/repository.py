@@ -50,6 +50,8 @@ from careerops.core.status import (
     VerificationState,
     VerifierState,
 )
+from careerops.parsers.jd_parser import JD_PARSER_VERSION, parse_jd
+from careerops.parsers.pdf_parser import parse_pdf_bytes
 
 
 class PersistedJsonSizeError(ValueError):
@@ -197,6 +199,13 @@ class _ArtifactFileEvidence:
 class _ArtifactPreflight:
     row_signature: tuple[Any, ...]
     file_evidence: _ArtifactFileEvidence
+
+
+@dataclass(frozen=True)
+class VerifiedResumePDF:
+    sha256: str
+    page_count: int
+    text: str
 
 
 def utc_now() -> str:
@@ -706,6 +715,11 @@ class CareerOpsRepository:
             or binding["identity_name"] != identity_name
         ):
             raise ValueError("Provider availability binding did not match configuration")
+        expected_transfer = privacy_mode == PrivacyMode.CLOUD_EXTERNAL
+        if binding["data_leaves_machine"] is not expected_transfer:
+            raise ValueError(
+                "Provider data transfer flag did not match its privacy mode"
+            )
         provider_id = new_id("aip")
         now = utc_now()
         with self.connection() as connection:
@@ -783,6 +797,7 @@ class CareerOpsRepository:
         privacy_mode: str,
         expected_provider_binding: Mapping[str, Any],
         expected_provider_binding_sha256: str,
+        cloud_transfer_acknowledged: bool = False,
     ) -> AiTask:
         task_type = finite_value(AiTaskType, task_type, "task type")
         privacy_mode = finite_value(PrivacyMode, privacy_mode, "privacy mode")
@@ -796,6 +811,8 @@ class CareerOpsRepository:
         )
         if expected_binding_sha != expected_provider_binding_sha256:
             raise ValueError("Expected AI provider binding checksum was invalid")
+        if not isinstance(cloud_transfer_acknowledged, bool):
+            raise ValueError("Cloud transfer acknowledgement must be a boolean")
         seen_artifact_ids: set[str] = set()
         for artifact_id in input_artifact_ids:
             if not isinstance(artifact_id, str):
@@ -842,6 +859,16 @@ class CareerOpsRepository:
                 or binding_sha256 != expected_binding_sha
             ):
                 raise ValueError("AI provider configuration changed during enqueue")
+            data_leaves_machine = binding.get("data_leaves_machine") is True
+            if data_leaves_machine and not cloud_transfer_acknowledged:
+                raise ValueError(
+                    "Cloud AI task requires a per-run data transfer acknowledgement"
+                )
+            if cloud_transfer_acknowledged and not data_leaves_machine:
+                raise ValueError(
+                    "Data transfer acknowledgement does not match this AI provider"
+                )
+            acknowledged_at = now if cloud_transfer_acknowledged else None
             if input_artifact_ids:
                 placeholders = ", ".join("?" for _ in input_artifact_ids)
                 rows = connection.execute(
@@ -878,9 +905,10 @@ class CareerOpsRepository:
                     id, application_id, task_type, provider_config_id,
                     prompt_template_id, prompt_sha256, input_artifact_ids_json,
                     status, privacy_mode,
-                    provider_binding_json, provider_binding_sha256, started_at,
+                    provider_binding_json, provider_binding_sha256,
+                    cloud_transfer_acknowledged, cloud_transfer_acknowledged_at, started_at,
                     completed_at, error_summary, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     task_id,
@@ -894,6 +922,8 @@ class CareerOpsRepository:
                     privacy_mode,
                     binding_json,
                     binding_sha256,
+                    int(cloud_transfer_acknowledged),
+                    acknowledged_at,
                     None,
                     None,
                     "",
@@ -1284,6 +1314,66 @@ class CareerOpsRepository:
                 != expected_resume_version_id
             ):
                 raise ValueError("Selected resume changed during AI task")
+            if (
+                terminal_status == AiTaskStatus.COMPLETED.value
+                and task["task_type"] == AiTaskType.ANALYZE_FIT.value
+            ):
+                context_row = next(
+                    artifact
+                    for artifact in artifact_rows
+                    if artifact["artifact_type"] == "context"
+                )
+                context_buffer = BytesIO()
+                try:
+                    context_evidence = self._stable_artifact_read(
+                        Path(context_row["path"]), context_buffer
+                    )
+                    context_payload = json.loads(
+                        context_buffer.getvalue().decode("utf-8")
+                    )
+                except (
+                    OSError,
+                    ValueError,
+                    UnicodeDecodeError,
+                ) as exc:
+                    raise ValueError("AI fit context is invalid") from exc
+                context_resume = (
+                    context_payload.get("selected_resume")
+                    if isinstance(context_payload, dict)
+                    else None
+                )
+                context_pdf_sha256 = (
+                    context_resume.get("pdf_sha256")
+                    if isinstance(context_resume, dict)
+                    else None
+                )
+                if (
+                    context_evidence.sha256 != context_row["sha256"]
+                    or not isinstance(context_resume, dict)
+                    or context_resume.get("version_id")
+                    != expected_resume_version_id
+                    or context_resume.get("source_kind") != "rendered_pdf"
+                    or not isinstance(context_pdf_sha256, str)
+                    or not re.fullmatch(r"[0-9a-f]{64}", context_pdf_sha256)
+                ):
+                    raise ValueError("AI fit context PDF authority is invalid")
+                reviewed_resume = connection.execute(
+                    "SELECT * FROM resume_versions WHERE id = ?",
+                    (expected_resume_version_id,),
+                ).fetchone()
+                if reviewed_resume is None:
+                    raise ValueError("Selected resume PDF changed during AI task")
+                try:
+                    verified_pdf = self._verify_resume_pdf_row(reviewed_resume)
+                except ValueError as exc:
+                    raise ValueError(
+                        "Selected resume PDF changed during AI task"
+                    ) from exc
+                if (
+                    reviewed_resume["pdf_sha256"] != context_pdf_sha256
+                    or verified_pdf.sha256 != context_pdf_sha256
+                ):
+                    raise ValueError("Selected resume PDF changed during AI task")
 
             finding_ids: list[str] = []
             finding_types: dict[str, list[str]] = {}
@@ -1491,6 +1581,12 @@ class CareerOpsRepository:
             snapshot = {
                 "ai_task": {
                     "id": task_id,
+                    "cloud_transfer_acknowledged": bool(
+                        task["cloud_transfer_acknowledged"]
+                    ),
+                    "cloud_transfer_acknowledged_at": task[
+                        "cloud_transfer_acknowledged_at"
+                    ],
                     "input_artifact_ids": self._ai_task_input_artifact_ids(
                         connection, task_id
                     ),
@@ -2021,10 +2117,12 @@ class CareerOpsRepository:
         with self.connection() as connection:
             connection.execute("BEGIN IMMEDIATE")
             application = connection.execute(
-                "SELECT id FROM applications WHERE id = ?", (application_id,)
+                "SELECT * FROM applications WHERE id = ?", (application_id,)
             ).fetchone()
             if application is None:
                 raise KeyError("No application with that ID")
+            self._require_pristine_application_packet(application)
+            self._require_no_active_ai_task(connection, application_id)
             connection.execute(
                 """
                 INSERT INTO evidence_items (
@@ -2072,13 +2170,8 @@ class CareerOpsRepository:
                 """,
                 (application_id, evidence_id, now),
             )
-            self._write_audit(
-                connection,
-                "application.evidence_linked",
-                "application",
-                application_id,
-                None,
-                {"evidence_item_id": evidence_id},
+            self._record_evidence_link_mutation(
+                connection, application, evidence_id, now
             )
             evidence_row = connection.execute(
                 "SELECT * FROM evidence_items WHERE id = ?", (evidence_id,)
@@ -2104,6 +2197,28 @@ class CareerOpsRepository:
     ) -> EvidenceItem:
         now = utc_now()
         with self.connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            application = connection.execute(
+                "SELECT * FROM applications WHERE id = ?", (application_id,)
+            ).fetchone()
+            if application is None:
+                raise KeyError("No application with that ID")
+            evidence_row = connection.execute(
+                "SELECT * FROM evidence_items WHERE id = ?", (evidence_item_id,)
+            ).fetchone()
+            if evidence_row is None:
+                raise KeyError("No evidence item with that ID")
+            existing_link = connection.execute(
+                """
+                SELECT 1 FROM application_evidence_links
+                WHERE application_id = ? AND evidence_item_id = ?
+                """,
+                (application_id, evidence_item_id),
+            ).fetchone()
+            if existing_link is not None:
+                return self._evidence_item_from_row(evidence_row)
+            self._require_pristine_application_packet(application)
+            self._require_no_active_ai_task(connection, application_id)
             cursor = connection.execute(
                 """
                 INSERT OR IGNORE INTO application_evidence_links (
@@ -2113,21 +2228,72 @@ class CareerOpsRepository:
                 (application_id, evidence_item_id, now),
             )
             if cursor.rowcount == 1:
-                self._write_audit(
-                    connection,
-                    "application.evidence_linked",
-                    "application",
-                    application_id,
-                    None,
-                    {"evidence_item_id": evidence_item_id},
+                self._record_evidence_link_mutation(
+                    connection, application, evidence_item_id, now
                 )
-            evidence_row = connection.execute(
-                "SELECT * FROM evidence_items WHERE id = ?", (evidence_item_id,)
-            ).fetchone()
-            if evidence_row is None:
-                raise RuntimeError("Linked evidence item was not readable")
             evidence = self._evidence_item_from_row(evidence_row)
         return evidence
+
+    def _record_evidence_link_mutation(
+        self,
+        connection: sqlite3.Connection,
+        application: sqlite3.Row,
+        evidence_item_id: str,
+        now: str,
+    ) -> None:
+        invalidated_report_id = application["latest_report_id"]
+        status = application["status"]
+        if invalidated_report_id is not None:
+            status = (
+                ApplicationStatus.NEEDS_RESUME_UPDATE.value
+                if application["selected_resume_version_id"] is not None
+                else ApplicationStatus.DRAFT.value
+            )
+        connection.execute(
+            """
+            UPDATE applications
+            SET latest_report_id = NULL, status = ?, updated_at = ?
+            WHERE id = ?
+            """,
+            (status, now, application["id"]),
+        )
+        self._write_audit(
+            connection,
+            "application.evidence_linked",
+            "application",
+            application["id"],
+            {"latest_report_id": invalidated_report_id},
+            {
+                "evidence_item_id": evidence_item_id,
+                "latest_report_id": None,
+                "status": status,
+            },
+        )
+        self._insert_application_version(
+            connection=connection,
+            application_id=application["id"],
+            event_type="application.evidence_linked",
+            snapshot={
+                "evidence_item_id": evidence_item_id,
+                "invalidated_report_id": invalidated_report_id,
+            },
+            now=now,
+        )
+
+    @staticmethod
+    def _require_no_active_ai_task(
+        connection: sqlite3.Connection, application_id: str
+    ) -> None:
+        active = connection.execute(
+            """
+            SELECT 1 FROM ai_tasks
+            WHERE application_id = ? AND status IN ('pending', 'running')
+            LIMIT 1
+            """,
+            (application_id,),
+        ).fetchone()
+        if active is not None:
+            raise ValueError("Application has a pending or running AI task")
 
     def list_application_evidence(self, application_id: str) -> list[EvidenceItem]:
         with self.connection() as connection:
@@ -2407,6 +2573,13 @@ class CareerOpsRepository:
         raw_text_path.write_bytes(jd_bytes)
         source_kind = "url" if source_url else "manual"
         jd_sha = hashlib.sha256(jd_bytes).hexdigest()
+        initial_requirements = {
+            "raw_ai": {},
+            "deterministic": parse_jd(jd_text).to_dict(),
+            "user_corrected": {},
+            "uncertainty": {},
+        }
+        _safe_requirements, requirements_json = persisted_json(initial_requirements)
 
         with self.connection() as connection:
             connection.execute(
@@ -2423,8 +2596,8 @@ class CareerOpsRepository:
                     str(raw_text_path),
                     jd_sha,
                     now,
-                    json.dumps({}),
-                    "unparsed",
+                    requirements_json,
+                    JD_PARSER_VERSION,
                 ),
             )
             connection.execute(
@@ -3314,23 +3487,7 @@ class CareerOpsRepository:
             ).fetchone()
             if resume is None:
                 raise KeyError("No resume version with that ID")
-            protected = connection.execute(
-                """
-                SELECT 1 FROM applications
-                WHERE selected_resume_version_id = ?
-                  AND (
-                    approval_id IS NOT NULL
-                    OR submission_state != ?
-                    OR submitted_at IS NOT NULL
-                  )
-                LIMIT 1
-                """,
-                (resume_version_id, SubmissionState.NOT_SUBMITTED.value),
-            ).fetchone()
-            if protected is not None:
-                raise ValueError(
-                    "Cannot change a resume selected by an approved or submitted application"
-                )
+            self._require_resume_render_mutable(connection, resume_version_id)
             connection.execute(
                 """
                 UPDATE resume_versions
@@ -3363,6 +3520,40 @@ class CareerOpsRepository:
                 },
             )
         return self.get_resume_version(resume_version_id)
+
+    def require_resume_render_mutable(self, resume_version_id: str) -> ResumeVersion:
+        with self.connection() as connection:
+            connection.execute("BEGIN")
+            resume = connection.execute(
+                "SELECT * FROM resume_versions WHERE id = ?",
+                (resume_version_id,),
+            ).fetchone()
+            if resume is None:
+                raise KeyError("No resume version with that ID")
+            self._require_resume_render_mutable(connection, resume_version_id)
+            return self._resume_from_row(resume)
+
+    @staticmethod
+    def _require_resume_render_mutable(
+        connection: sqlite3.Connection, resume_version_id: str
+    ) -> None:
+        protected = connection.execute(
+            """
+            SELECT 1 FROM applications
+            WHERE selected_resume_version_id = ?
+              AND (
+                approval_id IS NOT NULL
+                OR submission_state != ?
+                OR submitted_at IS NOT NULL
+              )
+            LIMIT 1
+            """,
+            (resume_version_id, SubmissionState.NOT_SUBMITTED.value),
+        ).fetchone()
+        if protected is not None:
+            raise ValueError(
+                "Cannot change a resume selected by an approved or submitted application"
+            )
 
     def select_resume(self, application_id: str, resume_version_id: str) -> Application:
         with self.connection() as connection:
@@ -3757,33 +3948,47 @@ class CareerOpsRepository:
             "SELECT * FROM ai_provider_configs WHERE id = ?",
             (task["provider_config_id"],),
         ).fetchone()
-        if provider is None or not provider["enabled"]:
+        if provider is None:
             raise ValueError("AI review provider authority is unavailable")
         try:
             task_binding, task_binding_json, task_binding_sha256 = (
                 canonical_provider_binding(json.loads(task["provider_binding_json"]))
-            )
-            provider_binding, provider_binding_json, provider_binding_sha256 = (
-                canonical_provider_binding(
-                    json.loads(provider["availability_binding_json"])
-                )
             )
         except (TypeError, json.JSONDecodeError, ValueError) as exc:
             raise ValueError("AI review provider authority is invalid") from exc
         if (
             task_binding_json != task["provider_binding_json"]
             or task_binding_sha256 != task["provider_binding_sha256"]
-            or provider_binding_json != provider["availability_binding_json"]
-            or provider_binding_sha256
-            != provider["availability_binding_sha256"]
-            or task_binding != provider_binding
-            or task_binding_sha256 != provider_binding_sha256
             or task["provider_config_id"] != provider["id"]
-            or task["privacy_mode"] != provider["privacy_mode"]
+            or task["privacy_mode"] != task_binding["privacy_mode"]
+            or provider["provider_kind"] != task_binding["provider_kind"]
+            or provider["endpoint"] != task_binding["endpoint"]
+            or provider["model"] != task_binding["model"]
+            or provider["identity_name"] != task_binding["identity_name"]
         ):
             raise ValueError("AI review provider binding is stale")
         if task_binding["is_ai"] is not True:
             raise ValueError("AI review must use an AI provider")
+        data_leaves_machine = task_binding["data_leaves_machine"] is True
+        acknowledged = bool(task["cloud_transfer_acknowledged"])
+        acknowledged_at = task["cloud_transfer_acknowledged_at"]
+        if data_leaves_machine:
+            if not acknowledged or not isinstance(acknowledged_at, str):
+                raise ValueError(
+                    "AI review cloud transfer acknowledgement is missing"
+                )
+            try:
+                acknowledged_time = datetime.fromisoformat(acknowledged_at)
+            except ValueError as exc:
+                raise ValueError(
+                    "AI review cloud transfer acknowledgement is invalid"
+                ) from exc
+            if acknowledged_time.tzinfo is None:
+                raise ValueError(
+                    "AI review cloud transfer acknowledgement is invalid"
+                )
+        elif acknowledged or acknowledged_at is not None:
+            raise ValueError("AI review transfer acknowledgement is invalid")
 
         versions = connection.execute(
             """
@@ -3826,6 +4031,11 @@ class CareerOpsRepository:
             or task_snapshot.get("task_type") != AiTaskType.ANALYZE_FIT.value
         ):
             raise ValueError("AI review task authority is invalid")
+        if data_leaves_machine and (
+            task_snapshot.get("cloud_transfer_acknowledged") is not True
+            or task_snapshot.get("cloud_transfer_acknowledged_at") != acknowledged_at
+        ):
+            raise ValueError("AI review cloud transfer authority is invalid")
 
         manifest = authority.get("artifacts")
         if not isinstance(manifest, list):
@@ -3897,6 +4107,9 @@ class CareerOpsRepository:
             or not isinstance(context.get("selected_resume"), dict)
             or context["selected_resume"].get("version_id")
             != report["resume_version_id"]
+            or context["selected_resume"].get("source_kind") != "rendered_pdf"
+            or context["selected_resume"].get("pdf_sha256")
+            != report["pdf_sha256"]
         ):
             raise ValueError("AI review context does not match the report")
 
@@ -3937,10 +4150,10 @@ class CareerOpsRepository:
             "prompt_template_id": task["prompt_template_id"],
             "provider_binding": task_binding,
             "provider_binding_sha256": task_binding_sha256,
-            "provider_config_id": provider["id"],
-            "provider_identity_name": provider["identity_name"],
-            "provider_kind": provider["provider_kind"],
-            "provider_model": provider["model"],
+            "provider_config_id": task["provider_config_id"],
+            "provider_identity_name": task_binding["identity_name"],
+            "provider_kind": task_binding["provider_kind"],
+            "provider_model": task_binding["model"],
         }
         if fit_provenance != expected_provenance:
             raise ValueError("AI review provenance no longer matches repository authority")
@@ -4073,23 +4286,38 @@ class CareerOpsRepository:
         if actual_sha256 != expected_sha256.lower():
             raise ValueError("Selected resume source integrity verification failed")
 
-    def _verify_resume_pdf_row(self, resume: sqlite3.Row) -> None:
+    def _verify_resume_pdf_row(self, resume: sqlite3.Row) -> VerifiedResumePDF:
         pdf_path = resume["pdf_path"]
         expected_sha256 = resume["pdf_sha256"]
         if (
             not pdf_path
             or not expected_sha256
             or not SHA256_PATTERN.fullmatch(expected_sha256)
+            or resume["render_status"] != "rendered"
+            or resume["parse_status"] != "parsed"
+            or not isinstance(resume["page_count"], int)
+            or resume["page_count"] < 1
         ):
             raise ValueError("Selected resume PDF integrity verification failed")
+        content = BytesIO()
         try:
-            _path, actual_sha256 = self._stable_artifact_digest(Path(pdf_path))
-        except (FileNotFoundError, OSError, ValueError) as exc:
+            evidence = self._stable_artifact_read(Path(pdf_path), content)
+            parsed = parse_pdf_bytes(content.getvalue(), path=evidence.path)
+        except Exception as exc:
             raise ValueError(
                 "Selected resume PDF integrity verification failed"
             ) from exc
-        if actual_sha256 != expected_sha256.lower():
+        if evidence.sha256 != expected_sha256.lower():
             raise ValueError("Selected resume PDF integrity verification failed")
+        if parsed.page_count != resume["page_count"]:
+            raise ValueError("Selected resume PDF page count verification failed")
+        if not parsed.text.strip():
+            raise ValueError("Selected resume PDF has no extractable text")
+        return VerifiedResumePDF(
+            sha256=evidence.sha256,
+            page_count=parsed.page_count,
+            text=parsed.text,
+        )
 
     def get_application(self, application_id: str) -> Application:
         row = self._one("SELECT * FROM applications WHERE id = ?", (application_id,))
@@ -4364,6 +4592,16 @@ class CareerOpsRepository:
     def get_resume_version(self, resume_version_id: str) -> ResumeVersion:
         row = self._one("SELECT * FROM resume_versions WHERE id = ?", (resume_version_id,))
         return self._resume_from_row(row)
+
+    def read_verified_resume_pdf(self, resume_version_id: str) -> VerifiedResumePDF:
+        with self.connection() as connection:
+            connection.execute("BEGIN")
+            row = connection.execute(
+                "SELECT * FROM resume_versions WHERE id = ?", (resume_version_id,)
+            ).fetchone()
+            if row is None:
+                raise KeyError("No resume version with that ID")
+            return self._verify_resume_pdf_row(row)
 
     def list_resume_versions(self) -> list[ResumeVersion]:
         with self.connection() as connection:
@@ -4981,6 +5219,7 @@ class CareerOpsRepository:
         row: sqlite3.Row,
         input_artifact_ids: list[str],
     ) -> AiTask:
+        row_columns = set(row.keys())
         binding_json = row["provider_binding_json"]
         binding_sha256 = row["provider_binding_sha256"]
         binding: dict[str, Any] = {}
@@ -5002,6 +5241,16 @@ class CareerOpsRepository:
             privacy_mode=PrivacyMode(row["privacy_mode"]),
             provider_binding=binding,
             provider_binding_sha256=binding_sha256,
+            cloud_transfer_acknowledged=(
+                bool(row["cloud_transfer_acknowledged"])
+                if "cloud_transfer_acknowledged" in row_columns
+                else False
+            ),
+            cloud_transfer_acknowledged_at=(
+                row["cloud_transfer_acknowledged_at"]
+                if "cloud_transfer_acknowledged_at" in row_columns
+                else None
+            ),
             started_at=row["started_at"],
             claim_expires_at=row["claim_expires_at"],
             invocation_started_at=row["invocation_started_at"],

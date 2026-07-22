@@ -4,9 +4,12 @@ from pathlib import Path
 from fastapi.testclient import TestClient
 import pytest
 
+from apps.api.careerops_api import main as api_main
 from apps.api.careerops_api.main import create_app
 from careerops.core.repository import CareerOpsRepository
+from careerops.renderers.latex import RenderResult
 from tests.ai_approval_helpers import create_ai_approval_report
+from tests.pdf_helpers import write_pdf
 
 
 def make_client(tmp_path: Path) -> TestClient:
@@ -34,7 +37,7 @@ def create_reviewable_packet(repo: CareerOpsRepository):
     tex_path = source_dir / "resume.tex"
     pdf_path = source_dir / "resume.pdf"
     tex_path.write_text("Python developer", encoding="utf-8")
-    pdf_path.write_bytes(b"%PDF-1.4\nreviewed")
+    write_pdf(pdf_path, "Reviewed Python developer resume")
     resume = repo.create_resume_version(
         name="Reviewed resume",
         role_family="software",
@@ -207,6 +210,122 @@ def test_resume_upload_rejects_oversize_or_invalid_utf8_and_cleans_partial_direc
 
     assert response.status_code == expected_status
     assert set(resume_root.iterdir()) == before
+
+
+def test_render_rejects_pdf_without_extractable_text(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    repo, client = make_repo_and_client(tmp_path)
+    application = client.post(
+        "/applications",
+        json={
+            "company": "Example Corp",
+            "role_title": "Engineer",
+            "jd_text": "Python role",
+        },
+    ).json()
+    resume = client.post(
+        f"/applications/{application['id']}/resume",
+        data={"name": "Resume", "role_family": "software"},
+        files={"tex_file": ("resume.tex", b"valid latex", "application/x-tex")},
+    ).json()
+
+    def render_blank(_source: Path, output_dir: Path) -> RenderResult:
+        pdf_path = output_dir / "resume.pdf"
+        content = write_pdf(pdf_path, None)
+        log_path = output_dir / "render.log"
+        log_path.write_text("fixture", encoding="utf-8")
+        return RenderResult(
+            True,
+            pdf_path,
+            log_path,
+            hashlib.sha256(content).hexdigest(),
+            "",
+            "fixture",
+        )
+
+    monkeypatch.setattr(api_main, "render_latex", render_blank)
+
+    response = client.post(f"/resumes/{resume['id']}/render")
+
+    assert response.status_code == 200
+    assert response.json()["render_status"] == "failed"
+    assert response.json()["parse_status"] == "not_parsed"
+    assert response.json()["pdf_sha256"] is None
+    assert repo.get_resume_version(resume["id"]).pdf_path is None
+    attempts = list(
+        (repo.vault_path / "resumes" / resume["id"] / "render").glob("attempt_*")
+    )
+    assert len(attempts) == 1
+    assert (attempts[0] / "render.log").read_text(encoding="utf-8") == "fixture"
+
+
+def test_rerender_of_approved_resume_is_rejected_before_pdf_bytes_change(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    repo = CareerOpsRepository(tmp_path / "careerops.db", tmp_path / "vault")
+    repo.initialize()
+    client = TestClient(create_app(repo, provider_registry={}), raise_server_exceptions=False)
+    application = client.post(
+        "/applications",
+        json={
+            "company": "Example Corp",
+            "role_title": "Engineer",
+            "jd_text": "Python role",
+        },
+    ).json()
+    resume = client.post(
+        f"/applications/{application['id']}/resume",
+        data={"name": "Resume", "role_family": "software"},
+        files={"tex_file": ("resume.tex", b"valid latex", "application/x-tex")},
+    ).json()
+
+    def render_text(_source: Path, output_dir: Path) -> RenderResult:
+        pdf_path = output_dir / "resume.pdf"
+        content = write_pdf(pdf_path, "Approved resume content")
+        log_path = output_dir / "render.log"
+        log_path.write_text("fixture", encoding="utf-8")
+        return RenderResult(
+            True,
+            pdf_path,
+            log_path,
+            hashlib.sha256(content).hexdigest(),
+            "",
+            "fixture",
+        )
+
+    monkeypatch.setattr(api_main, "render_latex", render_text)
+    rendered = client.post(f"/resumes/{resume['id']}/render")
+    assert rendered.status_code == 200
+    current = repo.get_resume_version(resume["id"])
+    assert current.pdf_path is not None
+    approved_bytes = current.pdf_path.read_bytes()
+    report = create_ai_approval_report(repo, application["id"], resume["id"])
+    repo.approve_application(application["id"], report.id, "Reviewed")
+    renderer_called = False
+
+    def overwrite_pdf(_source: Path, output_dir: Path) -> RenderResult:
+        nonlocal renderer_called
+        renderer_called = True
+        pdf_path = output_dir / "resume.pdf"
+        content = write_pdf(pdf_path, "Changed after approval")
+        log_path = output_dir / "render.log"
+        return RenderResult(
+            True,
+            pdf_path,
+            log_path,
+            hashlib.sha256(content).hexdigest(),
+            "",
+            "fixture",
+        )
+
+    monkeypatch.setattr(api_main, "render_latex", overwrite_pdf)
+
+    response = client.post(f"/resumes/{resume['id']}/render")
+
+    assert response.status_code == 409
+    assert renderer_called is False
+    assert current.pdf_path.read_bytes() == approved_bytes
 
 
 @pytest.mark.parametrize("terminal_state", ["approved", "submitted"])
