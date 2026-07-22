@@ -280,22 +280,25 @@ def create_app(
         startup_ready = False
         managed_factory: ManagedOllamaRuntimeFactory | None = None
         managed_runtime: ManagedOllamaRuntime | None = None
+        managed_mode = ""
         try:
             managed_mode = effective_environment.get(
                 "CAREEROPS_OLLAMA_MANAGED_MODE", ""
             ).strip().casefold()
             if managed_mode:
                 try:
-                    if managed_mode != "container":
+                    if managed_mode not in {"container", "windows_process"}:
                         raise ManagedRuntimeError(
                             "Configured managed Ollama mode was unsupported"
                         )
-                    if (
-                        effective_environment.get("CAREEROPS_OLLAMA_URL")
-                        != "http://ollama:11434"
-                    ):
+                    expected_endpoint = (
+                        "http://ollama:11434"
+                        if managed_mode == "container"
+                        else "http://127.0.0.1:11434"
+                    )
+                    if effective_environment.get("CAREEROPS_OLLAMA_URL") != expected_endpoint:
                         raise ManagedRuntimeError(
-                            "Managed Ollama endpoint did not match the Compose service"
+                            "Managed Ollama endpoint did not match its runtime mode"
                         )
                     configured_runtime_root = effective_environment.get(
                         "CAREEROPS_OLLAMA_RUNTIME_ROOT", ""
@@ -309,13 +312,22 @@ def create_app(
                         runtime_root = (
                             Path(__file__).resolve().parents[3] / runtime_root
                         )
+                    launcher = managed_runtime_launcher
+                    executable: str | None = None
+                    if launcher is None and managed_mode == "container":
+                        launcher = DockerComposeOllamaLauncher()
+                    elif launcher is None:
+                        executable = effective_environment.get(
+                            "CAREEROPS_OLLAMA_EXECUTABLE", ""
+                        ).strip()
+                        if not executable:
+                            raise ManagedRuntimeError(
+                                "Windows managed Ollama executable was not configured"
+                            )
                     managed_factory = ManagedOllamaRuntimeFactory(
-                        launcher=(
-                            managed_runtime_launcher
-                            if managed_runtime_launcher is not None
-                            else DockerComposeOllamaLauncher()
-                        ),
+                        launcher=launcher,
                         runtime_root=runtime_root,
+                        ollama_executable=executable,
                     )
                     managed_runtime = managed_factory.launch(
                         model=(
@@ -351,7 +363,7 @@ def create_app(
             if (
                 managed_factory is not None
                 and managed_runtime is not None
-                and not startup_ready
+                and (not startup_ready or managed_mode == "windows_process")
             ):
                 managed_factory.stop(managed_runtime)
 

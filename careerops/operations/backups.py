@@ -2,11 +2,14 @@ from __future__ import annotations
 
 import argparse
 from contextlib import closing
+import ctypes
+from ctypes import wintypes
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 import hashlib
 import hmac
 import json
+import ntpath
 import os
 from pathlib import Path, PurePosixPath, PureWindowsPath
 import re
@@ -21,10 +24,12 @@ from uuid import uuid4
 import zipfile
 
 
-BACKUP_VERSION = "careerops_backup_v1"
+BACKUP_VERSION = "careerops_backup_v2"
+LEGACY_BACKUP_VERSION = "careerops_backup_v1"
 DATABASE_ARCHIVE_PATH = "data/careerops.db"
 MANIFEST_ARCHIVE_PATH = "manifest.json"
 CHUNK_SIZE = 128 * 1024
+_IS_WINDOWS = os.name == "nt"
 SHA256_PATTERN = re.compile(r"[0-9a-f]{64}\Z")
 WINDOWS_RESERVED_NAMES = frozenset(
     {
@@ -36,6 +41,7 @@ WINDOWS_RESERVED_NAMES = frozenset(
         *(f"LPT{index}" for index in range(1, 10)),
     }
 )
+WINDOWS_FORBIDDEN_CHARACTERS = frozenset('<>:"/\\|?*')
 
 
 class BackupError(RuntimeError):
@@ -104,6 +110,31 @@ class _FileRecord:
     path: str
     size: int
     sha256: str
+
+
+@dataclass
+class _OpenSnapshotFile:
+    record: _FileRecord
+    staged_path: Path
+    staged_descriptor: int
+    staged_identity: tuple[int, int, int, int, int]
+    source_path: Path | None = None
+    source_descriptor: int | None = None
+    source_identity: tuple[int, int, int, int, int] | None = None
+
+    def close(self) -> None:
+        for descriptor_name in ("source_descriptor", "staged_descriptor"):
+            descriptor = getattr(self, descriptor_name)
+            if descriptor is not None and descriptor >= 0:
+                os.close(descriptor)
+                setattr(self, descriptor_name, -1)
+
+
+@dataclass(frozen=True)
+class _VaultSnapshot:
+    files: tuple[_OpenSnapshotFile, ...]
+    directories: tuple[str, ...]
+    topology: tuple[tuple[str, str, tuple[int, int, int, int, int]], ...]
 
 
 @dataclass(frozen=True)
@@ -243,6 +274,19 @@ def _stat_identity(value: os.stat_result) -> tuple[int, int, int, int, int, int]
     )
 
 
+def _snapshot_identity(value: os.stat_result) -> tuple[int, int, int, int, int]:
+    # Windows reports creation/change time differently through path and open
+    # handle APIs. Device, file ID, size, write time, and link count are stable
+    # across both views; content hashes provide the byte-level authority.
+    return (
+        value.st_dev,
+        value.st_ino,
+        value.st_size,
+        value.st_mtime_ns,
+        value.st_nlink,
+    )
+
+
 def _directory_identity(path: Path) -> tuple[int, int, int, int]:
     value = path.lstat()
     return (value.st_dev, value.st_ino, value.st_mtime_ns, value.st_ctime_ns)
@@ -257,13 +301,65 @@ def _fsync_file(path: Path) -> None:
 
 
 def _fsync_directory(path: Path) -> None:
-    if os.name == "nt" or not hasattr(os, "O_DIRECTORY"):
+    if _IS_WINDOWS:
+        _windows_flush_directory(path)
+        return
+    if not hasattr(os, "O_DIRECTORY"):
         return
     descriptor = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
     try:
         os.fsync(descriptor)
     finally:
         os.close(descriptor)
+
+
+def _windows_kernel32() -> Any:
+    return ctypes.WinDLL("kernel32", use_last_error=True)
+
+
+def _windows_flush_directory(path: Path) -> None:
+    kernel32 = _windows_kernel32()
+    create_file = kernel32.CreateFileW
+    create_file.argtypes = (
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.HANDLE,
+    )
+    create_file.restype = wintypes.HANDLE
+    handle = create_file(
+        str(path),
+        0x40000000,  # GENERIC_WRITE
+        0x00000001 | 0x00000002 | 0x00000004,
+        None,
+        3,  # OPEN_EXISTING
+        0x02000000 | 0x80000000,  # BACKUP_SEMANTICS | WRITE_THROUGH
+        None,
+    )
+    invalid_handle = wintypes.HANDLE(-1).value
+    if handle == invalid_handle:
+        raise ctypes.WinError(ctypes.get_last_error())
+    try:
+        if not kernel32.FlushFileBuffers(handle):
+            raise ctypes.WinError(ctypes.get_last_error())
+    finally:
+        kernel32.CloseHandle(handle)
+
+
+def _windows_write_through_replace(source: Path, destination: Path) -> None:
+    kernel32 = _windows_kernel32()
+    move_file = kernel32.MoveFileExW
+    move_file.argtypes = (wintypes.LPCWSTR, wintypes.LPCWSTR, wintypes.DWORD)
+    move_file.restype = wintypes.BOOL
+    if not move_file(
+        str(source),
+        str(destination),
+        0x00000001 | 0x00000008,  # REPLACE_EXISTING | WRITE_THROUGH
+    ):
+        raise ctypes.WinError(ctypes.get_last_error())
 
 
 def _stream_file(source: Path, destination: BinaryIO, limit: int) -> tuple[int, str]:
@@ -311,14 +407,261 @@ def _stream_file(source: Path, destination: BinaryIO, limit: int) -> tuple[int, 
     return observed, digest.hexdigest()
 
 
+def _descriptor_digest(descriptor: int, limit: int) -> tuple[int, str]:
+    digest = hashlib.sha256()
+    observed = 0
+    os.lseek(descriptor, 0, os.SEEK_SET)
+    while True:
+        chunk = os.read(descriptor, CHUNK_SIZE)
+        if not chunk:
+            break
+        observed += len(chunk)
+        if observed > limit:
+            raise BackupIntegrityError("A backup file exceeded its size limit")
+        digest.update(chunk)
+    return observed, digest.hexdigest()
+
+
+def _open_regular_descriptor(
+    path: Path, description: str
+) -> tuple[int, tuple[int, int, int, int, int]]:
+    try:
+        before = path.lstat()
+        if _is_link_or_reparse(path) or not stat.S_ISREG(before.st_mode):
+            raise BackupPathError(f"{description} must be a regular file")
+        if before.st_nlink != 1:
+            raise BackupPathError(f"{description} must be a single-link regular file")
+        descriptor = os.open(
+            path,
+            os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0),
+        )
+        opened = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or opened.st_nlink != 1
+            or (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino)
+        ):
+            os.close(descriptor)
+            raise BackupPathError(f"{description} changed while it was opened")
+        return descriptor, _snapshot_identity(opened)
+    except BackupError:
+        raise
+    except OSError as error:
+        raise BackupPathError(f"{description} could not be opened safely") from error
+
+
+def _assert_descriptor_identity(
+    path: Path,
+    descriptor: int,
+    identity: tuple[int, int, int, int, int],
+    description: str,
+) -> None:
+    try:
+        path_value = path.lstat()
+        descriptor_value = os.fstat(descriptor)
+    except OSError as error:
+        raise BackupIntegrityError(f"{description} changed during the snapshot") from error
+    if (
+        _is_link_or_reparse(path)
+        or not stat.S_ISREG(path_value.st_mode)
+        or path_value.st_nlink != 1
+        or _snapshot_identity(path_value) != identity
+        or _snapshot_identity(descriptor_value) != identity
+        or (path_value.st_dev, path_value.st_ino)
+        != (descriptor_value.st_dev, descriptor_value.st_ino)
+    ):
+        raise BackupIntegrityError(f"{description} changed during the snapshot")
+
+
+def _copy_descriptor(source: int, destination: int, limit: int) -> tuple[int, str]:
+    digest = hashlib.sha256()
+    observed = 0
+    os.lseek(source, 0, os.SEEK_SET)
+    while True:
+        chunk = os.read(source, CHUNK_SIZE)
+        if not chunk:
+            break
+        observed += len(chunk)
+        if observed > limit:
+            raise BackupIntegrityError("A backup file exceeded its size limit")
+        view = memoryview(chunk)
+        while view:
+            written = os.write(destination, view)
+            if written <= 0:
+                raise BackupIntegrityError("A staged backup file could not be written")
+            view = view[written:]
+        digest.update(chunk)
+    return observed, digest.hexdigest()
+
+
+def _vault_topology(
+    vault: Path,
+) -> tuple[tuple[str, str, tuple[int, int, int, int, int]], ...]:
+    observed: list[tuple[str, str, tuple[int, int, int, int, int]]] = []
+    seen: set[str] = set()
+    stack: list[tuple[Path, str]] = [(vault, "")]
+    while stack:
+        directory, relative = stack.pop()
+        value = directory.lstat()
+        if _is_link_or_reparse(directory) or not stat.S_ISDIR(value.st_mode):
+            raise BackupPathError("Vault directories must not be links or reparse points")
+        archive_directory = "vault" if not relative else _safe_archive_path(
+            f"vault/{relative}", allow_manifest=False
+        )
+        key = _portable_path_key(archive_directory)
+        if key in seen:
+            raise BackupPathError("Vault paths collided after portable normalization")
+        seen.add(key)
+        observed.append((archive_directory, "directory", _snapshot_identity(value)))
+        with os.scandir(directory) as entries:
+            children = sorted(
+                entries,
+                key=lambda entry: (_portable_path_key(entry.name), entry.name),
+                reverse=True,
+            )
+        for entry in children:
+            child = Path(entry.path)
+            child_value = child.lstat()
+            child_relative = entry.name if not relative else f"{relative}/{entry.name}"
+            archive_path = _safe_archive_path(
+                f"vault/{child_relative}", allow_manifest=False
+            )
+            child_key = _portable_path_key(archive_path)
+            if child_key in seen:
+                raise BackupPathError("Vault paths collided after portable normalization")
+            if _is_link_or_reparse(child):
+                raise BackupPathError("Vault entries must not be links or reparse points")
+            if stat.S_ISDIR(child_value.st_mode):
+                stack.append((child, child_relative))
+            elif stat.S_ISREG(child_value.st_mode) and child_value.st_nlink == 1:
+                seen.add(child_key)
+                observed.append((archive_path, "file", _snapshot_identity(child_value)))
+            elif stat.S_ISREG(child_value.st_mode):
+                raise BackupPathError("Backup source files must be single-link regular files")
+            else:
+                raise BackupPathError("Vault entries must be regular files or directories")
+    return tuple(sorted(observed, key=lambda item: item[0]))
+
+
+def _capture_vault_snapshot(
+    vault: Path,
+    staged_vault: Path,
+    limits: BackupLimits,
+) -> _VaultSnapshot:
+    topology = _vault_topology(vault)
+    directories = tuple(
+        path for path, kind, _identity in topology if kind == "directory" and path != "vault"
+    )
+    file_entries = [item for item in topology if item[1] == "file"]
+    if len(topology) + 1 > limits.max_files:
+        raise BackupIntegrityError("Backup exceeded its file-count limit")
+    opened: list[_OpenSnapshotFile] = []
+    try:
+        for archive_path, _kind, expected_identity in file_entries:
+            relative = PurePosixPath(archive_path).relative_to("vault")
+            source_path = vault / relative
+            source_descriptor, source_identity = _open_regular_descriptor(
+                source_path, "Vault entry"
+            )
+            if source_identity != expected_identity:
+                os.close(source_descriptor)
+                raise BackupIntegrityError("Vault changed while it was staged")
+            staged_path = staged_vault / relative
+            staged_path.parent.mkdir(parents=True, exist_ok=True)
+            staged_descriptor = -1
+            try:
+                staged_descriptor = os.open(
+                    staged_path,
+                    os.O_RDWR
+                    | os.O_CREAT
+                    | os.O_EXCL
+                    | getattr(os, "O_BINARY", 0)
+                    | getattr(os, "O_NOFOLLOW", 0),
+                    0o600,
+                )
+                size, sha256 = _copy_descriptor(
+                    source_descriptor, staged_descriptor, limits.max_file_bytes
+                )
+                os.fsync(staged_descriptor)
+                staged_identity = _snapshot_identity(os.fstat(staged_descriptor))
+            except BaseException:
+                if staged_descriptor >= 0:
+                    os.close(staged_descriptor)
+                os.close(source_descriptor)
+                raise
+            opened.append(
+                _OpenSnapshotFile(
+                    record=_FileRecord(archive_path, size, sha256),
+                    staged_path=staged_path,
+                    staged_descriptor=staged_descriptor,
+                    staged_identity=staged_identity,
+                    source_path=source_path,
+                    source_descriptor=source_descriptor,
+                    source_identity=source_identity,
+                )
+            )
+        return _VaultSnapshot(tuple(opened), directories, topology)
+    except BaseException:
+        for item in opened:
+            item.close()
+        raise
+
+
+def _revalidate_vault_snapshot(
+    vault: Path,
+    snapshot: _VaultSnapshot,
+    limits: BackupLimits,
+) -> None:
+    if _vault_topology(vault) != snapshot.topology:
+        raise BackupIntegrityError("Vault changed after the database snapshot")
+    for item in snapshot.files:
+        if (
+            item.source_path is None
+            or item.source_descriptor is None
+            or item.source_identity is None
+        ):
+            raise BackupIntegrityError("Vault snapshot identity was incomplete")
+        _assert_descriptor_identity(
+            item.source_path,
+            item.source_descriptor,
+            item.source_identity,
+            "Vault source",
+        )
+        size, digest = _descriptor_digest(
+            item.source_descriptor, limits.max_file_bytes
+        )
+        if size != item.record.size or not secrets_compare_digest(
+            digest, item.record.sha256
+        ):
+            raise BackupIntegrityError("Vault changed after the database snapshot")
+        _assert_descriptor_identity(
+            item.staged_path,
+            item.staged_descriptor,
+            item.staged_identity,
+            "Staged vault file",
+        )
+        staged_size, staged_digest = _descriptor_digest(
+            item.staged_descriptor, limits.max_file_bytes
+        )
+        if staged_size != item.record.size or not secrets_compare_digest(
+            staged_digest, item.record.sha256
+        ):
+            raise BackupIntegrityError("Staged vault bytes did not match the manifest")
+
+
 def _safe_archive_path(raw: str, *, allow_manifest: bool = True) -> str:
-    if not isinstance(raw, str) or not raw or raw != unicodedata.normalize("NFC", raw):
+    if (
+        not isinstance(raw, str)
+        or not raw
+        or len(raw.encode("utf-8")) > 4096
+        or raw != unicodedata.normalize("NFC", raw)
+    ):
         raise BackupPathError("Archive member paths must be normalized UTF-8 names")
     if (
         "\\" in raw
         or ":" in raw
         or "\x00" in raw
-        or any(ord(character) < 32 for character in raw)
+        or any(ord(character) < 32 or ord(character) == 127 for character in raw)
         or raw.startswith("/")
         or PureWindowsPath(raw).drive
     ):
@@ -327,10 +670,16 @@ def _safe_archive_path(raw: str, *, allow_manifest: bool = True) -> str:
     if any(part in {"", ".", ".."} for part in parts):
         raise BackupPathError("Archive member path contained traversal")
     for part in parts:
-        if part != part.rstrip(" ."):
+        if (
+            len(part.encode("utf-8")) > 255
+            or part != unicodedata.normalize("NFC", part)
+            or part != part.rstrip(" .")
+            or any(character in WINDOWS_FORBIDDEN_CHARACTERS for character in part)
+        ):
             raise BackupPathError("Archive member path was Windows-ambiguous")
         base = part.split(".", 1)[0].upper()
-        if base in WINDOWS_RESERVED_NAMES:
+        is_reserved = getattr(ntpath, "isreserved", lambda _value: False)
+        if base in WINDOWS_RESERVED_NAMES or is_reserved(part):
             raise BackupPathError("Archive member path used a reserved device name")
     normalized = PurePosixPath(*parts).as_posix()
     if normalized != raw:
@@ -342,6 +691,10 @@ def _safe_archive_path(raw: str, *, allow_manifest: bool = True) -> str:
     if len(parts) >= 2 and parts[0] == "vault":
         return raw
     raise BackupPathError("Archive member path was outside data and vault roots")
+
+
+def _portable_path_key(path: str) -> str:
+    return unicodedata.normalize("NFC", path).casefold()
 
 
 def _vault_files(vault: Path) -> Iterable[tuple[str, Path]]:
@@ -375,8 +728,11 @@ def _canonical_json(value: Any) -> bytes:
     ).encode("utf-8")
 
 
-def _manifest(records: list[_FileRecord]) -> tuple[bytes, str]:
+def _manifest(
+    records: list[_FileRecord], directories: tuple[str, ...]
+) -> tuple[bytes, str]:
     payload = {
+        "directories": list(directories),
         "files": [asdict(record) for record in records],
         "version": BACKUP_VERSION,
     }
@@ -407,13 +763,167 @@ def _snapshot_database(source: Path, destination: Path) -> None:
         raise BackupIntegrityError("SQLite backup could not produce a valid snapshot") from error
 
 
+def _open_database_snapshot(
+    snapshot_path: Path,
+    limits: BackupLimits,
+) -> _OpenSnapshotFile:
+    descriptor, identity = _open_regular_descriptor(
+        snapshot_path, "Staged database snapshot"
+    )
+    try:
+        size, sha256 = _descriptor_digest(descriptor, limits.max_file_bytes)
+        return _OpenSnapshotFile(
+            record=_FileRecord(DATABASE_ARCHIVE_PATH, size, sha256),
+            staged_path=snapshot_path,
+            staged_descriptor=descriptor,
+            staged_identity=identity,
+        )
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def _validate_database_vault_bindings(
+    database_snapshot: Path,
+    source_vault: Path,
+    vault_files: tuple[_OpenSnapshotFile, ...],
+) -> None:
+    records = {_portable_path_key(item.record.path): item.record for item in vault_files}
+    bindings = (
+        ("jd_snapshots", "raw_text_path", "raw_text_sha256", True),
+        ("resume_versions", "tex_path", "tex_sha256", True),
+        ("resume_versions", "pdf_path", "pdf_sha256", False),
+        ("ai_artifacts", "path", "sha256", True),
+        ("evidence_items", "source_path", "source_sha256", False),
+    )
+    try:
+        with closing(
+            sqlite3.connect(
+                f"{database_snapshot.as_uri()}?mode=ro&immutable=1",
+                uri=True,
+            )
+        ) as connection:
+            available_tables = {
+                row[0]
+                for row in connection.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'table'"
+                )
+            }
+            for table, path_column, checksum_column, must_be_vault_owned in bindings:
+                if table not in available_tables:
+                    continue
+                rows = connection.execute(
+                    f'SELECT "{path_column}", "{checksum_column}" FROM "{table}"'
+                ).fetchall()
+                for raw_path, expected_sha256 in rows:
+                    if raw_path is None and expected_sha256 is None:
+                        continue
+                    if type(raw_path) is not str or not raw_path:
+                        raise BackupIntegrityError(
+                            "Database and vault snapshot did not agree"
+                        )
+                    candidate = _absolute(raw_path)
+                    try:
+                        relative = candidate.relative_to(source_vault)
+                    except ValueError:
+                        if must_be_vault_owned:
+                            raise BackupIntegrityError(
+                                "Database referenced a path outside the vault"
+                            )
+                        continue
+                    if (
+                        type(expected_sha256) is not str
+                        or SHA256_PATTERN.fullmatch(expected_sha256) is None
+                    ):
+                        raise BackupIntegrityError(
+                            "Database and vault snapshot did not agree"
+                        )
+                    archive_path = _safe_archive_path(
+                        f"vault/{relative.as_posix()}", allow_manifest=False
+                    )
+                    observed = records.get(_portable_path_key(archive_path))
+                    if observed is None or not secrets_compare_digest(
+                        observed.sha256, expected_sha256
+                    ):
+                        raise BackupIntegrityError(
+                            "Database and vault snapshot did not agree"
+                        )
+    except BackupError:
+        raise
+    except sqlite3.Error as error:
+        raise BackupIntegrityError(
+            "Database and vault snapshot could not be cross-validated"
+        ) from error
+
+
+def _backup_snapshot_checkpoint(_boundary: str, _stage_path: Path) -> None:
+    return None
+
+
+def _write_snapshot_member(
+    archive: zipfile.ZipFile,
+    item: _OpenSnapshotFile,
+    limits: BackupLimits,
+) -> None:
+    _assert_descriptor_identity(
+        item.staged_path,
+        item.staged_descriptor,
+        item.staged_identity,
+        "Staged backup file",
+    )
+    digest = hashlib.sha256()
+    observed = 0
+    info = zipfile.ZipInfo(item.record.path)
+    info.compress_type = zipfile.ZIP_DEFLATED
+    info.create_system = 3
+    info.external_attr = (stat.S_IFREG | 0o600) << 16
+    os.lseek(item.staged_descriptor, 0, os.SEEK_SET)
+    with archive.open(info, "w", force_zip64=True) as output:
+        while True:
+            chunk = os.read(item.staged_descriptor, CHUNK_SIZE)
+            if not chunk:
+                break
+            observed += len(chunk)
+            if observed > limits.max_file_bytes or observed > item.record.size:
+                raise BackupIntegrityError(
+                    "Staged backup file exceeded its manifest size"
+                )
+            output.write(chunk)
+            digest.update(chunk)
+    _assert_descriptor_identity(
+        item.staged_path,
+        item.staged_descriptor,
+        item.staged_identity,
+        "Staged backup file",
+    )
+    if observed != item.record.size or not secrets_compare_digest(
+        digest.hexdigest(), item.record.sha256
+    ):
+        raise BackupIntegrityError("Staged backup bytes did not match the manifest")
+
+
+def _write_directory_member(archive: zipfile.ZipFile, path: str) -> None:
+    info = zipfile.ZipInfo(f"{path}/")
+    info.compress_type = zipfile.ZIP_STORED
+    info.create_system = 3
+    info.external_attr = (stat.S_IFDIR | 0o700) << 16
+    archive.writestr(info, b"")
+
+
 def _hash_path(path: Path, limit: int) -> tuple[int, str]:
     with open(os.devnull, "wb") as sink:
         return _stream_file(path, sink, limit)
 
 
+def _restore_archive_checkpoint(_boundary: str, _archive_path: Path) -> None:
+    return None
+
+
 def _atomic_rename(source: Path, destination: Path) -> None:
-    os.replace(source, destination)
+    if _IS_WINDOWS:
+        _windows_write_through_replace(source, destination)
+    else:
+        os.replace(source, destination)
 
 
 def _durable_rename(source: Path, destination: Path) -> None:
@@ -443,63 +953,77 @@ def create_backup(
     final_path = root / archive_name
     temp_path = root / f".{archive_name}.tmp"
     stage_path: Path | None = None
+    open_snapshot_files: list[_OpenSnapshotFile] = []
+    temp_descriptor = -1
     try:
         stage_path = Path(tempfile.mkdtemp(prefix=".careerops-backup-stage-", dir=root))
         snapshot_db = stage_path / "careerops.db"
         snapshot_vault = stage_path / "vault"
         snapshot_vault.mkdir()
+        vault_snapshot = _capture_vault_snapshot(vault, snapshot_vault, limits)
+        open_snapshot_files.extend(vault_snapshot.files)
         _snapshot_database(database, snapshot_db)
+        database_snapshot = _open_database_snapshot(snapshot_db, limits)
+        open_snapshot_files.append(database_snapshot)
+        _backup_snapshot_checkpoint("database_snapshotted", stage_path)
+        _revalidate_vault_snapshot(vault, vault_snapshot, limits)
+        _validate_database_vault_bindings(
+            snapshot_db,
+            vault,
+            vault_snapshot.files,
+        )
 
-        records: list[_FileRecord] = []
-        db_size, db_sha256 = _hash_path(snapshot_db, limits.max_file_bytes)
-        records.append(_FileRecord(DATABASE_ARCHIVE_PATH, db_size, db_sha256))
-        total_bytes = db_size
+        records = [item.record for item in open_snapshot_files]
+        records.sort(key=lambda item: item.path)
+        directories = tuple(sorted(vault_snapshot.directories))
+        total_bytes = sum(record.size for record in records)
         if total_bytes > limits.max_total_bytes:
             raise BackupIntegrityError("Backup exceeded its total size limit")
-        seen = {DATABASE_ARCHIVE_PATH.casefold()}
-        for archive_path, source in _vault_files(vault):
-            if len(records) >= limits.max_files:
-                raise BackupIntegrityError("Backup exceeded its file-count limit")
-            folded = archive_path.casefold()
-            if folded in seen:
-                raise BackupPathError("Vault paths collided after case normalization")
-            seen.add(folded)
-            destination = snapshot_vault / PurePosixPath(archive_path).relative_to("vault")
-            destination.parent.mkdir(parents=True, exist_ok=True)
-            with destination.open("xb") as output:
-                size, sha256 = _stream_file(source, output, limits.max_file_bytes)
-                output.flush()
-                os.fsync(output.fileno())
-            total_bytes += size
-            if total_bytes > limits.max_total_bytes:
-                raise BackupIntegrityError("Backup exceeded its total size limit")
-            records.append(_FileRecord(archive_path, size, sha256))
-        records.sort(key=lambda item: item.path)
-        manifest_bytes, manifest_sha256 = _manifest(records)
+        manifest_bytes, manifest_sha256 = _manifest(records, directories)
         if len(manifest_bytes) > limits.max_manifest_bytes:
             raise BackupIntegrityError("Backup manifest exceeded its size limit")
+        _backup_snapshot_checkpoint("manifest_built", stage_path)
 
-        with zipfile.ZipFile(
+        by_path = {item.record.path: item for item in open_snapshot_files}
+        temp_descriptor = os.open(
             temp_path,
-            mode="x",
-            compression=zipfile.ZIP_DEFLATED,
-            compresslevel=6,
-            allowZip64=True,
-        ) as archive:
-            archive.writestr(MANIFEST_ARCHIVE_PATH, manifest_bytes)
-            for record in records:
-                source = (
-                    snapshot_db
-                    if record.path == DATABASE_ARCHIVE_PATH
-                    else snapshot_vault / PurePosixPath(record.path).relative_to("vault")
-                )
-                archive.write(source, record.path)
-        _fsync_file(temp_path)
-        if temp_path.stat().st_size > limits.max_archive_bytes:
-            raise BackupIntegrityError("Backup archive exceeded its size limit")
-        archive_size, archive_sha256 = _hash_path(temp_path, limits.max_archive_bytes)
+            os.O_RDWR
+            | os.O_CREAT
+            | os.O_EXCL
+            | getattr(os, "O_BINARY", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+            0o600,
+        )
+        with os.fdopen(temp_descriptor, "w+b", closefd=False) as archive_stream:
+            with zipfile.ZipFile(
+                archive_stream,
+                mode="w",
+                compression=zipfile.ZIP_DEFLATED,
+                compresslevel=6,
+                allowZip64=True,
+            ) as archive:
+                archive.writestr(MANIFEST_ARCHIVE_PATH, manifest_bytes)
+                for archive_path in sorted({*by_path, *directories}):
+                    if archive_path in by_path:
+                        _write_snapshot_member(archive, by_path[archive_path], limits)
+                    else:
+                        _write_directory_member(archive, archive_path)
+            archive_stream.flush()
+            os.fsync(temp_descriptor)
+        temp_identity = _snapshot_identity(os.fstat(temp_descriptor))
+        archive_size, archive_sha256 = _descriptor_digest(
+            temp_descriptor, limits.max_archive_bytes
+        )
         if archive_size <= 0:
             raise BackupIntegrityError("Backup archive was empty")
+        _assert_descriptor_identity(
+            temp_path,
+            temp_descriptor,
+            temp_identity,
+            "Temporary backup archive",
+        )
+        os.close(temp_descriptor)
+        temp_descriptor = -1
         _atomic_rename(temp_path, final_path)
         _fsync_directory(root)
         return BackupResult(
@@ -514,6 +1038,10 @@ def create_backup(
     except OSError as error:
         raise BackupPathError("Backup could not be published atomically") from error
     finally:
+        if temp_descriptor >= 0:
+            os.close(temp_descriptor)
+        for item in open_snapshot_files:
+            item.close()
         if temp_path.exists() and not _is_link_or_reparse(temp_path):
             temp_path.unlink()
         if stage_path is not None and stage_path.exists() and not _is_link_or_reparse(stage_path):
@@ -534,16 +1062,32 @@ def _read_bounded(stream: BinaryIO, limit: int) -> bytes:
     return b"".join(chunks)
 
 
-def _validate_zip_info(info: zipfile.ZipInfo, limits: BackupLimits) -> str:
+def _validate_zip_info(
+    info: zipfile.ZipInfo, limits: BackupLimits
+) -> tuple[str, bool]:
     raw_name = getattr(info, "orig_filename", info.filename)
     if raw_name != info.filename:
         raise BackupPathError("Archive member path used platform-dependent separators")
-    path = _safe_archive_path(raw_name)
-    if info.is_dir() or info.flag_bits & 0x1:
-        raise BackupPathError("Archive members must be unencrypted regular files")
+    is_directory = info.is_dir()
+    normalized_name = raw_name[:-1] if is_directory and raw_name.endswith("/") else raw_name
+    path = _safe_archive_path(
+        normalized_name,
+        allow_manifest=not is_directory,
+    )
+    if info.flag_bits & 0x1:
+        raise BackupPathError("Archive members must not be encrypted")
     mode = info.external_attr >> 16
     file_type = stat.S_IFMT(mode)
-    if file_type not in {0, stat.S_IFREG}:
+    if is_directory:
+        if (
+            path in {MANIFEST_ARCHIVE_PATH, DATABASE_ARCHIVE_PATH}
+            or not path.startswith("vault/")
+            or info.file_size != 0
+            or file_type not in {0, stat.S_IFDIR}
+        ):
+            raise BackupPathError("Archive directory member was invalid")
+        return path, True
+    if raw_name.endswith("/") or file_type not in {0, stat.S_IFREG}:
         raise BackupPathError("Archive members must not be links or special files")
     if info.file_size < 0 or info.file_size > limits.max_file_bytes:
         raise BackupIntegrityError("Archive member exceeded its size limit")
@@ -554,22 +1098,40 @@ def _validate_zip_info(info: zipfile.ZipInfo, limits: BackupLimits) -> str:
     ratio = info.file_size / max(1, info.compress_size)
     if ratio > limits.max_compression_ratio:
         raise BackupIntegrityError("Archive member exceeded its compression-ratio limit")
-    return path
+    return path, False
 
 
-def _parse_manifest(raw: bytes) -> tuple[list[_FileRecord], str]:
+def _parse_manifest(
+    raw: bytes,
+) -> tuple[list[_FileRecord], tuple[str, ...], str, str]:
     try:
         value = json.loads(raw, object_pairs_hook=_strict_json_object)
     except (UnicodeError, ValueError, TypeError) as error:
         raise BackupIntegrityError("Backup manifest was not strict JSON") from error
-    if type(value) is not dict or set(value) != {"version", "files", "manifest_sha256"}:
+    if type(value) is not dict:
         raise BackupIntegrityError("Backup manifest shape was invalid")
-    if value["version"] != BACKUP_VERSION or type(value["files"]) is not list:
+    version = value.get("version")
+    expected_fields = (
+        {"version", "files", "manifest_sha256"}
+        if version == LEGACY_BACKUP_VERSION
+        else {"version", "directories", "files", "manifest_sha256"}
+    )
+    if (
+        set(value) != expected_fields
+        or version not in {LEGACY_BACKUP_VERSION, BACKUP_VERSION}
+        or type(value.get("files")) is not list
+        or (
+            version == BACKUP_VERSION
+            and type(value.get("directories")) is not list
+        )
+    ):
         raise BackupIntegrityError("Backup manifest version was unsupported")
     manifest_sha256 = value["manifest_sha256"]
     if type(manifest_sha256) is not str or SHA256_PATTERN.fullmatch(manifest_sha256) is None:
         raise BackupIntegrityError("Backup manifest checksum was invalid")
-    payload = {"files": value["files"], "version": value["version"]}
+    payload = {"files": value["files"], "version": version}
+    if version == BACKUP_VERSION:
+        payload["directories"] = value["directories"]
     expected = hashlib.sha256(_canonical_json(payload)).hexdigest()
     if not secrets_compare_digest(expected, manifest_sha256):
         raise BackupIntegrityError("Backup manifest checksum did not match")
@@ -580,7 +1142,7 @@ def _parse_manifest(raw: bytes) -> tuple[list[_FileRecord], str]:
         if type(item) is not dict or set(item) != {"path", "size", "sha256"}:
             raise BackupIntegrityError("Backup file manifest entry was invalid")
         path = _safe_archive_path(item["path"], allow_manifest=False)
-        folded = path.casefold()
+        folded = _portable_path_key(path)
         if folded in seen:
             raise BackupPathError("Backup manifest contained colliding paths")
         seen.add(folded)
@@ -595,7 +1157,46 @@ def _parse_manifest(raw: bytes) -> tuple[list[_FileRecord], str]:
         raise BackupIntegrityError("Backup manifest files were not sorted")
     if sum(item.path == DATABASE_ARCHIVE_PATH for item in records) != 1:
         raise BackupIntegrityError("Backup manifest did not declare one database")
-    return records, manifest_sha256
+    if version == BACKUP_VERSION:
+        raw_directories = value["directories"]
+        directories: list[str] = []
+        directory_keys: set[str] = set()
+        for raw_directory in raw_directories:
+            path = _safe_archive_path(raw_directory, allow_manifest=False)
+            if not path.startswith("vault/"):
+                raise BackupPathError("Backup directory was outside the vault")
+            key = _portable_path_key(path)
+            if key in seen or key in directory_keys:
+                raise BackupPathError("Backup manifest contained colliding paths")
+            directory_keys.add(key)
+            directories.append(path)
+        if directories != sorted(directories):
+            raise BackupIntegrityError("Backup manifest directories were not sorted")
+        for directory in directories:
+            parent = PurePosixPath(directory).parent
+            if parent != PurePosixPath("vault") and _portable_path_key(
+                parent.as_posix()
+            ) not in directory_keys:
+                raise BackupIntegrityError("Backup manifest omitted a parent directory")
+        for record in records:
+            if record.path == DATABASE_ARCHIVE_PATH:
+                continue
+            parent = PurePosixPath(record.path).parent
+            if parent != PurePosixPath("vault") and _portable_path_key(
+                parent.as_posix()
+            ) not in directory_keys:
+                raise BackupIntegrityError("Backup manifest omitted a parent directory")
+    else:
+        inferred: set[str] = set()
+        for record in records:
+            if record.path == DATABASE_ARCHIVE_PATH:
+                continue
+            parent = PurePosixPath(record.path).parent
+            while parent != PurePosixPath("vault"):
+                inferred.add(parent.as_posix())
+                parent = parent.parent
+        directories = sorted(inferred)
+    return records, tuple(directories), manifest_sha256, version
 
 
 def secrets_compare_digest(left: str, right: str) -> bool:
@@ -786,7 +1387,7 @@ def _write_restore_journals(transaction: _RestoreTransaction, phase: str) -> Non
                 stream.write(raw)
                 stream.flush()
                 os.fsync(stream.fileno())
-            os.replace(temporary, journal)
+            _atomic_rename(temporary, journal)
             _fsync_directory(journal.parent)
         except OSError as error:
             if temporary.exists() and not _is_link_or_reparse(temporary):
@@ -918,24 +1519,14 @@ def _validate_original_hold(path: Path, identity: tuple[int, int]) -> None:
 
 
 def _expected_topology_entry_count(
-    records: list[_FileRecord], target_kind: str
+    records: list[_FileRecord], directories: tuple[str, ...], target_kind: str
 ) -> int:
     if target_kind == "data":
         return 2
     if target_kind != "vault":
         raise RestoreTargetError("Restore recovery target kind was invalid")
-    directories = {"."}
-    files = 0
-    for record in records:
-        if record.path == DATABASE_ARCHIVE_PATH:
-            continue
-        relative = PurePosixPath(record.path).relative_to("vault")
-        files += 1
-        parent = relative.parent
-        while parent != PurePosixPath("."):
-            directories.add(parent.as_posix())
-            parent = parent.parent
-    return len(directories) + files
+    files = sum(record.path != DATABASE_ARCHIVE_PATH for record in records)
+    return 1 + len(directories) + files
 
 
 def _snapshot_restore_topology(
@@ -1093,6 +1684,7 @@ def _recover_restore_transaction(
         raise RestoreTargetError("Restore transaction did not match this backup")
     fully_committed = all(phase == "committed" for _item, phase in observed)
     if fully_committed:
+        state_is_committed = True
         for target, hold, stage, identity in (
             (layout.data, layout.data_hold, layout.data_stage, transaction.data_identity),
             (layout.vault, layout.vault_hold, layout.vault_stage, transaction.vault_identity),
@@ -1103,10 +1695,12 @@ def _recover_restore_transaction(
                 or stage.exists()
                 or stage.is_symlink()
             ):
-                raise RestoreTargetError("Committed restore transaction was incomplete")
+                state_is_committed = False
+                break
             if hold.exists() or hold.is_symlink():
                 _validate_original_hold(hold, identity)
-        return transaction
+        if state_is_committed:
+            return transaction
     try:
         _rollback_target(
             target=layout.vault,
@@ -1276,34 +1870,54 @@ def restore_backup(
     limits: BackupLimits = DEFAULT_LIMITS,
 ) -> RestoreResult:
     archive_path = _regular_file(archive_path, "Backup archive")
-    if archive_path.stat().st_size > limits.max_archive_bytes:
-        raise BackupIntegrityError("Backup archive exceeded its size limit")
-    archive_size, archive_sha256 = _hash_path(archive_path, limits.max_archive_bytes)
-    if archive_size <= 0:
-        raise BackupIntegrityError("Backup archive was empty")
     layout = _restore_layout(data_path, vault_path)
+    archive_descriptor = -1
+    archive_stream: BinaryIO | None = None
     recovered_commit: _RestoreTransaction | None = None
     targets: _RestoreTargets | None = None
     data_stage: Path | None = None
     vault_stage: Path | None = None
     published = False
     records: list[_FileRecord] = []
+    directories: tuple[str, ...] = ()
+    manifest_version = ""
     manifest_sha256 = ""
     total_bytes = 0
     try:
-        with zipfile.ZipFile(archive_path, "r") as archive:
+        archive_descriptor, archive_identity = _open_regular_descriptor(
+            archive_path, "Backup archive"
+        )
+        archive_size, archive_sha256 = _descriptor_digest(
+            archive_descriptor, limits.max_archive_bytes
+        )
+        if archive_size <= 0:
+            raise BackupIntegrityError("Backup archive was empty")
+        _restore_archive_checkpoint("archive_hashed", archive_path)
+        _assert_descriptor_identity(
+            archive_path,
+            archive_descriptor,
+            archive_identity,
+            "Backup archive",
+        )
+        os.lseek(archive_descriptor, 0, os.SEEK_SET)
+        archive_stream = os.fdopen(archive_descriptor, "rb", closefd=False)
+        with zipfile.ZipFile(archive_stream, "r") as archive:
             infos = archive.infolist()
             if len(infos) > limits.max_files + 1:
                 raise BackupIntegrityError("Backup exceeded its file-count limit")
             by_path: dict[str, zipfile.ZipInfo] = {}
+            directory_infos: dict[str, zipfile.ZipInfo] = {}
             folded_paths: set[str] = set()
             for info in infos:
-                path = _validate_zip_info(info, limits)
-                folded = path.casefold()
+                path, is_directory = _validate_zip_info(info, limits)
+                folded = _portable_path_key(path)
                 if folded in folded_paths:
                     raise BackupPathError("Backup archive contained duplicate or colliding paths")
                 folded_paths.add(folded)
-                by_path[path] = info
+                if is_directory:
+                    directory_infos[path] = info
+                else:
+                    by_path[path] = info
                 total_bytes += info.file_size
                 if total_bytes > limits.max_total_bytes + limits.max_manifest_bytes:
                     raise BackupIntegrityError("Backup exceeded its total size limit")
@@ -1314,12 +1928,22 @@ def restore_backup(
                 raise BackupIntegrityError("Backup manifest exceeded its size limit")
             with archive.open(manifest_info, "r") as manifest_stream:
                 manifest_bytes = _read_bounded(manifest_stream, limits.max_manifest_bytes)
-            records, manifest_sha256 = _parse_manifest(manifest_bytes)
-            if len(records) > limits.max_files:
+            (
+                records,
+                directories,
+                manifest_sha256,
+                manifest_version,
+            ) = _parse_manifest(manifest_bytes)
+            if len(records) + len(directories) > limits.max_files:
                 raise BackupIntegrityError("Backup exceeded its file-count limit")
             declared = {item.path for item in records}
             archived = set(by_path) - {MANIFEST_ARCHIVE_PATH}
-            if declared != archived:
+            if declared != archived or (
+                manifest_version == BACKUP_VERSION
+                and set(directories) != set(directory_infos)
+            ) or (
+                manifest_version == LEGACY_BACKUP_VERSION and directory_infos
+            ):
                 raise BackupIntegrityError("Backup contained missing or undeclared files")
             if sum(item.size for item in records) > limits.max_total_bytes:
                 raise BackupIntegrityError("Backup exceeded its declared total size limit")
@@ -1349,6 +1973,11 @@ def restore_backup(
                 layout.vault_stage.mkdir()
                 data_stage = layout.data_stage
                 vault_stage = layout.vault_stage
+                for directory in directories:
+                    destination = vault_stage / PurePosixPath(directory).relative_to(
+                        "vault"
+                    )
+                    destination.mkdir()
                 for record in records:
                     destination = (
                         data_stage / "careerops.db"
@@ -1356,6 +1985,14 @@ def restore_backup(
                         else vault_stage / PurePosixPath(record.path).relative_to("vault")
                     )
                     _extract_member(archive, by_path[record.path], destination, record, limits)
+
+        _restore_archive_checkpoint("archive_extracted", archive_path)
+        _assert_descriptor_identity(
+            archive_path,
+            archive_descriptor,
+            archive_identity,
+            "Backup archive",
+        )
 
         if recovered_commit is not None:
             if (
@@ -1413,11 +2050,15 @@ def restore_backup(
             raise BackupIntegrityError("Restored database was not valid SQLite") from error
         data_topology = _snapshot_restore_topology(
             data_stage,
-            expected_entries=_expected_topology_entry_count(records, "data"),
+            expected_entries=_expected_topology_entry_count(
+                records, directories, "data"
+            ),
         )
         vault_topology = _snapshot_restore_topology(
             vault_stage,
-            expected_entries=_expected_topology_entry_count(records, "vault"),
+            expected_entries=_expected_topology_entry_count(
+                records, directories, "vault"
+            ),
         )
         transaction = _RestoreTransaction(
             layout=layout,
@@ -1445,6 +2086,10 @@ def restore_backup(
             raise
         raise BackupIntegrityError("Backup archive was corrupt or unreadable") from error
     finally:
+        if archive_stream is not None:
+            archive_stream.close()
+        if archive_descriptor >= 0:
+            os.close(archive_descriptor)
         if not published and not _restore_journals_exist(layout):
             _safe_remove_tree(data_stage, layout.data.parent)
             _safe_remove_tree(vault_stage, layout.vault.parent)

@@ -214,25 +214,45 @@ def test_compose_healthchecks_and_least_privilege_are_enabled():
         assert any(item.startswith("/tmp:") for item in service["tmpfs"])
     assert config["services"]["careerops"]["depends_on"]["ollama"]["condition"] == "service_healthy"
     assert (
+        config["services"]["careerops"]["depends_on"]["storage-init"]["condition"]
+        == "service_completed_successfully"
+    )
+    assert (
         config["services"]["careerops"]["depends_on"]["runtime-inspector"]["condition"]
         == "service_healthy"
     )
 
 
-def test_compose_runtime_inspector_is_internal_unpublished_and_socket_scoped():
+def test_compose_runtime_inspector_uses_get_only_socket_proxy():
     config = compose_config()
     inspector = config["services"]["runtime-inspector"]
+    proxy = config["services"]["docker-socket-proxy"]
 
     assert set(inspector["networks"]) == {"attestation_private"}
     assert config["networks"]["attestation_private"]["internal"] is True
     assert "ports" not in inspector
     assert "expose" not in inspector
     assert inspector["read_only"] is True
+    assert inspector["user"] == "1000:1000"
     assert "ALL" in inspector["cap_drop"]
     assert "no-new-privileges:true" in inspector["security_opt"]
-    socket_mount = next(
-        item for item in inspector["volumes"] if item["target"] == "/var/run/docker.sock"
+    assert not inspector.get("volumes")
+    assert "environment" not in inspector
+    assert inspector["depends_on"]["docker-socket-proxy"]["condition"] == "service_healthy"
+    assert set(proxy["networks"]) == {"attestation_private"}
+    assert proxy["environment"]["POST"] == "0"
+    assert proxy["environment"]["CONTAINERS"] == "1"
+    assert proxy["environment"]["NETWORKS"] == "1"
+    assert proxy["environment"]["VERSION"] == "1"
+    assert all(
+        proxy["environment"][name] == "0"
+        for name in ("AUTH", "BUILD", "COMMIT", "CONFIGS", "DISTRIBUTION", "EVENTS", "EXEC", "IMAGES", "INFO", "NODES", "PLUGINS", "SECRETS", "SERVICES", "SESSION", "SWARM", "SYSTEM", "TASKS", "VOLUMES")
     )
+    assert re.fullmatch(
+        r"tecnativa/docker-socket-proxy@sha256:[0-9a-f]{64}",
+        proxy["image"],
+    )
+    socket_mount = next(item for item in proxy["volumes"] if item["target"] == "/var/run/docker.sock")
     assert socket_mount["read_only"] is True
     assert inspector["command"] == [
         "python",
@@ -243,11 +263,68 @@ def test_compose_runtime_inspector_is_internal_unpublished_and_socket_scoped():
 
 def test_compose_remains_self_hosted_without_paid_managed_dependencies():
     config = compose_config()
-    assert set(config["services"]) == {"careerops", "ollama", "runtime-inspector"}
+    assert set(config["services"]) == {
+        "careerops",
+        "storage-init",
+        "ollama-bootstrap",
+        "ollama",
+        "runtime-inspector",
+        "docker-socket-proxy",
+    }
     assert Path(config["services"]["careerops"]["build"]["context"]).resolve() == ROOT.resolve()
     image = config["services"]["ollama"]["image"]
     assert re.fullmatch(r"ollama/ollama@sha256:[0-9a-f]{64}", image)
+    assert config["services"]["ollama-bootstrap"]["image"] == image
+    assert "${CAREEROPS_OLLAMA_IMAGE" not in (ROOT / "compose.yaml").read_text(encoding="utf-8")
     assert not any(
         key in config["services"]["careerops"]["environment"]
         for key in ("OPENAI_API_KEY", "ANTHROPIC_API_KEY", "AWS_ACCESS_KEY_ID")
     )
+
+
+def test_compose_bootstraps_exact_model_before_no_egress_runtime():
+    config = compose_config()
+    services = config["services"]
+    bootstrap = services["ollama-bootstrap"]
+    ollama = services["ollama"]
+
+    assert bootstrap["restart"] == "no"
+    assert set(bootstrap["networks"]) == {"model_bootstrap_egress"}
+    assert config["networks"]["model_bootstrap_egress"].get("internal", False) is False
+    assert set(ollama["networks"]) == {"ollama_private"}
+    assert config["networks"]["ollama_private"]["internal"] is True
+    assert ollama["depends_on"]["ollama-bootstrap"]["condition"] == "service_completed_successfully"
+    assert bootstrap["environment"]["CAREEROPS_OLLAMA_MODEL"] == "qwen2.5:7b"
+    assert bootstrap["environment"]["OLLAMA_NO_CLOUD"] == "1"
+    bootstrap_command = " ".join(bootstrap["command"])
+    assert "attempts=0" in bootstrap_command
+    assert "-ge 120" in bootstrap_command
+    assert 'ollama show "$$CAREEROPS_OLLAMA_MODEL"' in bootstrap_command
+    assert 'ollama pull "$$CAREEROPS_OLLAMA_MODEL"' in bootstrap_command
+    health_command = " ".join(ollama["healthcheck"]["test"])
+    assert "ollama list" in health_command and "exit 1" in health_command
+    assert 'ollama show "$${CAREEROPS_OLLAMA_MODEL}"' in health_command
+    assert "exit 2" in health_command
+
+
+def test_compose_initializes_bind_storage_before_unprivileged_api():
+    config = compose_config()
+    services = config["services"]
+    initializer = services["storage-init"]
+    api = services["careerops"]
+
+    assert initializer["restart"] == "no"
+    assert initializer["network_mode"] == "none"
+    assert initializer["user"] == "0:0"
+    assert initializer["cap_drop"] == ["ALL"]
+    assert initializer["cap_add"] == ["CHOWN"]
+    assert "environment" not in initializer
+    assert initializer["command"][:3] == [
+        "python",
+        "-m",
+        "careerops.operations.storage_init",
+    ]
+    init_mounts = {item["target"]: item for item in initializer["volumes"]}
+    assert set(init_mounts) == {"/app/data", "/app/vault", "/app/backups"}
+    assert api["user"] == "1000:1000"
+    assert api["depends_on"]["storage-init"]["condition"] == "service_completed_successfully"

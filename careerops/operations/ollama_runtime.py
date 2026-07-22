@@ -33,6 +33,20 @@ CONTAINER_IMAGE_REFERENCE_PATTERN = re.compile(
     r"[a-z0-9][a-z0-9._:/-]*@sha256:[0-9a-f]{64}\Z"
 )
 CONTAINER_IMAGE_ID_PATTERN = re.compile(r"sha256:[0-9a-f]{64}\Z")
+PROCESS_START_PATTERN = re.compile(
+    r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{7}Z\Z"
+)
+FIREWALL_TOKEN_PATTERN = re.compile(r"[0-9a-f]{32}\Z")
+WINDOWS_LAUNCHER_ENV_ALLOWLIST = (
+    "SystemRoot",
+    "WINDIR",
+    "COMSPEC",
+    "PATHEXT",
+    "PATH",
+    "PSModulePath",
+    "TEMP",
+    "TMP",
+)
 
 
 class ManagedRuntimeError(RuntimeError):
@@ -64,6 +78,10 @@ class RuntimeLaunchRecord:
     container_id: str | None
     container_image_reference: str | None
     container_image_id: str | None
+    process_started_at: str | None
+    executable_sha256: str | None
+    executable_size: int | None
+    firewall_rule_token: str | None
     egress_policy: Literal["os_firewall_block", "container_internal_no_egress"]
     egress_enforced: bool
     cloud_disabled: bool
@@ -92,6 +110,14 @@ class RuntimeLaunchRecord:
                 or self.container_id is not None
                 or self.container_image_reference is not None
                 or self.container_image_id is not None
+                or type(self.process_started_at) is not str
+                or PROCESS_START_PATTERN.fullmatch(self.process_started_at) is None
+                or type(self.executable_sha256) is not str
+                or SHA256_PATTERN.fullmatch(self.executable_sha256) is None
+                or type(self.executable_size) is not int
+                or self.executable_size <= 0
+                or type(self.firewall_rule_token) is not str
+                or FIREWALL_TOKEN_PATTERN.fullmatch(self.firewall_rule_token) is None
                 or self.runtime_handle != f"pid:{self.process_id}"
                 or self.egress_policy != "os_firewall_block"
             ):
@@ -109,6 +135,10 @@ class RuntimeLaunchRecord:
                 or type(self.container_image_id) is not str
                 or CONTAINER_IMAGE_ID_PATTERN.fullmatch(self.container_image_id)
                 is None
+                or self.process_started_at is not None
+                or self.executable_sha256 is not None
+                or self.executable_size is not None
+                or self.firewall_rule_token is not None
                 or self.runtime_handle != f"container:{self.container_id}"
                 or self.egress_policy != "container_internal_no_egress"
             ):
@@ -118,6 +148,7 @@ class RuntimeLaunchRecord:
 
 
 class ManagedRuntimeLauncher(Protocol):
+    owns_runtime_lifecycle: bool
     def launch(self, *, model: str, runtime_root: Path) -> RuntimeLaunchRecord: ...
     def verify(self, record: RuntimeLaunchRecord) -> bool: ...
     def cleanup(self, record: RuntimeLaunchRecord) -> None: ...
@@ -481,6 +512,8 @@ def _find_ollama() -> Path:
 
 
 class WindowsPowerShellOllamaLauncher:
+    owns_runtime_lifecycle = True
+
     def __init__(
         self,
         *,
@@ -547,15 +580,21 @@ class WindowsPowerShellOllamaLauncher:
             str(record.process_id),
             "-IsolationRuleId",
             record.isolation_rule_id,
+            "-ProcessStartedAt",
+            record.process_started_at or "",
+            "-ExecutableSha256",
+            record.executable_sha256 or "",
+            "-ExecutableSize",
+            str(record.executable_size or 0),
+            "-FirewallRuleToken",
+            record.firewall_rule_token or "",
         ]
 
     def _run(self, command: list[str]) -> dict[str, Any]:
         child_environment = {
             key: value
-            for key, value in os.environ.items()
-            if not key.upper().startswith("OLLAMA_")
-            and not key.upper().startswith("CAREEROPS_OLLAMA_")
-            and key.upper() not in {"HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY"}
+            for key in WINDOWS_LAUNCHER_ENV_ALLOWLIST
+            if (value := os.environ.get(key)) is not None
         }
         child_environment.update(
             {"NO_PROXY": "127.0.0.1,localhost", "no_proxy": "127.0.0.1,localhost"}
@@ -599,6 +638,10 @@ class WindowsPowerShellOllamaLauncher:
             "container_id",
             "container_image_reference",
             "container_image_id",
+            "process_started_at",
+            "executable_sha256",
+            "executable_size",
+            "firewall_rule_token",
             "egress_policy",
             "egress_enforced",
             "cloud_disabled",
@@ -670,6 +713,7 @@ class DockerComposeOllamaLauncher:
 
     _INSPECTOR_ORIGIN = "http://runtime-inspector:8766"
     _MAX_RESPONSE_BYTES = 64 * 1024
+    owns_runtime_lifecycle = False
 
     def __init__(self, *, transport: InspectorTransport | None = None):
         self._transport = transport or self._request_inspector
@@ -711,22 +755,6 @@ class DockerComposeOllamaLauncher:
                 raise ManagedRuntimeLaunchError(
                     "Managed container runtime binding was unavailable"
                 )
-        payload = self._call(
-            "POST",
-            "/v1/ollama-runtime/cleanup",
-            {
-                "runtime_instance_id": record.runtime_instance_id,
-                "container_id": record.container_id,
-            },
-        )
-        if payload != {
-            "stopped": True,
-            "runtime_instance_id": record.runtime_instance_id,
-        }:
-            raise ManagedRuntimeLaunchError(
-                "Managed container cleanup result was invalid"
-            )
-        with self._lock:
             self._active.pop(record.runtime_instance_id, None)
 
     def _call(
@@ -761,6 +789,10 @@ class DockerComposeOllamaLauncher:
             "container_id",
             "container_image_reference",
             "container_image_id",
+            "process_started_at",
+            "executable_sha256",
+            "executable_size",
+            "firewall_rule_token",
             "egress_policy",
             "egress_enforced",
             "cloud_disabled",
@@ -794,7 +826,7 @@ class DockerComposeOllamaLauncher:
         path: str,
         body: dict[str, Any] | None,
     ) -> dict[str, Any]:
-        if method not in {"GET", "POST"} or not path.startswith("/v1/ollama-runtime"):
+        if method != "GET" or not path.startswith("/v1/ollama-runtime") or body is not None:
             raise ManagedRuntimeConfigurationError(
                 "Managed container inspector request was invalid"
             )

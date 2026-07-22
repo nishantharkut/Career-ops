@@ -1,4 +1,39 @@
 services:
+  storage-init:
+    build:
+      context: .
+    command:
+      - python
+      - -m
+      - careerops.operations.storage_init
+      - --uid
+      - "${CAREEROPS_UID:-1000}"
+      - --gid
+      - "${CAREEROPS_GID:-1000}"
+      - /app/data
+      - /app/vault
+      - /app/backups
+    restart: "no"
+    network_mode: none
+    user: "0:0"
+    read_only: true
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+    security_opt:
+      - no-new-privileges:true
+    volumes:
+      - type: bind
+        source: ./data
+        target: /app/data
+      - type: bind
+        source: ./vault
+        target: /app/vault
+      - type: bind
+        source: ./backups
+        target: /app/backups
+
   careerops:
     build:
       context: .
@@ -45,6 +80,8 @@ services:
       - ollama_private
       - attestation_private
     depends_on:
+      storage-init:
+        condition: service_completed_successfully
       ollama:
         condition: service_healthy
         restart: true
@@ -72,20 +109,20 @@ services:
       - -m
       - careerops.operations.container_runtime_inspector
     restart: unless-stopped
+    user: "${CAREEROPS_UID:-1000}:${CAREEROPS_GID:-1000}"
     read_only: true
     cap_drop:
       - ALL
     security_opt:
       - no-new-privileges:true
-    volumes:
-      - type: bind
-        source: /var/run/docker.sock
-        target: /var/run/docker.sock
-        read_only: true
     tmpfs:
       - /tmp:rw,noexec,nosuid,nodev,size=64m
     networks:
       - attestation_private
+    depends_on:
+      docker-socket-proxy:
+        condition: service_healthy
+        restart: true
     healthcheck:
       test:
         [
@@ -99,8 +136,101 @@ services:
       retries: 3
       start_period: 10s
 
+  docker-socket-proxy:
+    image: tecnativa/docker-socket-proxy@sha256:1f3a6f303320723d199d2316a3e82b2e2685d86c275d5e3deeaf182573b47476
+    restart: unless-stopped
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    environment:
+      POST: "0"
+      CONTAINERS: "1"
+      NETWORKS: "1"
+      VERSION: "1"
+      AUTH: "0"
+      BUILD: "0"
+      COMMIT: "0"
+      CONFIGS: "0"
+      DISTRIBUTION: "0"
+      EVENTS: "0"
+      EXEC: "0"
+      IMAGES: "0"
+      INFO: "0"
+      NODES: "0"
+      PLUGINS: "0"
+      SECRETS: "0"
+      SERVICES: "0"
+      SESSION: "0"
+      SWARM: "0"
+      SYSTEM: "0"
+      TASKS: "0"
+      VOLUMES: "0"
+    volumes:
+      - type: bind
+        source: /var/run/docker.sock
+        target: /var/run/docker.sock
+        read_only: true
+    tmpfs:
+      - /run:rw,noexec,nosuid,nodev,size=16m
+      - /tmp:rw,noexec,nosuid,nodev,size=16m
+    networks:
+      - attestation_private
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "wget -q -O - http://127.0.0.1:2375/version >/dev/null 2>&1"
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  ollama-bootstrap:
+    image: ollama/ollama@sha256:6345fbc18bd73a1e16404be681dbc6fd291a027cab43ed541abe78c4c81051b0
+    entrypoint:
+      - /bin/sh
+      - -ec
+    command:
+      - |
+        ollama serve >/tmp/ollama-bootstrap.log 2>&1 &
+        pid=$$!
+        trap 'kill "$$pid" >/dev/null 2>&1 || true' EXIT
+        attempts=0
+        until ollama list >/dev/null 2>&1; do
+          attempts=$$((attempts + 1))
+          if [ "$$attempts" -ge 120 ]; then exit 11; fi
+          sleep 1
+        done
+        if ! ollama show "$$CAREEROPS_OLLAMA_MODEL" >/dev/null 2>&1; then
+          ollama pull "$$CAREEROPS_OLLAMA_MODEL"
+        fi
+        ollama show "$$CAREEROPS_OLLAMA_MODEL" >/dev/null 2>&1
+    restart: "no"
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    environment:
+      OLLAMA_HOST: 127.0.0.1:11434
+      OLLAMA_NO_CLOUD: "1"
+      OLLAMA_MODELS: /root/.ollama/models
+      CAREEROPS_OLLAMA_MODEL: ${CAREEROPS_OLLAMA_MODEL:-qwen2.5:7b}
+      HOME: /root
+    volumes:
+      - type: volume
+        source: ollama_models
+        target: /root/.ollama
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=256m
+    networks:
+      - model_bootstrap_egress
+
   ollama:
-    image: ${CAREEROPS_OLLAMA_IMAGE:-ollama/ollama@sha256:6345fbc18bd73a1e16404be681dbc6fd291a027cab43ed541abe78c4c81051b0}
+    image: ollama/ollama@sha256:6345fbc18bd73a1e16404be681dbc6fd291a027cab43ed541abe78c4c81051b0
     restart: unless-stopped
     read_only: true
     cap_drop:
@@ -125,11 +255,14 @@ services:
       - /tmp:rw,noexec,nosuid,nodev,size=256m
     networks:
       - ollama_private
+    depends_on:
+      ollama-bootstrap:
+        condition: service_completed_successfully
     healthcheck:
       test:
         [
           "CMD-SHELL",
-          "ollama show \"$${CAREEROPS_OLLAMA_MODEL}\" >/dev/null 2>&1"
+          "ollama list >/dev/null 2>&1 || exit 1; ollama show \"$${CAREEROPS_OLLAMA_MODEL}\" >/dev/null 2>&1 || exit 2"
         ]
       interval: 30s
       timeout: 10s
@@ -145,6 +278,8 @@ networks:
   attestation_private:
     driver: bridge
     internal: true
+  model_bootstrap_egress:
+    driver: bridge
 
 volumes:
   ollama_models:

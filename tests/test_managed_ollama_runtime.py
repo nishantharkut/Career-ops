@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import MISSING, replace
 from copy import deepcopy
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -36,6 +37,10 @@ GOOD_SHOW_SHA = "c" * 64
 CONTAINER_IMAGE_C = "ollama/ollama@sha256:" + ("c" * 64)
 CONTAINER_IMAGE_E = "ollama/ollama@sha256:" + ("e" * 64)
 CONTAINER_IMAGE_ID = "sha256:" + ("d" * 64)
+PROCESS_STARTED_AT = "2026-07-22T10:00:00.0000000Z"
+PROCESS_EXECUTABLE_SHA256 = "e" * 64
+PROCESS_EXECUTABLE_SIZE = 12_345_678
+FIREWALL_RULE_TOKEN = "f" * 32
 
 
 class FakeProvider:
@@ -110,6 +115,10 @@ def _record(
         "container_id": None,
         "container_image_reference": None,
         "container_image_id": None,
+        "process_started_at": PROCESS_STARTED_AT,
+        "executable_sha256": PROCESS_EXECUTABLE_SHA256,
+        "executable_size": PROCESS_EXECUTABLE_SIZE,
+        "firewall_rule_token": FIREWALL_RULE_TOKEN,
         "egress_policy": "os_firewall_block",
         "egress_enforced": True,
         "cloud_disabled": True,
@@ -363,8 +372,15 @@ def test_windows_launcher_script_owns_hidden_process_and_firewall_boundary():
     ).read_text(encoding="utf-8")
 
     assert "Mandatory = $true" in script
+    assert "ProcessStartInfo" in script
+    assert "EnvironmentVariables.Clear()" in script
+    assert '$Info.Arguments = "serve"' in script
+    assert "$Info.CreateNoWindow = $true" in script
+    assert "ProcessWindowStyle]::Hidden" in script
     assert "Start-Process" in script
     assert "-WindowStyle Hidden" in script
+    assert "Get-ChildItem Env:" in script
+    assert "Remove-Item -LiteralPath \"Env:" in script
     assert "New-NetFirewallRule" in script
     assert "Get-NetFirewallRule" in script
     assert "Get-NetFirewallAddressFilter" in script
@@ -386,7 +402,7 @@ def test_windows_launcher_script_owns_hidden_process_and_firewall_boundary():
     assert "CAREEROPS_OLLAMA_EGRESS_ENFORCED" not in script
     assert "Invoke-RestMethod" not in script
     assert 'Join-Path $ResolvedRuntimeRoot "models"' in script
-    assert '$env:OLLAMA_MODELS = $ManagedModelsPath' in script
+    assert '$Info.EnvironmentVariables["OLLAMA_MODELS"] = $ManagedModelsPath' in script
     assert "Get-NetTCPConnection" in script
     assert "OwningProcess" in script
     assert "Assert-EndpointOwnedByProcess" in script
@@ -410,6 +426,9 @@ def test_windows_launcher_uses_argument_lists_and_scrubs_ambient_ollama_state(
     monkeypatch.setenv("OLLAMA_NO_CLOUD", "0")
     monkeypatch.setenv("OLLAMA_API_KEY", "must-not-reach-child")
     monkeypatch.setenv("HTTPS_PROXY", "https://proxy.invalid")
+    monkeypatch.setenv("CAREEROPS_AUTH_PASSWORD", "must-not-reach-launcher")
+    monkeypatch.setenv("OPENAI_API_KEY", "must-not-reach-launcher")
+    monkeypatch.setenv("CODEX_HOME", "C:\\private-codex-home")
     calls = []
     record_payload = {
         "endpoint": "http://127.0.0.1:11434",
@@ -421,6 +440,10 @@ def test_windows_launcher_uses_argument_lists_and_scrubs_ambient_ollama_state(
         "container_id": None,
         "container_image_reference": None,
         "container_image_id": None,
+        "process_started_at": PROCESS_STARTED_AT,
+        "executable_sha256": PROCESS_EXECUTABLE_SHA256,
+        "executable_size": PROCESS_EXECUTABLE_SIZE,
+        "firewall_rule_token": FIREWALL_RULE_TOKEN,
         "egress_policy": "os_firewall_block",
         "egress_enforced": True,
         "cloud_disabled": True,
@@ -456,6 +479,23 @@ def test_windows_launcher_uses_argument_lists_and_scrubs_ambient_ollama_state(
         assert not any(key.startswith("OLLAMA_") for key in environment)
         assert "CAREEROPS_OLLAMA_EGRESS_ENFORCED" not in environment
         assert "HTTPS_PROXY" not in environment
+        assert "CAREEROPS_AUTH_PASSWORD" not in environment
+        assert "OPENAI_API_KEY" not in environment
+        assert "CODEX_HOME" not in environment
+        assert set(environment).issubset(
+            {
+                "SystemRoot",
+                "WINDIR",
+                "COMSPEC",
+                "PATHEXT",
+                "PATH",
+                "PSModulePath",
+                "TEMP",
+                "TMP",
+                "NO_PROXY",
+                "no_proxy",
+            }
+        )
         assert environment["NO_PROXY"] == "127.0.0.1,localhost"
 
 
@@ -477,6 +517,76 @@ def test_runtime_record_requires_explicit_container_image_identity_fields():
 
     assert fields["container_image_reference"].default is MISSING
     assert fields["container_image_id"].default is MISSING
+    assert fields["process_started_at"].default is MISSING
+    assert fields["executable_sha256"].default is MISSING
+    assert fields["executable_size"].default is MISSING
+    assert fields["firewall_rule_token"].default is MISSING
+
+
+@pytest.mark.skipif(
+    shutil.which("pwsh") is None and shutil.which("powershell") is None,
+    reason="PowerShell is unavailable",
+)
+def test_windows_child_process_environment_is_an_explicit_secret_free_allowlist(
+    tmp_path: Path,
+):
+    powershell = shutil.which("pwsh") or shutil.which("powershell")
+    script = (
+        Path(__file__).resolve().parents[1] / "scripts" / "start-managed-ollama.ps1"
+    )
+    harness = tmp_path / "environment-harness.ps1"
+    harness.write_text(
+        r'''
+param([string]$ScriptPath, [string]$Executable, [string]$Models)
+. $ScriptPath -Action Recover -ExecutablePath $Executable -Model "qwen2.5:7b" -RuntimeRoot $Models
+$env:CAREEROPS_AUTH_PASSWORD = "must-not-reach-ollama"
+$env:OPENAI_API_KEY = "must-not-reach-ollama"
+$env:CODEX_HOME = "must-not-reach-ollama"
+$Info = New-OllamaProcessStartInfo -OwnedExecutable $Executable -ManagedModelsPath $Models -OwnedPort 11434
+$Observed = @{}
+foreach ($Name in $Info.EnvironmentVariables.Keys) { $Observed[$Name] = $Info.EnvironmentVariables[$Name] }
+$Expected = @("OLLAMA_HOST", "OLLAMA_NO_CLOUD", "OLLAMA_MODELS", "NO_PROXY", "no_proxy", "PATH", "SystemRoot", "WINDIR", "TEMP", "TMP")
+if (@($Observed.Keys | Where-Object { $_ -notin $Expected }).Count -ne 0) { throw "unexpected inherited environment" }
+if ($Observed.ContainsKey("CAREEROPS_AUTH_PASSWORD") -or $Observed.ContainsKey("OPENAI_API_KEY") -or $Observed.ContainsKey("CODEX_HOME")) { throw "secret inherited" }
+if ($Observed["OLLAMA_NO_CLOUD"] -ne "1" -or $Observed["OLLAMA_HOST"] -ne "127.0.0.1:11434") { throw "managed environment missing" }
+Set-OllamaProcessEnvironment -Variables $Info.EnvironmentVariables
+$Applied = @{}
+foreach ($Variable in Get-ChildItem Env:) { $Applied[$Variable.Name] = $Variable.Value }
+if (@($Applied.Keys | Where-Object { $_ -notin $Expected }).Count -ne 0) { throw "applied environment inherited unexpected state" }
+if ($Applied.ContainsKey("CAREEROPS_AUTH_PASSWORD") -or $Applied.ContainsKey("OPENAI_API_KEY") -or $Applied.ContainsKey("CODEX_HOME")) { throw "applied environment inherited secret" }
+$Observed | ConvertTo-Json -Compress
+''',
+        encoding="utf-8",
+    )
+    executable = tmp_path / "ollama.exe"
+    executable.write_bytes(b"fixture")
+    models = tmp_path / "models"
+    models.mkdir()
+
+    completed = subprocess.run(
+        [
+            powershell,
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            str(harness),
+            "-ScriptPath",
+            str(script),
+            "-Executable",
+            str(executable),
+            "-Models",
+            str(models),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+
+    assert completed.returncode == 0, completed.stderr
 
 
 def test_windows_launcher_recovers_durable_launch_record_after_timeout(
@@ -535,9 +645,12 @@ def test_windows_recovery_state_machine_removes_intent_and_launched_resources(
     fixture_executable = tmp_path / "fixture-ollama.exe"
     fixture_executable.write_bytes(b"fixture")
 
-    for instance, process_id, state in (
-        ("runtime-intent", 0, "intent"),
-        ("runtime-launched", 4201, "launched"),
+    executable_digest = hashlib.sha256(b"owned").hexdigest()
+    for instance, process_id, state, rule_token in (
+        ("runtime-intent", 0, "intent", "1" * 32),
+        ("runtime-launched", 4201, "launched", "2" * 32),
+        ("runtime-starting", 0, "firewall_ready", "4" * 32),
+        ("runtime-intent-started", 0, "intent", "5" * 32),
     ):
         instance_root = runtime_root / instance
         owned_executable = instance_root / "bin" / "ollama.exe"
@@ -546,7 +659,7 @@ def test_windows_recovery_state_machine_removes_intent_and_launched_resources(
         (instance_root / "launch-record.json").write_text(
             json.dumps(
                 {
-                    "version": 1,
+                    "version": 2,
                     "runtime_instance_id": instance,
                     "isolation_rule_id": f"CareerOps-Ollama-{instance}",
                     "owned_executable": str(owned_executable),
@@ -554,6 +667,10 @@ def test_windows_recovery_state_machine_removes_intent_and_launched_resources(
                     "model": "qwen2.5:7b",
                     "process_id": process_id,
                     "runtime_handle": f"pid:{process_id}" if process_id else "",
+                    "process_started_at": PROCESS_STARTED_AT if process_id else "",
+                    "executable_sha256": executable_digest,
+                    "executable_size": len(b"owned"),
+                    "firewall_rule_token": rule_token,
                     "state": state,
                 }
             ),
@@ -565,25 +682,49 @@ def test_windows_recovery_state_machine_removes_intent_and_launched_resources(
         r'''
 param([string]$ScriptPath, [string]$Root, [string]$FixtureExecutable)
 . $ScriptPath -Action Recover -ExecutablePath $FixtureExecutable -Model "qwen2.5:7b" -RuntimeRoot $Root
+$script:HarnessRoot = $Root
 $script:RemovedRules = @()
 $script:StoppedProcesses = @()
+$script:Rules = @{
+    "CareerOps-Ollama-runtime-intent" = [pscustomobject]@{ Name = "CareerOps-Ollama-runtime-intent"; DisplayName = "CareerOps-Ollama-runtime-intent"; Description = "CareerOps managed Ollama runtime 11111111111111111111111111111111"; Enabled = "True"; Direction = "Outbound"; Action = "Block"; Profile = "Any" }
+    "CareerOps-Ollama-runtime-launched" = [pscustomobject]@{ Name = "CareerOps-Ollama-runtime-launched"; DisplayName = "CareerOps-Ollama-runtime-launched"; Description = "CareerOps managed Ollama runtime 22222222222222222222222222222222"; Enabled = "True"; Direction = "Outbound"; Action = "Block"; Profile = "Any" }
+    "CareerOps-Ollama-runtime-starting" = [pscustomobject]@{ Name = "CareerOps-Ollama-runtime-starting"; DisplayName = "CareerOps-Ollama-runtime-starting"; Description = "CareerOps managed Ollama runtime 44444444444444444444444444444444"; Enabled = "True"; Direction = "Outbound"; Action = "Block"; Profile = "Any" }
+    "CareerOps-Ollama-runtime-intent-started" = [pscustomobject]@{ Name = "CareerOps-Ollama-runtime-intent-started"; DisplayName = "CareerOps-Ollama-runtime-intent-started"; Description = "CareerOps managed Ollama runtime 55555555555555555555555555555555"; Enabled = "True"; Direction = "Outbound"; Action = "Block"; Profile = "Any" }
+    "CareerOps-Ollama-foreign" = [pscustomobject]@{ Name = "CareerOps-Ollama-foreign"; DisplayName = "Foreign"; Description = "not owned"; Enabled = "True"; Direction = "Outbound"; Action = "Block"; Profile = "Any" }
+}
 function Get-NetFirewallRule {
     [CmdletBinding()]
     param([string]$Name)
-    return [pscustomobject]@{ Name = $Name }
+    return $script:Rules[$Name]
 }
 function Remove-NetFirewallRule {
     [CmdletBinding()]
     param([string]$Name)
     $script:RemovedRules += $Name
+    $script:Rules.Remove($Name)
+}
+function Get-NetFirewallApplicationFilter {
+    [CmdletBinding()]
+    param([Parameter(ValueFromPipeline = $true)]$InputObject)
+    process {
+        $Instance = $InputObject.Name.Replace("CareerOps-Ollama-", "")
+        [pscustomobject]@{ Program = (Join-Path $script:HarnessRoot "$Instance/bin/ollama.exe") }
+    }
+}
+function Get-NetFirewallAddressFilter {
+    [CmdletBinding()]
+    param([Parameter(ValueFromPipeline = $true)]$InputObject)
+    process { [pscustomobject]@{ RemoteAddress = $NonLoopbackRanges } }
 }
 function Get-Process {
     [CmdletBinding()]
     param([int]$Id)
-    if ($Id -eq 4201) {
+    if ($Id -in @(4201, 4202, 4203)) {
+        $Instance = switch ($Id) { 4201 { "runtime-launched" } 4202 { "runtime-starting" } 4203 { "runtime-intent-started" } }
         return [pscustomobject]@{
-            Id = 4201
-            Path = (Join-Path $Root "runtime-launched/bin/ollama.exe")
+            Id = $Id
+            Path = (Join-Path $script:HarnessRoot "$Instance/bin/ollama.exe")
+            StartTime = [DateTime]::ParseExact("2026-07-22T10:00:00.0000000Z", "o", [System.Globalization.CultureInfo]::InvariantCulture, [System.Globalization.DateTimeStyles]::RoundtripKind)
         }
     }
     return $null
@@ -591,7 +732,10 @@ function Get-Process {
 function Get-CimInstance {
     [CmdletBinding()]
     param([string]$ClassName)
-    return @()
+    return @(
+        [pscustomobject]@{ ProcessId = 4202; ExecutablePath = (Join-Path $script:HarnessRoot "runtime-starting/bin/ollama.exe") },
+        [pscustomobject]@{ ProcessId = 4203; ExecutablePath = (Join-Path $script:HarnessRoot "runtime-intent-started/bin/ollama.exe") }
+    )
 }
 function Stop-Process {
     [CmdletBinding()]
@@ -607,9 +751,9 @@ function Get-NetTCPConnection {
     }
 }
 $Recovered = @(Recover-PendingLaunches -Root $Root | Sort-Object)
-if (($Recovered -join ",") -ne "runtime-intent,runtime-launched") { throw "recovery set mismatch" }
-if (($script:RemovedRules | Sort-Object) -join "," -ne "CareerOps-Ollama-runtime-intent,CareerOps-Ollama-runtime-launched") { throw "firewall cleanup mismatch" }
-if (($script:StoppedProcesses -join ",") -ne "4201") { throw "process cleanup mismatch" }
+if (($Recovered -join ",") -ne "runtime-intent,runtime-intent-started,runtime-launched,runtime-starting") { throw "recovery set mismatch" }
+if (($script:RemovedRules | Sort-Object) -join "," -ne "CareerOps-Ollama-runtime-intent,CareerOps-Ollama-runtime-intent-started,CareerOps-Ollama-runtime-launched,CareerOps-Ollama-runtime-starting") { throw "firewall cleanup mismatch" }
+if (($script:StoppedProcesses | Sort-Object) -join "," -ne "4201,4202,4203") { throw "process cleanup mismatch" }
 if (@(Get-ChildItem -LiteralPath $Root -Filter "launch-record.json" -Recurse).Count -ne 0) { throw "launch records remained" }
 $script:ListenerOwner = 4201
 Assert-EndpointOwnedByProcess -OwnedProcessId 4201
@@ -620,7 +764,10 @@ if (-not $MismatchRejected) { throw "listener owner mismatch was accepted" }
 $PreexistingRejected = $false
 try { Assert-PortUnbound } catch { $PreexistingRejected = $true }
 if (-not $PreexistingRejected) { throw "preexisting listener was accepted" }
-@{ recovered = $Recovered; removed_rules = $script:RemovedRules; stopped_processes = $script:StoppedProcesses; ownership_rejected = $MismatchRejected; preexisting_rejected = $PreexistingRejected } | ConvertTo-Json -Compress
+$CollisionRejected = $false
+try { Assert-FirewallRuleNameAvailable -RuleName "CareerOps-Ollama-foreign" } catch { $CollisionRejected = $true }
+if (-not $CollisionRejected -or $script:RemovedRules -contains "CareerOps-Ollama-foreign") { throw "foreign firewall rule collision was touched" }
+@{ recovered = $Recovered; removed_rules = $script:RemovedRules; stopped_processes = $script:StoppedProcesses; ownership_rejected = $MismatchRejected; preexisting_rejected = $PreexistingRejected; collision_rejected = $CollisionRejected } | ConvertTo-Json -Compress
 ''',
         encoding="utf-8",
     )
@@ -650,13 +797,101 @@ if (-not $PreexistingRejected) { throw "preexisting listener was accepted" }
 
     assert completed.returncode == 0, completed.stderr
     result = json.loads(completed.stdout.strip().splitlines()[-1])
-    assert result["stopped_processes"] == [4201]
+    assert sorted(result["stopped_processes"]) == [4201, 4202, 4203]
     assert result["ownership_rejected"] is True
     assert result["preexisting_rejected"] is True
+    assert result["collision_rejected"] is True
     assert sorted(result["removed_rules"]) == [
         "CareerOps-Ollama-runtime-intent",
+        "CareerOps-Ollama-runtime-intent-started",
         "CareerOps-Ollama-runtime-launched",
+        "CareerOps-Ollama-runtime-starting",
     ]
+
+
+@pytest.mark.skipif(
+    shutil.which("pwsh") is None and shutil.which("powershell") is None,
+    reason="PowerShell is unavailable",
+)
+def test_windows_recovery_preserves_journal_when_firewall_ownership_mismatches(
+    tmp_path: Path,
+):
+    powershell = shutil.which("pwsh") or shutil.which("powershell")
+    script = Path(__file__).resolve().parents[1] / "scripts" / "start-managed-ollama.ps1"
+    root = tmp_path / "runtime"
+    instance = root / "runtime-mismatch"
+    owned = instance / "bin" / "ollama.exe"
+    owned.parent.mkdir(parents=True)
+    owned.write_bytes(b"owned")
+    record = instance / "launch-record.json"
+    record.write_text(
+        json.dumps(
+            {
+                "version": 2,
+                "runtime_instance_id": "runtime-mismatch",
+                "isolation_rule_id": "CareerOps-Ollama-runtime-mismatch",
+                "owned_executable": str(owned),
+                "endpoint": "http://127.0.0.1:11434",
+                "model": "qwen2.5:7b",
+                "process_id": 0,
+                "runtime_handle": "",
+                "process_started_at": "",
+                "executable_sha256": hashlib.sha256(b"owned").hexdigest(),
+                "executable_size": 5,
+                "firewall_rule_token": "3" * 32,
+                "state": "intent",
+            }
+        ),
+        encoding="utf-8",
+    )
+    fixture = tmp_path / "fixture.exe"
+    fixture.write_bytes(b"fixture")
+    harness = tmp_path / "mismatch-harness.ps1"
+    harness.write_text(
+        r'''
+param([string]$ScriptPath, [string]$Root, [string]$Fixture)
+. $ScriptPath -Action Recover -ExecutablePath $Fixture -Model "qwen2.5:7b" -RuntimeRoot $Root
+$script:Removed = $false
+function Get-NetFirewallRule { [CmdletBinding()] param([string]$Name) [pscustomobject]@{ Name = $Name; DisplayName = $Name; Description = "foreign"; Enabled = "True"; Direction = "Outbound"; Action = "Block"; Profile = "Any" } }
+function Remove-NetFirewallRule { [CmdletBinding()] param([string]$Name) $script:Removed = $true }
+$Rejected = $false
+try { Recover-PendingLaunches -Root $Root | Out-Null } catch { $Rejected = $true }
+$RecordExists = Test-Path -LiteralPath (Join-Path $Root "runtime-mismatch/launch-record.json")
+if (-not $Rejected -or -not $RecordExists -or $script:Removed) { throw "unsafe recovery state" }
+@{ rejected = $Rejected; record_exists = $RecordExists; removed = $script:Removed } | ConvertTo-Json -Compress
+''',
+        encoding="utf-8",
+    )
+
+    completed = subprocess.run(
+        [
+            powershell,
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            str(harness),
+            "-ScriptPath",
+            str(script),
+            "-Root",
+            str(root),
+            "-Fixture",
+            str(fixture),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert json.loads(completed.stdout.strip().splitlines()[-1]) == {
+        "record_exists": True,
+        "rejected": True,
+        "removed": False,
+    }
 
 
 def _container_record(*, model: str = "qwen2.5:7b") -> RuntimeLaunchRecord:
@@ -671,6 +906,10 @@ def _container_record(*, model: str = "qwen2.5:7b") -> RuntimeLaunchRecord:
         container_id=container_id,
         container_image_reference=CONTAINER_IMAGE_C,
         container_image_id=CONTAINER_IMAGE_ID,
+        process_started_at=None,
+        executable_sha256=None,
+        executable_size=None,
+        firewall_rule_token=None,
         egress_policy="container_internal_no_egress",
         egress_enforced=True,
         cloud_disabled=True,
@@ -747,6 +986,8 @@ def test_production_lifespan_enables_only_verified_compose_managed_ollama(
         assert managed.evidence.container_image_reference == CONTAINER_IMAGE_C
         assert managed.evidence.container_image_id == CONTAINER_IMAGE_ID
         assert launcher.events[:2] == ["launch", "verify"]
+
+    assert launcher.cleaned == []
 
 
 def test_production_managed_provider_reverifies_live_runtime_before_probe_and_run(
@@ -955,6 +1196,39 @@ def test_production_lifespan_selects_compose_inspector_without_test_injection(
         assert launcher.events[:2] == ["launch", "verify"]
 
 
+def test_production_windows_process_mode_stops_owned_runtime_on_shutdown(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    repo = CareerOpsRepository(tmp_path / "data" / "careerops.db", tmp_path / "vault")
+    repo.initialize()
+    launcher = FakeLauncher()
+    monkeypatch.setattr(OllamaProvider, "_request_json", _local_model_response)
+    environment = _compose_environment(tmp_path)
+    environment.update(
+        {
+            "CAREEROPS_OLLAMA_MANAGED_MODE": "windows_process",
+            "CAREEROPS_OLLAMA_URL": "http://127.0.0.1:11434",
+            "CAREEROPS_OLLAMA_RUNTIME_ROOT": str(tmp_path / "managed-runtime"),
+        }
+    )
+    api = create_app(
+        repo,
+        environment=environment,
+        managed_runtime_launcher=launcher,
+    )
+
+    with TestClient(api) as client:
+        ollama = next(
+            item
+            for item in client.get("/ai/providers").json()
+            if item["provider_kind"] == "ollama"
+        )
+        assert ollama["enabled"] is True
+        assert launcher.cleaned == []
+
+    assert launcher.cleaned == [launcher.records[0]]
+
+
 def test_compose_launcher_reverifies_identity_and_uses_bounded_inspector_actions(
     tmp_path: Path,
 ):
@@ -968,6 +1242,10 @@ def test_compose_launcher_reverifies_identity_and_uses_bounded_inspector_actions
         "container_id": "a" * 64,
         "container_image_reference": CONTAINER_IMAGE_C,
         "container_image_id": CONTAINER_IMAGE_ID,
+        "process_started_at": None,
+        "executable_sha256": None,
+        "executable_size": None,
+        "firewall_rule_token": None,
         "egress_policy": "container_internal_no_egress",
         "egress_enforced": True,
         "cloud_disabled": True,
@@ -977,11 +1255,6 @@ def test_compose_launcher_reverifies_identity_and_uses_bounded_inspector_actions
 
     def inspector(method: str, path: str, body):
         calls.append((method, path, body))
-        if method == "POST":
-            return {
-                "stopped": True,
-                "runtime_instance_id": "runtime-compose-1",
-            }
         return payload
 
     launcher = DockerComposeOllamaLauncher(transport=inspector)
@@ -993,15 +1266,21 @@ def test_compose_launcher_reverifies_identity_and_uses_bounded_inspector_actions
     assert calls == [
         ("GET", "/v1/ollama-runtime?model=qwen2.5%3A7b", None),
         ("GET", "/v1/ollama-runtime?model=qwen2.5%3A7b", None),
-        (
-            "POST",
-            "/v1/ollama-runtime/cleanup",
-            {
-                "runtime_instance_id": "runtime-compose-1",
-                "container_id": "a" * 64,
-            },
-        ),
     ]
+
+
+def test_container_inspector_rejects_all_mutating_docker_requests(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setattr(
+        inspector_module,
+        "_validated_socket",
+        lambda: (_ for _ in ()).throw(AssertionError("socket must not be opened")),
+        raising=False,
+    )
+
+    with pytest.raises(inspector_module.InspectorError, match="invalid"):
+        inspector_module._docker_request("POST", "/containers/abc/stop")
 
 
 def test_compose_launcher_rejects_exact_image_digest_drift_after_launch(
@@ -1017,6 +1296,10 @@ def test_compose_launcher_rejects_exact_image_digest_drift_after_launch(
         "container_id": "a" * 64,
         "container_image_reference": CONTAINER_IMAGE_C,
         "container_image_id": CONTAINER_IMAGE_ID,
+        "process_started_at": None,
+        "executable_sha256": None,
+        "executable_size": None,
+        "firewall_rule_token": None,
         "egress_policy": "container_internal_no_egress",
         "egress_enforced": True,
         "cloud_disabled": True,

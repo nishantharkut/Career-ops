@@ -92,7 +92,7 @@ def test_backup_restores_database_and_vault_with_checksums(tmp_path: Path):
         manifest_bytes = archive.read("manifest.json")
         manifest = json.loads(manifest_bytes)
         assert names == sorted(names, key=lambda value: (value != "manifest.json", value))
-        assert manifest["version"] == "careerops_backup_v1"
+        assert manifest["version"] == "careerops_backup_v2"
         assert manifest["manifest_sha256"] == backup.manifest_sha256
         paths = [item["path"] for item in manifest["files"]]
         assert paths == sorted(paths)
@@ -161,6 +161,122 @@ def test_live_sqlite_backup_is_a_consistent_snapshot_during_writes(tmp_path: Pat
     assert count == maximum
 
 
+def test_backup_rejects_vault_mutation_after_database_snapshot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    repo = _make_repo(tmp_path)
+    proof = repo.vault_path / "evidence" / "snapshot-proof.txt"
+    proof.write_bytes(b"before-database-snapshot")
+    repo.create_evidence_item(
+        claim_text="Snapshot proof",
+        evidence_type="document",
+        verification_state="verified",
+        privacy_level="private",
+        source_path=proof,
+        source_sha256=backups_module.hashlib.sha256(proof.read_bytes()).hexdigest(),
+    )
+
+    def mutate_after_database_snapshot(boundary: str, _stage_path: Path) -> None:
+        if boundary == "database_snapshotted":
+            proof.write_bytes(b"after-database-snapshot")
+
+    monkeypatch.setattr(
+        backups_module,
+        "_backup_snapshot_checkpoint",
+        mutate_after_database_snapshot,
+        raising=False,
+    )
+
+    with pytest.raises(BackupIntegrityError, match="changed"):
+        create_backup(repo.database_path, repo.vault_path, tmp_path / "backups")
+
+    assert not list((tmp_path / "backups").glob("*.zip"))
+
+
+def test_backup_rejects_staged_file_mutation_after_manifest(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    repo = _make_repo(tmp_path)
+    proof = repo.vault_path / "proof.txt"
+    proof.write_bytes(b"manifest-authority")
+
+    def mutate_staged_file(boundary: str, stage_path: Path) -> None:
+        if boundary == "manifest_built":
+            (stage_path / "vault" / "proof.txt").write_bytes(b"changed-stage")
+
+    monkeypatch.setattr(
+        backups_module,
+        "_backup_snapshot_checkpoint",
+        mutate_staged_file,
+        raising=False,
+    )
+
+    with pytest.raises(BackupIntegrityError, match="[Ss]taged|manifest"):
+        create_backup(repo.database_path, repo.vault_path, tmp_path / "backups")
+
+    assert not list((tmp_path / "backups").glob("*.zip"))
+
+
+def test_restore_rejects_archive_path_swap_after_descriptor_hash(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    first_repo = _make_repo(tmp_path / "first")
+    (first_repo.vault_path / "proof.txt").write_bytes(b"first")
+    first = create_backup(
+        first_repo.database_path,
+        first_repo.vault_path,
+        tmp_path / "first-backups",
+    )
+    second_repo = _make_repo(tmp_path / "second")
+    (second_repo.vault_path / "proof.txt").write_bytes(b"replacement")
+    second = create_backup(
+        second_repo.database_path,
+        second_repo.vault_path,
+        tmp_path / "second-backups",
+    )
+
+    def swap_archive(boundary: str, archive_path: Path) -> None:
+        if boundary == "archive_hashed":
+            replacement = archive_path.with_suffix(".replacement")
+            shutil.copyfile(second.path, replacement)
+            os.replace(replacement, archive_path)
+
+    monkeypatch.setattr(
+        backups_module,
+        "_restore_archive_checkpoint",
+        swap_archive,
+        raising=False,
+    )
+    data_path, vault_path = _empty_targets(tmp_path / "restore")
+
+    with pytest.raises((BackupIntegrityError, BackupPathError)):
+        restore_backup(first.path, data_path, vault_path)
+
+    assert list(data_path.iterdir()) == []
+    assert list(vault_path.iterdir()) == []
+
+
+def test_backup_and_restore_preserve_empty_vault_directories(tmp_path: Path):
+    repo = _make_repo(tmp_path)
+    empty = repo.vault_path / "empty" / "nested"
+    empty.mkdir(parents=True)
+
+    backup = create_backup(repo.database_path, repo.vault_path, tmp_path / "backups")
+
+    with zipfile.ZipFile(backup.path) as archive:
+        manifest = json.loads(archive.read("manifest.json"))
+        assert "vault/empty" in manifest["directories"]
+        assert "vault/empty/nested" in manifest["directories"]
+        assert "vault/empty/" in archive.namelist()
+        assert "vault/empty/nested/" in archive.namelist()
+
+    data_path, vault_path = _empty_targets(tmp_path / "restore")
+    restore_backup(backup.path, data_path, vault_path)
+
+    assert (vault_path / "empty" / "nested").is_dir()
+    assert list((vault_path / "empty" / "nested").iterdir()) == []
+
+
 @pytest.mark.parametrize("target", ["database", "manifest", "missing", "extra"])
 def test_restore_rejects_changed_missing_or_undeclared_archive_content(
     tmp_path: Path, target: str
@@ -178,7 +294,7 @@ def test_restore_rejects_changed_missing_or_undeclared_archive_content(
             ]
         if target == "manifest":
             return [
-                (item, payload.replace(b"careerops_backup_v1", b"careerops_backup_v9"))
+                (item, payload.replace(b"careerops_backup_v2", b"careerops_backup_v9"))
                 if item.filename == "manifest.json"
                 else (item, payload)
                 for item, payload in entries
@@ -211,6 +327,13 @@ def test_restore_rejects_changed_missing_or_undeclared_archive_content(
         "vault//empty.txt",
         "vault/./dot.txt",
         "vault/CON.txt",
+        "vault/COM\u00b9.txt",
+        "vault/LPT\u00b2.log",
+        "vault/forbidden<name.txt",
+        "vault/question?.txt",
+        "vault/control\u007fname.txt",
+        "vault/trailing-dot./name.txt",
+        "vault/e\u0301.txt",
     ],
 )
 def test_restore_rejects_unsafe_or_windows_ambiguous_archive_names(
@@ -724,7 +847,7 @@ def test_restore_recovers_power_loss_between_mirrored_journal_replaces(
     vault_path = vault_parent / "vault"
     data_path.mkdir()
     vault_path.mkdir()
-    real_replace = backups_module.os.replace
+    real_replace = backups_module._atomic_rename
     crashed = False
 
     def crash_after_first_vault_published_journal(source, destination) -> None:
@@ -744,8 +867,8 @@ def test_restore_recovers_power_loss_between_mirrored_journal_replaces(
             raise SimulatedRestoreCrash("first mirrored journal replace")
 
     monkeypatch.setattr(
-        backups_module.os,
-        "replace",
+        backups_module,
+        "_atomic_rename",
         crash_after_first_vault_published_journal,
     )
     with pytest.raises(SimulatedRestoreCrash, match="mirrored journal replace"):
@@ -755,13 +878,78 @@ def test_restore_recovers_power_loss_between_mirrored_journal_replaces(
     vault_journal = next(vault_parent.glob(".careerops-restore-transaction-*.json"))
     assert json.loads(data_journal.read_text(encoding="utf-8"))["phase"] == "vault_published"
     assert json.loads(vault_journal.read_text(encoding="utf-8"))["phase"] == "data_published"
-    monkeypatch.setattr(backups_module.os, "replace", real_replace)
+    monkeypatch.setattr(backups_module, "_atomic_rename", real_replace)
 
     restore_backup(backup.path, data_path, vault_path)
 
     assert (vault_path / "proof.txt").read_bytes() == b"journal-power-loss"
     assert not list(data_parent.glob(".careerops-restore-transaction-*.json"))
     assert not list(vault_parent.glob(".careerops-restore-transaction-*.json"))
+
+
+def test_restore_recovers_when_committed_journal_is_ahead_of_rename_state(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    repo = _make_repo(tmp_path)
+    (repo.vault_path / "proof.txt").write_bytes(b"state-authority")
+    backup = create_backup(repo.database_path, repo.vault_path, tmp_path / "backups")
+    data_path, vault_path = _empty_targets(tmp_path)
+
+    def crash_after_data_publish(boundary: str) -> None:
+        if boundary == "data_published":
+            raise SimulatedRestoreCrash(boundary)
+
+    monkeypatch.setattr(
+        backups_module,
+        "_restore_publication_checkpoint",
+        crash_after_data_publish,
+    )
+    with pytest.raises(SimulatedRestoreCrash):
+        restore_backup(backup.path, data_path, vault_path)
+
+    layout = backups_module._restore_layout(data_path, vault_path)
+    transaction, _phase = backups_module._read_restore_journal(
+        layout.journals[0], layout
+    )
+    for journal in layout.journals:
+        journal.write_bytes(backups_module._journal_bytes(transaction, "committed"))
+    monkeypatch.setattr(
+        backups_module,
+        "_restore_publication_checkpoint",
+        lambda _boundary: None,
+    )
+
+    restored = restore_backup(backup.path, data_path, vault_path)
+
+    assert restored.database_path.is_file()
+    assert (vault_path / "proof.txt").read_bytes() == b"state-authority"
+    assert not any(path.exists() for path in layout.journals)
+
+
+def test_windows_restore_renames_use_write_through_primitive(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    source = tmp_path / "source"
+    destination = tmp_path / "destination"
+    source.mkdir()
+    calls: list[tuple[Path, Path]] = []
+
+    def write_through(source_path: Path, destination_path: Path) -> None:
+        calls.append((source_path, destination_path))
+        os.replace(source_path, destination_path)
+
+    monkeypatch.setattr(backups_module, "_IS_WINDOWS", True, raising=False)
+    monkeypatch.setattr(
+        backups_module,
+        "_windows_write_through_replace",
+        write_through,
+        raising=False,
+    )
+
+    backups_module._atomic_rename(source, destination)
+
+    assert calls == [(source, destination)]
+    assert destination.is_dir()
 
 
 def test_restore_recovery_never_deletes_a_changed_partially_published_target(

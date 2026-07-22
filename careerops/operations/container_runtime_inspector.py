@@ -8,15 +8,13 @@ import ipaddress
 import json
 from pathlib import Path
 import re
-import socket
-import stat
 from typing import Any
 from urllib.parse import parse_qs, quote, urlsplit
 
 
-DOCKER_SOCKET = Path("/var/run/docker.sock")
+DOCKER_PROXY_HOST = "docker-socket-proxy"
+DOCKER_PROXY_PORT = 2375
 MAX_DOCKER_RESPONSE_BYTES = 2 * 1024 * 1024
-MAX_REQUEST_BYTES = 4 * 1024
 CONTAINER_ID = re.compile(r"[0-9a-f]{12,64}\Z")
 FULL_CONTAINER_ID = re.compile(r"[0-9a-f]{64}\Z")
 DIGEST_IMAGE = re.compile(
@@ -30,32 +28,12 @@ class InspectorError(RuntimeError):
     pass
 
 
-class _UnixHttpConnection(http.client.HTTPConnection):
-    def __init__(self, socket_path: Path):
-        super().__init__("localhost", timeout=5)
-        self._socket_path = socket_path
-
-    def connect(self) -> None:
-        connection = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        connection.settimeout(self.timeout)
-        connection.connect(str(self._socket_path))
-        self.sock = connection
-
-
-def _validated_socket() -> Path:
-    try:
-        value = DOCKER_SOCKET.lstat()
-    except OSError as error:
-        raise InspectorError("Docker runtime socket was unavailable") from error
-    if DOCKER_SOCKET.is_symlink() or not stat.S_ISSOCK(value.st_mode):
-        raise InspectorError("Docker runtime socket was invalid")
-    return DOCKER_SOCKET
-
-
 def _docker_request(method: str, path: str) -> tuple[int, Any]:
-    if method not in {"GET", "POST"} or not path.startswith("/") or "\r" in path or "\n" in path:
+    if method != "GET" or not path.startswith("/") or "\r" in path or "\n" in path:
         raise InspectorError("Docker runtime request was invalid")
-    connection = _UnixHttpConnection(_validated_socket())
+    connection = http.client.HTTPConnection(
+        DOCKER_PROXY_HOST, DOCKER_PROXY_PORT, timeout=5
+    )
     response: http.client.HTTPResponse | None = None
     try:
         connection.request(method, path, headers={"Connection": "close"})
@@ -131,6 +109,10 @@ class InspectedRuntime:
     container_id: str
     container_image_reference: str
     container_image_id: str
+    process_started_at: None
+    executable_sha256: None
+    executable_size: None
+    firewall_rule_token: None
     egress_policy: str
     egress_enforced: bool
     cloud_disabled: bool
@@ -261,34 +243,15 @@ def inspect_ollama_runtime(model: str) -> InspectedRuntime:
         container_id=container_id,
         container_image_reference=image_reference,
         container_image_id=image_id,
+        process_started_at=None,
+        executable_sha256=None,
+        executable_size=None,
+        firewall_rule_token=None,
         egress_policy="container_internal_no_egress",
         egress_enforced=True,
         cloud_disabled=True,
         isolation_rule_id=f"network-{network_id[:32]}",
     )
-
-
-def stop_ollama_runtime(runtime_instance_id: str, container_id: str) -> None:
-    if not re.fullmatch(r"runtime-[0-9a-f]{32}", runtime_instance_id):
-        raise InspectorError("Cleanup runtime identity was invalid")
-    if FULL_CONTAINER_ID.fullmatch(container_id) is None:
-        raise InspectorError("Cleanup container identity was invalid")
-    inspection = _mapping(
-        _docker_json(f"/containers/{container_id}/json"),
-        "Ollama container metadata",
-    )
-    config = _mapping(inspection.get("Config"), "Ollama configuration")
-    environment = _environment(config.get("Env"))
-    model = _string(environment.get("CAREEROPS_OLLAMA_MODEL"), "Ollama model")
-    observed = inspect_ollama_runtime(model)
-    if (
-        observed.runtime_instance_id != runtime_instance_id
-        or observed.container_id != container_id
-    ):
-        raise InspectorError("Cleanup runtime identity changed")
-    status, _payload = _docker_request("POST", f"/containers/{container_id}/stop?t=10")
-    if status not in {204, 304}:
-        raise InspectorError("Ollama container cleanup failed")
 
 
 class _Handler(BaseHTTPRequestHandler):
@@ -311,33 +274,6 @@ class _Handler(BaseHTTPRequestHandler):
             self._send(200, asdict(runtime))
         except (InspectorError, ValueError):
             self._send(503, {"error": "runtime_unverified"})
-
-    def do_POST(self) -> None:
-        if self.path != "/v1/ollama-runtime/cleanup":
-            self._send(404, {"error": "not_found"})
-            return
-        try:
-            length = int(self.headers.get("Content-Length", ""))
-            if length <= 0 or length > MAX_REQUEST_BYTES:
-                raise InspectorError("Cleanup request was invalid")
-            raw = self.rfile.read(length)
-            payload = json.loads(raw)
-            if type(payload) is not dict or set(payload) != {
-                "runtime_instance_id",
-                "container_id",
-            }:
-                raise InspectorError("Cleanup request was invalid")
-            runtime_instance_id = _string(
-                payload["runtime_instance_id"], "Cleanup runtime identity"
-            )
-            container_id = _string(payload["container_id"], "Cleanup container identity")
-            stop_ollama_runtime(runtime_instance_id, container_id)
-            self._send(
-                200,
-                {"stopped": True, "runtime_instance_id": runtime_instance_id},
-            )
-        except (InspectorError, UnicodeError, ValueError):
-            self._send(409, {"error": "cleanup_rejected"})
 
     def _send(self, status: int, payload: dict[str, Any]) -> None:
         raw = json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8")
