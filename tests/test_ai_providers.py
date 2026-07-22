@@ -1374,6 +1374,9 @@ def test_ollama_postflight_show_metadata_hash_drift_is_rejected(tmp_path: Path):
     def drift(handler: BaseHTTPRequestHandler) -> None:
         nonlocal after_chat
         observed.append(handler.path)
+        if handler.command == "POST":
+            length = int(handler.headers.get("Content-Length", "0"))
+            handler.rfile.read(length)
         if handler.path == "/api/tags":
             send_http_json(handler, 200, {"models": [local_model_metadata()]})
             return
@@ -1404,8 +1407,10 @@ def test_ollama_postflight_show_metadata_hash_drift_is_rejected(tmp_path: Path):
         )
 
     with ollama_test_server(drift) as endpoint:
-        with pytest.raises(ProviderUnavailableError, match="provenance"):
+        with pytest.raises(ProviderUnavailableError) as captured:
             isolated_ollama(endpoint=endpoint).run(make_request(tmp_path))
+
+    assert "provenance" in str(captured.value), observed
 
     assert observed == [
         "/api/tags",
