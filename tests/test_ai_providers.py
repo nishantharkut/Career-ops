@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from collections.abc import Callable
 from contextlib import contextmanager
 import hashlib
@@ -482,8 +483,20 @@ def isolated_ollama(**values: Any) -> OllamaProvider:
         runtime_handle=runtime_handle,
         isolation_authority=authority,
         isolation_evidence=evidence,
+        runtime_verifier=ollama_provider_module._bind_ollama_runtime_verifier(
+            authority,
+            evidence,
+            lambda: True,
+        ),
         **configured,
     )
+
+
+def test_ollama_rejects_arbitrary_live_runtime_verifier():
+    provider = isolated_ollama()
+
+    with pytest.raises(ValueError, match="factory-bound"):
+        replace(provider, runtime_verifier=lambda: True)
 
 
 class _OllamaTestServer(ThreadingHTTPServer):
@@ -610,6 +623,54 @@ def successful_ollama_responder(
         send_http_json(handler, 404, {"error": "missing"})
 
     return respond
+
+
+def test_ollama_reverifies_runtime_immediately_before_sending_task_content(
+    tmp_path: Path,
+):
+    runtime = {"live": True}
+    observed_paths: list[str] = []
+
+    def responder(handler: BaseHTTPRequestHandler) -> None:
+        observed_paths.append(handler.path)
+        if handler.path == "/api/tags":
+            send_http_json(handler, 200, {"models": [local_model_metadata()]})
+            return
+        if handler.path == "/api/show":
+            send_http_json(handler, 200, official_show_metadata())
+            runtime["live"] = False
+            return
+        raise AssertionError("task content reached Ollama after runtime verification failed")
+
+    with ollama_test_server(responder) as endpoint:
+        authority = ollama_provider_module.OllamaRuntimeAuthority.generate(
+            "careerops_api_live_recheck"
+        )
+        evidence = authority.issue(
+            endpoint=endpoint,
+            model=OLLAMA_MODEL,
+            runtime_instance_id="runtime_live_recheck",
+            runtime_handle="pid:5511",
+            egress_policy="os_firewall_block",
+        )
+        provider = OllamaProvider(
+            endpoint=endpoint,
+            model=OLLAMA_MODEL,
+            runtime_instance_id="runtime_live_recheck",
+            runtime_handle="pid:5511",
+            isolation_authority=authority,
+            isolation_evidence=evidence,
+            runtime_verifier=ollama_provider_module._bind_ollama_runtime_verifier(
+                authority,
+                evidence,
+                lambda: runtime["live"],
+            ),
+        )
+
+        with pytest.raises(ProviderUnavailableError, match="isolation"):
+            provider.run(make_request(tmp_path))
+
+    assert observed_paths == ["/api/tags", "/api/show"]
 
 
 def test_ollama_isolation_evidence_is_strict_structured_and_frozen():
@@ -756,6 +817,11 @@ def test_ollama_bound_capability_accepts_equivalent_canonical_endpoint(
             runtime_handle="process:12345",
             isolation_authority=authority,
             isolation_evidence=evidence,
+            runtime_verifier=ollama_provider_module._bind_ollama_runtime_verifier(
+                authority,
+                evidence,
+                lambda: True,
+            ),
         )
 
         result = provider.run(make_request(tmp_path))
@@ -937,6 +1003,11 @@ def test_ollama_local_private_result_persists_complete_justification(
             runtime_handle="container:ollama_provenance",
             isolation_authority=authority,
             isolation_evidence=evidence,
+            runtime_verifier=ollama_provider_module._bind_ollama_runtime_verifier(
+                authority,
+                evidence,
+                lambda: True,
+            ),
         )
 
         availability = provider.availability()

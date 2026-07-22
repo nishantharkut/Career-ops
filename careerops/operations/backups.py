@@ -127,6 +127,12 @@ class _RestoreLayout:
 
 
 @dataclass(frozen=True)
+class _TopologySnapshot:
+    entry_count: int
+    identity_sha256: str
+
+
+@dataclass(frozen=True)
 class _RestoreTransaction:
     layout: _RestoreLayout
     archive_sha256: str
@@ -135,6 +141,8 @@ class _RestoreTransaction:
     total_bytes: int
     data_identity: tuple[int, int]
     vault_identity: tuple[int, int]
+    data_topology: _TopologySnapshot
+    vault_topology: _TopologySnapshot
 
 
 class _DuplicateJsonMember(ValueError):
@@ -406,6 +414,15 @@ def _hash_path(path: Path, limit: int) -> tuple[int, str]:
 
 def _atomic_rename(source: Path, destination: Path) -> None:
     os.replace(source, destination)
+
+
+def _durable_rename(source: Path, destination: Path) -> None:
+    source_parent = source.parent
+    destination_parent = destination.parent
+    _atomic_rename(source, destination)
+    _fsync_directory(source_parent)
+    if destination_parent != source_parent:
+        _fsync_directory(destination_parent)
 
 
 def create_backup(
@@ -683,7 +700,14 @@ def _restore_layout(data_path: Path | str, vault_path: Path | str) -> _RestoreLa
     ).encode("utf-8")
     transaction_id = hashlib.sha256(identity_bytes).hexdigest()[:32]
     journal_name = f".careerops-restore-transaction-{transaction_id}.json"
-    journals = (data.parent / journal_name,)
+    journals = tuple(
+        dict.fromkeys(
+            (
+                data.parent / journal_name,
+                vault.parent / journal_name,
+            )
+        )
+    )
     return _RestoreLayout(
         transaction_id=transaction_id,
         data=data,
@@ -708,7 +732,7 @@ def _journal_payload(transaction: _RestoreTransaction, phase: str) -> dict[str, 
         raise RestoreTargetError("Restore transaction phase was invalid")
     layout = transaction.layout
     payload: dict[str, Any] = {
-        "version": 1,
+        "version": 2,
         "transaction_id": layout.transaction_id,
         "phase": phase,
         "data_target": str(layout.data),
@@ -723,6 +747,14 @@ def _journal_payload(transaction: _RestoreTransaction, phase: str) -> dict[str, 
         "total_bytes": transaction.total_bytes,
         "data_identity": list(transaction.data_identity),
         "vault_identity": list(transaction.vault_identity),
+        "data_topology": [
+            transaction.data_topology.entry_count,
+            transaction.data_topology.identity_sha256,
+        ],
+        "vault_topology": [
+            transaction.vault_topology.entry_count,
+            transaction.vault_topology.identity_sha256,
+        ],
     }
     checksum_bytes = json.dumps(
         payload,
@@ -789,6 +821,8 @@ def _read_restore_journal(path: Path, layout: _RestoreLayout) -> tuple[_RestoreT
         "total_bytes",
         "data_identity",
         "vault_identity",
+        "data_topology",
+        "vault_topology",
         "journal_sha256",
     }
     if type(payload) is not dict or set(payload) != expected_fields:
@@ -810,8 +844,9 @@ def _read_restore_journal(path: Path, layout: _RestoreLayout) -> tuple[_RestoreT
         "vault_hold": layout.vault_hold,
     }
     identities = (payload.get("data_identity"), payload.get("vault_identity"))
+    topologies = (payload.get("data_topology"), payload.get("vault_topology"))
     invalid = bool(
-        payload.get("version") != 1
+        payload.get("version") != 2
         or payload.get("transaction_id") != layout.transaction_id
         or type(checksum) is not str
         or SHA256_PATTERN.fullmatch(checksum) is None
@@ -831,6 +866,15 @@ def _read_restore_journal(path: Path, layout: _RestoreLayout) -> tuple[_RestoreT
             or any(type(item) is not int or item < 0 for item in identity)
             for identity in identities
         )
+        or any(
+            not isinstance(topology, list)
+            or len(topology) != 2
+            or type(topology[0]) is not int
+            or topology[0] <= 0
+            or type(topology[1]) is not str
+            or SHA256_PATTERN.fullmatch(topology[1]) is None
+            for topology in topologies
+        )
     )
     if invalid:
         raise RestoreTargetError("Restore transaction journal was invalid")
@@ -843,6 +887,8 @@ def _read_restore_journal(path: Path, layout: _RestoreLayout) -> tuple[_RestoreT
             total_bytes=payload["total_bytes"],
             data_identity=tuple(payload["data_identity"]),
             vault_identity=tuple(payload["vault_identity"]),
+            data_topology=_TopologySnapshot(*payload["data_topology"]),
+            vault_topology=_TopologySnapshot(*payload["vault_topology"]),
         )
         phase = payload["phase"]
         _journal_payload(transaction, phase)
@@ -871,6 +917,116 @@ def _validate_original_hold(path: Path, identity: tuple[int, int]) -> None:
         raise RestoreTargetError("Restore recovery could not inspect a target placeholder") from error
 
 
+def _expected_topology_entry_count(
+    records: list[_FileRecord], target_kind: str
+) -> int:
+    if target_kind == "data":
+        return 2
+    if target_kind != "vault":
+        raise RestoreTargetError("Restore recovery target kind was invalid")
+    directories = {"."}
+    files = 0
+    for record in records:
+        if record.path == DATABASE_ARCHIVE_PATH:
+            continue
+        relative = PurePosixPath(record.path).relative_to("vault")
+        files += 1
+        parent = relative.parent
+        while parent != PurePosixPath("."):
+            directories.add(parent.as_posix())
+            parent = parent.parent
+    return len(directories) + files
+
+
+def _snapshot_restore_topology(
+    root: Path,
+    *,
+    expected_entries: int,
+) -> _TopologySnapshot:
+    digest = hashlib.sha256()
+    observed = 0
+    directories: list[tuple[Path, tuple[int, int, int, int]]] = []
+    stack: list[tuple[Path, str]] = [(root, ".")]
+    try:
+        while stack:
+            path, relative = stack.pop()
+            value = path.lstat()
+            if _is_link_or_reparse(path):
+                raise RestoreTargetError(
+                    "Restore recovery found changed published topology"
+                )
+            if stat.S_ISDIR(value.st_mode):
+                kind = "directory"
+                directories.append(
+                    (
+                        path,
+                        (
+                            value.st_dev,
+                            value.st_ino,
+                            value.st_mtime_ns,
+                            value.st_ctime_ns,
+                        ),
+                    )
+                )
+                with os.scandir(path) as entries:
+                    children = sorted(
+                        entries,
+                        key=lambda entry: (entry.name.casefold(), entry.name),
+                        reverse=True,
+                    )
+                for child in children:
+                    child_relative = (
+                        child.name
+                        if relative == "."
+                        else f"{relative}/{child.name}"
+                    )
+                    stack.append((Path(child.path), child_relative))
+            elif stat.S_ISREG(value.st_mode) and value.st_nlink == 1:
+                kind = "file"
+            else:
+                raise RestoreTargetError(
+                    "Restore recovery found changed published topology"
+                )
+            observed += 1
+            if observed > expected_entries:
+                raise RestoreTargetError(
+                    "Restore recovery found changed published topology"
+                )
+            digest.update(
+                _canonical_json(
+                    [kind, relative, value.st_dev, value.st_ino]
+                )
+            )
+            digest.update(b"\n")
+        if observed != expected_entries:
+            raise RestoreTargetError(
+                "Restore recovery found changed published topology"
+            )
+        for directory, before in directories:
+            after = directory.lstat()
+            if (
+                _is_link_or_reparse(directory)
+                or not stat.S_ISDIR(after.st_mode)
+                or (
+                    after.st_dev,
+                    after.st_ino,
+                    after.st_mtime_ns,
+                    after.st_ctime_ns,
+                )
+                != before
+            ):
+                raise RestoreTargetError(
+                    "Restore recovery found changed published topology"
+                )
+    except RestoreTargetError:
+        raise
+    except OSError as error:
+        raise RestoreTargetError(
+            "Restore recovery found changed published topology"
+        ) from error
+    return _TopologySnapshot(observed, digest.hexdigest())
+
+
 def _rollback_target(
     *,
     target: Path,
@@ -879,6 +1035,7 @@ def _rollback_target(
     identity: tuple[int, int],
     records: list[_FileRecord],
     target_kind: str,
+    expected_topology: _TopologySnapshot,
 ) -> None:
     hold_exists = hold.exists() or hold.is_symlink()
     target_exists = target.exists() or target.is_symlink()
@@ -888,11 +1045,16 @@ def _rollback_target(
         if target_exists:
             if stage_exists or _is_link_or_reparse(target) or not target.is_dir():
                 raise RestoreTargetError("Restore recovery found ambiguous published data")
-            _verify_restore_target_files(target, records, target_kind)
-            _atomic_rename(target, stage)
+            _verify_restore_target_files(
+                target,
+                records,
+                target_kind,
+                expected_topology,
+            )
+            _durable_rename(target, stage)
             target_exists = False
         if not target_exists:
-            _atomic_rename(hold, target)
+            _durable_rename(hold, target)
         return
     if not target_exists:
         raise RestoreTargetError("Restore recovery could not locate the original target")
@@ -929,10 +1091,7 @@ def _recover_restore_transaction(
         or transaction.total_bytes != sum(record.size for record in records)
     ):
         raise RestoreTargetError("Restore transaction did not match this backup")
-    fully_committed = bool(
-        len(existing) == len(layout.journals)
-        and all(phase == "committed" for _item, phase in observed)
-    )
+    fully_committed = all(phase == "committed" for _item, phase in observed)
     if fully_committed:
         for target, hold, stage, identity in (
             (layout.data, layout.data_hold, layout.data_stage, transaction.data_identity),
@@ -956,6 +1115,7 @@ def _recover_restore_transaction(
             identity=transaction.vault_identity,
             records=records,
             target_kind="vault",
+            expected_topology=transaction.vault_topology,
         )
         _rollback_target(
             target=layout.data,
@@ -964,6 +1124,7 @@ def _recover_restore_transaction(
             identity=transaction.data_identity,
             records=records,
             target_kind="data",
+            expected_topology=transaction.data_topology,
         )
         _safe_remove_tree(layout.data_stage, layout.data.parent)
         _safe_remove_tree(layout.vault_stage, layout.vault.parent)
@@ -997,7 +1158,14 @@ def _verify_restore_target_files(
     target: Path,
     records: list[_FileRecord],
     target_kind: str,
+    expected_topology: _TopologySnapshot,
 ) -> None:
+    observed_topology = _snapshot_restore_topology(
+        target,
+        expected_entries=expected_topology.entry_count,
+    )
+    if observed_topology != expected_topology:
+        raise RestoreTargetError("Restore recovery found changed published topology")
     if target_kind == "data":
         expected = {
             record.path: record
@@ -1040,8 +1208,18 @@ def _verify_restore_target_files(
 
 
 def _verify_committed_files(transaction: _RestoreTransaction, records: list[_FileRecord]) -> None:
-    _verify_restore_target_files(transaction.layout.data, records, "data")
-    _verify_restore_target_files(transaction.layout.vault, records, "vault")
+    _verify_restore_target_files(
+        transaction.layout.data,
+        records,
+        "data",
+        transaction.data_topology,
+    )
+    _verify_restore_target_files(
+        transaction.layout.vault,
+        records,
+        "vault",
+        transaction.vault_topology,
+    )
 
 
 def _restore_publication_checkpoint(_boundary: str) -> None:
@@ -1058,16 +1236,16 @@ def _publish_restore(
     _revalidate_empty_target(targets.vault, targets.vault_identity)
     _write_restore_journals(transaction, "prepared")
     try:
-        _atomic_rename(targets.data, layout.data_hold)
+        _durable_rename(targets.data, layout.data_hold)
         _restore_publication_checkpoint("data_target_held")
         _write_restore_journals(transaction, "data_target_held")
-        _atomic_rename(targets.vault, layout.vault_hold)
+        _durable_rename(targets.vault, layout.vault_hold)
         _restore_publication_checkpoint("vault_target_held")
         _write_restore_journals(transaction, "vault_target_held")
-        _atomic_rename(layout.data_stage, targets.data)
+        _durable_rename(layout.data_stage, targets.data)
         _restore_publication_checkpoint("data_published")
         _write_restore_journals(transaction, "data_published")
-        _atomic_rename(layout.vault_stage, targets.vault)
+        _durable_rename(layout.vault_stage, targets.vault)
         _restore_publication_checkpoint("vault_published")
         _write_restore_journals(transaction, "vault_published")
         _write_restore_journals(transaction, "committed")
@@ -1233,6 +1411,14 @@ def restore_backup(
             raise
         except sqlite3.Error as error:
             raise BackupIntegrityError("Restored database was not valid SQLite") from error
+        data_topology = _snapshot_restore_topology(
+            data_stage,
+            expected_entries=_expected_topology_entry_count(records, "data"),
+        )
+        vault_topology = _snapshot_restore_topology(
+            vault_stage,
+            expected_entries=_expected_topology_entry_count(records, "vault"),
+        )
         transaction = _RestoreTransaction(
             layout=layout,
             archive_sha256=archive_sha256,
@@ -1241,6 +1427,8 @@ def restore_backup(
             total_bytes=declared_total_bytes,
             data_identity=targets.data_identity[:2],
             vault_identity=targets.vault_identity[:2],
+            data_topology=data_topology,
+            vault_topology=vault_topology,
         )
         _publish_restore(targets, transaction, records)
         published = True

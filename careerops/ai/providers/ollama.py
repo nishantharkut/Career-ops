@@ -11,7 +11,7 @@ import re
 import secrets
 import socket
 import time
-from typing import Any, Literal
+from typing import Any, Callable, Literal
 from urllib.parse import urlsplit
 
 from careerops.ai.contracts import (
@@ -207,6 +207,62 @@ class OllamaRuntimeAuthority:
             return False
 
 
+_RUNTIME_VERIFIER_TOKEN = object()
+
+
+@dataclass(frozen=True, init=False)
+class OllamaRuntimeVerifier:
+    _authority: OllamaRuntimeAuthority = field(repr=False, compare=False)
+    _evidence: OllamaIsolationEvidence = field(repr=False, compare=False)
+    _verify: Callable[[], bool] = field(repr=False, compare=False)
+
+    def __init__(
+        self,
+        authority: OllamaRuntimeAuthority,
+        evidence: OllamaIsolationEvidence,
+        verify: Callable[[], bool],
+        *,
+        _token: object,
+    ):
+        if (
+            _token is not _RUNTIME_VERIFIER_TOKEN
+            or type(authority) is not OllamaRuntimeAuthority
+            or type(evidence) is not OllamaIsolationEvidence
+            or not callable(verify)
+        ):
+            raise ValueError("Ollama runtime verifier must be factory-bound")
+        object.__setattr__(self, "_authority", authority)
+        object.__setattr__(self, "_evidence", evidence)
+        object.__setattr__(self, "_verify", verify)
+
+    def verifies(
+        self,
+        authority: OllamaRuntimeAuthority,
+        evidence: OllamaIsolationEvidence,
+    ) -> bool:
+        try:
+            return bool(
+                authority is self._authority
+                and evidence is self._evidence
+                and self._verify()
+            )
+        except Exception:
+            return False
+
+
+def _bind_ollama_runtime_verifier(
+    authority: OllamaRuntimeAuthority,
+    evidence: OllamaIsolationEvidence,
+    verify: Callable[[], bool],
+) -> OllamaRuntimeVerifier:
+    return OllamaRuntimeVerifier(
+        authority,
+        evidence,
+        verify,
+        _token=_RUNTIME_VERIFIER_TOKEN,
+    )
+
+
 @dataclass(frozen=True)
 class OllamaModelIdentity:
     model: str
@@ -358,6 +414,11 @@ class OllamaProvider:
         default=None,
         repr=False,
     )
+    runtime_verifier: OllamaRuntimeVerifier | None = field(
+        default=None,
+        repr=False,
+        compare=False,
+    )
     _parsed_endpoint: _Endpoint | None = field(
         init=False, default=None, repr=False, compare=False
     )
@@ -374,6 +435,10 @@ class OllamaProvider:
             self.isolation_authority, OllamaRuntimeAuthority
         ):
             raise ValueError("isolation_authority must be a trusted authority")
+        if self.runtime_verifier is not None and type(
+            self.runtime_verifier
+        ) is not OllamaRuntimeVerifier:
+            raise ValueError("runtime_verifier must be factory-bound")
         parsed_endpoint = _parse_endpoint(
             endpoint,
             allow_managed_container=True,
@@ -390,20 +455,29 @@ class OllamaProvider:
         return _parse_endpoint(endpoint, allow_managed_container=True)
 
     def _verified_isolation_evidence(self) -> OllamaIsolationEvidence | None:
-        if (
-            self._parsed_endpoint is None
-            or self.isolation_authority is None
-            or self.isolation_evidence is None
-            or not self.runtime_instance_id
-            or not self.runtime_handle
-            or not self.isolation_authority.verifies(
-                self.isolation_evidence,
-                endpoint=self._parsed_endpoint.canonical,
-                model=self.model,
-                runtime_instance_id=self.runtime_instance_id,
-                runtime_handle=self.runtime_handle,
+        try:
+            valid = bool(
+                self._parsed_endpoint is not None
+                and self.isolation_authority is not None
+                and self.isolation_evidence is not None
+                and self.runtime_verifier is not None
+                and self.runtime_instance_id
+                and self.runtime_handle
+                and self.isolation_authority.verifies(
+                    self.isolation_evidence,
+                    endpoint=self._parsed_endpoint.canonical,
+                    model=self.model,
+                    runtime_instance_id=self.runtime_instance_id,
+                    runtime_handle=self.runtime_handle,
+                )
+                and self.runtime_verifier.verifies(
+                    self.isolation_authority,
+                    self.isolation_evidence,
+                )
             )
-        ):
+        except Exception:
+            valid = False
+        if not valid:
             return None
         return self.isolation_evidence
 
@@ -770,13 +844,22 @@ class OllamaProvider:
     ) -> dict[str, Any]:
         if self._parsed_endpoint is None:
             raise ProviderUnavailableError("Ollama provider configuration is invalid")
-        if (
-            self._parsed_endpoint.scope == "managed_container"
-            and self._verified_isolation_evidence() is None
-        ):
+        managed = any(
+            (
+                self.isolation_authority is not None,
+                self.isolation_evidence is not None,
+                self.runtime_verifier is not None,
+                bool(self.runtime_instance_id),
+                bool(self.runtime_handle),
+            )
+        )
+        if managed and self._verified_isolation_evidence() is None:
             raise ProviderUnavailableError(
                 "Ollama isolation evidence is invalid or unavailable"
             )
+        # This is the final app-side check before connecting. A same-host actor
+        # able to replace state between verification and connect is outside the
+        # application-process threat boundary.
         status, raw = _PrivateTransport(self._parsed_endpoint).request(
             method,
             path,

@@ -317,6 +317,10 @@ function Assert-LocalModel {
     } while ($true)
 }
 
+if ($MyInvocation.InvocationName -eq ".") {
+    return
+}
+
 $ResolvedExecutable = Get-RegularFullPath `
     -LiteralPath $ExecutablePath `
     -MustExist ($Action -eq "Launch")
@@ -366,6 +370,15 @@ if ($Action -eq "Launch") {
             throw "Managed Ollama executable copy was not regular"
         }
 
+        $Endpoint = "http://127.0.0.1:$Port"
+        Assert-PortUnbound
+        Write-LaunchRecord `
+            -Paths $Paths `
+            -State "intent" `
+            -OwnedProcessId 0 `
+            -OwnedRuntimeHandle "" `
+            -Endpoint $Endpoint
+
         New-NetFirewallRule `
             -Name $IsolationRuleId `
             -DisplayName $IsolationRuleId `
@@ -378,8 +391,6 @@ if ($Action -eq "Launch") {
         $RuleCreated = $true
         Assert-FirewallBoundary -RuleName $IsolationRuleId -OwnedExecutable $Paths.OwnedExecutable
 
-        $Endpoint = "http://127.0.0.1:$Port"
-        Assert-PortUnbound
         Write-LaunchRecord `
             -Paths $Paths `
             -State "firewall_ready" `

@@ -20,6 +20,7 @@ from careerops.ai.providers.ollama import (
     OllamaModelIdentity,
     OllamaProvider,
     OllamaRuntimeAuthority,
+    _bind_ollama_runtime_verifier,
     canonicalize_ollama_endpoint,
 )
 
@@ -278,6 +279,7 @@ class ManagedOllamaRuntimeFactory:
             f"careerops-api-{uuid4().hex}"
         )
         self._active: dict[str, ManagedOllamaRuntime] = {}
+        self._launching: dict[str, RuntimeLaunchRecord] = {}
         self._lock = RLock()
 
     def __repr__(self) -> str:
@@ -304,6 +306,7 @@ class ManagedOllamaRuntimeFactory:
                     runtime_handle=record.runtime_handle,
                     egress_policy=record.egress_policy,
                 )
+                self._launching[record.runtime_instance_id] = record
                 try:
                     provider = self._provider_builder(
                         endpoint=endpoint,
@@ -312,6 +315,13 @@ class ManagedOllamaRuntimeFactory:
                         runtime_handle=record.runtime_handle,
                         isolation_authority=self._authority,
                         isolation_evidence=evidence,
+                        runtime_verifier=_bind_ollama_runtime_verifier(
+                            self._authority,
+                            evidence,
+                            lambda bound_record=record: self._verify_bound_record(
+                                bound_record
+                            ),
+                        ),
                     )
                 except Exception as error:
                     raise ManagedRuntimeLaunchError(
@@ -341,6 +351,7 @@ class ManagedOllamaRuntimeFactory:
                     model_identity=identity,
                 )
                 self._active[record.runtime_instance_id] = managed
+                self._launching.pop(record.runtime_instance_id, None)
                 return managed
             except ManagedRuntimeLaunchError as error:
                 cleanup_record = record or error.record
@@ -354,6 +365,22 @@ class ManagedOllamaRuntimeFactory:
                 raise ManagedRuntimeLaunchError(
                     "Managed Ollama runtime could not be launched"
                 ) from error
+            finally:
+                if record is not None:
+                    self._launching.pop(record.runtime_instance_id, None)
+
+    def _verify_bound_record(self, record: RuntimeLaunchRecord) -> bool:
+        with self._lock:
+            try:
+                active = self._active.get(record.runtime_instance_id)
+                bound = self._launching.get(record.runtime_instance_id)
+                if bound is not record and (
+                    active is None or active.launch_record is not record
+                ):
+                    return False
+                return bool(self._launcher.verify(record))
+            except Exception:
+                return False
 
     def _cleanup_failed_launch(self, record: RuntimeLaunchRecord | None) -> None:
         if record is None:

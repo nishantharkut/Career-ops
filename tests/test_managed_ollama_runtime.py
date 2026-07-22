@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path
 import re
+import shutil
 import subprocess
 
 from fastapi.testclient import TestClient
@@ -381,6 +382,8 @@ def test_windows_launcher_script_owns_hidden_process_and_firewall_boundary():
     assert "Assert-PortUnbound" in script
     assert "launch-record.json" in script
     assert '"Recover"' in script
+    assert '-State "intent"' in script
+    assert script.index('-State "intent"') < script.index("New-NetFirewallRule")
 
 
 def test_windows_launcher_uses_argument_lists_and_scrubs_ambient_ollama_state(
@@ -496,6 +499,146 @@ def test_windows_launcher_recovers_durable_launch_record_after_timeout(
     assert calls[1][calls[1].index("-RuntimeRoot") + 1] == str(runtime_root)
 
 
+@pytest.mark.skipif(
+    shutil.which("pwsh") is None and shutil.which("powershell") is None,
+    reason="PowerShell is unavailable",
+)
+def test_windows_recovery_state_machine_removes_intent_and_launched_resources(
+    tmp_path: Path,
+):
+    powershell = shutil.which("pwsh") or shutil.which("powershell")
+    script = (
+        Path(__file__).resolve().parents[1] / "scripts" / "start-managed-ollama.ps1"
+    )
+    runtime_root = tmp_path / "runtime"
+    runtime_root.mkdir()
+    fixture_executable = tmp_path / "fixture-ollama.exe"
+    fixture_executable.write_bytes(b"fixture")
+
+    for instance, process_id, state in (
+        ("runtime-intent", 0, "intent"),
+        ("runtime-launched", 4201, "launched"),
+    ):
+        instance_root = runtime_root / instance
+        owned_executable = instance_root / "bin" / "ollama.exe"
+        owned_executable.parent.mkdir(parents=True)
+        owned_executable.write_bytes(b"owned")
+        (instance_root / "launch-record.json").write_text(
+            json.dumps(
+                {
+                    "version": 1,
+                    "runtime_instance_id": instance,
+                    "isolation_rule_id": f"CareerOps-Ollama-{instance}",
+                    "owned_executable": str(owned_executable),
+                    "endpoint": "http://127.0.0.1:11434",
+                    "model": "qwen2.5:7b",
+                    "process_id": process_id,
+                    "runtime_handle": f"pid:{process_id}" if process_id else "",
+                    "state": state,
+                }
+            ),
+            encoding="utf-8",
+        )
+
+    harness = tmp_path / "recovery-harness.ps1"
+    harness.write_text(
+        r'''
+param([string]$ScriptPath, [string]$Root, [string]$FixtureExecutable)
+. $ScriptPath -Action Recover -ExecutablePath $FixtureExecutable -Model "qwen2.5:7b" -RuntimeRoot $Root
+$script:RemovedRules = @()
+$script:StoppedProcesses = @()
+function Get-NetFirewallRule {
+    [CmdletBinding()]
+    param([string]$Name)
+    return [pscustomobject]@{ Name = $Name }
+}
+function Remove-NetFirewallRule {
+    [CmdletBinding()]
+    param([string]$Name)
+    $script:RemovedRules += $Name
+}
+function Get-Process {
+    [CmdletBinding()]
+    param([int]$Id)
+    if ($Id -eq 4201) {
+        return [pscustomobject]@{
+            Id = 4201
+            Path = (Join-Path $Root "runtime-launched/bin/ollama.exe")
+        }
+    }
+    return $null
+}
+function Get-CimInstance {
+    [CmdletBinding()]
+    param([string]$ClassName)
+    return @()
+}
+function Stop-Process {
+    [CmdletBinding()]
+    param([int]$Id, [switch]$Force)
+    $script:StoppedProcesses += $Id
+}
+function Get-NetTCPConnection {
+    [CmdletBinding()]
+    param([string]$State, [int]$LocalPort)
+    return [pscustomobject]@{
+        OwningProcess = $script:ListenerOwner
+        LocalAddress = "127.0.0.1"
+    }
+}
+$Recovered = @(Recover-PendingLaunches -Root $Root | Sort-Object)
+if (($Recovered -join ",") -ne "runtime-intent,runtime-launched") { throw "recovery set mismatch" }
+if (($script:RemovedRules | Sort-Object) -join "," -ne "CareerOps-Ollama-runtime-intent,CareerOps-Ollama-runtime-launched") { throw "firewall cleanup mismatch" }
+if (($script:StoppedProcesses -join ",") -ne "4201") { throw "process cleanup mismatch" }
+if (@(Get-ChildItem -LiteralPath $Root -Filter "launch-record.json" -Recurse).Count -ne 0) { throw "launch records remained" }
+$script:ListenerOwner = 4201
+Assert-EndpointOwnedByProcess -OwnedProcessId 4201
+$MismatchRejected = $false
+$script:ListenerOwner = 4202
+try { Assert-EndpointOwnedByProcess -OwnedProcessId 4201 } catch { $MismatchRejected = $true }
+if (-not $MismatchRejected) { throw "listener owner mismatch was accepted" }
+$PreexistingRejected = $false
+try { Assert-PortUnbound } catch { $PreexistingRejected = $true }
+if (-not $PreexistingRejected) { throw "preexisting listener was accepted" }
+@{ recovered = $Recovered; removed_rules = $script:RemovedRules; stopped_processes = $script:StoppedProcesses; ownership_rejected = $MismatchRejected; preexisting_rejected = $PreexistingRejected } | ConvertTo-Json -Compress
+''',
+        encoding="utf-8",
+    )
+
+    completed = subprocess.run(
+        [
+            powershell,
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            str(harness),
+            "-ScriptPath",
+            str(script),
+            "-Root",
+            str(runtime_root),
+            "-FixtureExecutable",
+            str(fixture_executable),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    result = json.loads(completed.stdout.strip().splitlines()[-1])
+    assert result["stopped_processes"] == [4201]
+    assert result["ownership_rejected"] is True
+    assert result["preexisting_rejected"] is True
+    assert sorted(result["removed_rules"]) == [
+        "CareerOps-Ollama-runtime-intent",
+        "CareerOps-Ollama-runtime-launched",
+    ]
+
+
 def _container_record(*, model: str = "qwen2.5:7b") -> RuntimeLaunchRecord:
     container_id = "a" * 64
     return RuntimeLaunchRecord(
@@ -574,6 +717,50 @@ def test_production_lifespan_enables_only_verified_compose_managed_ollama(
             runtime_handle=managed.runtime_handle,
         )
         assert launcher.events[:2] == ["launch", "verify"]
+
+
+def test_production_managed_provider_reverifies_live_runtime_before_probe_and_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    repo = CareerOpsRepository(tmp_path / "data" / "careerops.db", tmp_path / "vault")
+    repo.initialize()
+    launcher = FakeLauncher()
+    launcher.next_record = _container_record()
+    ollama_calls: list[tuple[str, str, bytes | None]] = []
+
+    def local_model_response(self, method: str, path: str, body, deadline):
+        ollama_calls.append((method, path, body))
+        return _local_model_response(self, method, path, body, deadline)
+
+    monkeypatch.setattr(OllamaProvider, "_request_json", local_model_response)
+    api = create_app(
+        repo,
+        environment=_compose_environment(tmp_path),
+        managed_runtime_launcher=launcher,
+    )
+
+    with TestClient(api) as client:
+        managed = api.state.managed_ollama_runtime
+        launcher.events.clear()
+        ollama_calls.clear()
+        launcher.current = replace(
+            managed.launch_record,
+            isolation_rule_id="network-replaced-after-startup",
+        )
+
+        ollama = next(
+            item
+            for item in client.get("/ai/providers").json()
+            if item["provider_kind"] == "ollama"
+        )
+
+        assert ollama["available"] is False
+        assert launcher.events == ["verify"]
+        assert ollama_calls == []
+        with pytest.raises(ProviderUnavailableError, match="isolation"):
+            managed.provider.run(object())
+        assert launcher.events == ["verify", "verify"]
+        assert ollama_calls == []
 
 
 def test_production_lifespan_keeps_invalid_managed_runtime_disabled_and_unavailable(

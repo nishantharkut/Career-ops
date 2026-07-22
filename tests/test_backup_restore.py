@@ -545,7 +545,7 @@ def test_restore_preserves_journal_when_rollback_fails_then_recovers_on_next_ent
     assert not list(tmp_path.glob(".careerops-restore-transaction-*.json"))
 
 
-def test_restore_recovers_cross_parent_publication_from_single_authoritative_journal(
+def test_restore_recovers_cross_parent_publication_from_mirrored_journals(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
     repo = _make_repo(tmp_path)
@@ -572,9 +572,10 @@ def test_restore_recovers_cross_parent_publication_from_single_authoritative_jou
     with pytest.raises(SimulatedRestoreCrash):
         restore_backup(backup.path, data_path, vault_path)
 
-    journals = list(data_parent.glob(".careerops-restore-transaction-*.json"))
-    assert len(journals) == 1
-    assert not list(vault_parent.glob(".careerops-restore-transaction-*.json"))
+    data_journals = list(data_parent.glob(".careerops-restore-transaction-*.json"))
+    vault_journals = list(vault_parent.glob(".careerops-restore-transaction-*.json"))
+    assert len(data_journals) == 1
+    assert len(vault_journals) == 1
     monkeypatch.setattr(
         backups_module,
         "_restore_publication_checkpoint",
@@ -585,6 +586,182 @@ def test_restore_recovers_cross_parent_publication_from_single_authoritative_jou
 
     assert (vault_path / "cross-parent.txt").read_bytes() == b"cross-parent"
     assert not list(data_parent.glob(".careerops-restore-transaction-*.json"))
+    assert not list(vault_parent.glob(".careerops-restore-transaction-*.json"))
+
+
+def test_restore_recovery_preserves_external_empty_directory_after_vault_publish_crash(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    repo = _make_repo(tmp_path)
+    (repo.vault_path / "proof.txt").write_bytes(b"published")
+    backup = create_backup(repo.database_path, repo.vault_path, tmp_path / "backups")
+    data_path, vault_path = _empty_targets(tmp_path)
+
+    def crash_after_vault_publish(boundary: str) -> None:
+        if boundary == "vault_published":
+            raise SimulatedRestoreCrash(boundary)
+
+    monkeypatch.setattr(
+        backups_module,
+        "_restore_publication_checkpoint",
+        crash_after_vault_publish,
+    )
+    with pytest.raises(SimulatedRestoreCrash):
+        restore_backup(backup.path, data_path, vault_path)
+    external_directory = vault_path / "caller-owned-empty-directory"
+    external_directory.mkdir()
+    monkeypatch.setattr(
+        backups_module,
+        "_restore_publication_checkpoint",
+        lambda _boundary: None,
+    )
+
+    with pytest.raises(RestoreTargetError, match="changed"):
+        restore_backup(backup.path, data_path, vault_path)
+
+    assert external_directory.is_dir()
+    assert list(tmp_path.glob(".careerops-restore-transaction-*.json"))
+
+
+def test_restore_fsyncs_each_rename_parent_before_advancing_journal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    repo = _make_repo(tmp_path)
+    (repo.vault_path / "proof.txt").write_bytes(b"durable")
+    backup = create_backup(repo.database_path, repo.vault_path, tmp_path / "backups")
+    data_parent = tmp_path / "data-parent"
+    vault_parent = tmp_path / "vault-parent"
+    data_parent.mkdir()
+    vault_parent.mkdir()
+    data_path = data_parent / "data"
+    vault_path = vault_parent / "vault"
+    data_path.mkdir()
+    vault_path.mkdir()
+    events: list[tuple[str, str]] = []
+    real_rename = backups_module._atomic_rename
+    real_fsync = backups_module._fsync_directory
+    real_write_journals = backups_module._write_restore_journals
+
+    def observed_rename(source: Path, destination: Path) -> None:
+        events.append(("rename", str(source.parent)))
+        real_rename(source, destination)
+
+    def observed_fsync(path: Path) -> None:
+        events.append(("fsync", str(path)))
+        real_fsync(path)
+
+    def observed_journals(transaction, phase: str) -> None:
+        events.append(("journal", phase))
+        real_write_journals(transaction, phase)
+
+    monkeypatch.setattr(backups_module, "_atomic_rename", observed_rename)
+    monkeypatch.setattr(backups_module, "_fsync_directory", observed_fsync)
+    monkeypatch.setattr(backups_module, "_write_restore_journals", observed_journals)
+
+    restore_backup(backup.path, data_path, vault_path)
+
+    for index, event in enumerate(events):
+        if event[0] == "rename":
+            assert events[index + 1] == ("fsync", event[1])
+
+
+def test_restore_recovers_power_loss_after_cross_parent_rename_fsync(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    repo = _make_repo(tmp_path)
+    (repo.vault_path / "proof.txt").write_bytes(b"power-loss")
+    backup = create_backup(repo.database_path, repo.vault_path, tmp_path / "backups")
+    data_parent = tmp_path / "data-parent"
+    vault_parent = tmp_path / "vault-parent"
+    data_parent.mkdir()
+    vault_parent.mkdir()
+    data_path = data_parent / "data"
+    vault_path = vault_parent / "vault"
+    data_path.mkdir()
+    vault_path.mkdir()
+    real_fsync = backups_module._fsync_directory
+    crashed = False
+
+    def crash_after_vault_publish_fsync(path: Path) -> None:
+        nonlocal crashed
+        real_fsync(path)
+        if (
+            not crashed
+            and path == vault_parent
+            and vault_path.is_dir()
+            and not next(vault_parent.glob(".careerops-restore-vault-*"), None)
+            and next(vault_parent.glob(".careerops-empty-vault-*"), None) is not None
+        ):
+            crashed = True
+            raise SimulatedRestoreCrash("vault publish fsync")
+
+    monkeypatch.setattr(backups_module, "_fsync_directory", crash_after_vault_publish_fsync)
+    with pytest.raises(SimulatedRestoreCrash, match="vault publish fsync"):
+        restore_backup(backup.path, data_path, vault_path)
+
+    assert list(data_parent.glob(".careerops-restore-transaction-*.json"))
+    assert list(vault_parent.glob(".careerops-restore-transaction-*.json"))
+    monkeypatch.setattr(backups_module, "_fsync_directory", real_fsync)
+
+    restore_backup(backup.path, data_path, vault_path)
+
+    assert (vault_path / "proof.txt").read_bytes() == b"power-loss"
+    assert not list(data_parent.glob(".careerops-restore-transaction-*.json"))
+    assert not list(vault_parent.glob(".careerops-restore-transaction-*.json"))
+
+
+def test_restore_recovers_power_loss_between_mirrored_journal_replaces(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    repo = _make_repo(tmp_path)
+    (repo.vault_path / "proof.txt").write_bytes(b"journal-power-loss")
+    backup = create_backup(repo.database_path, repo.vault_path, tmp_path / "backups")
+    data_parent = tmp_path / "data-parent"
+    vault_parent = tmp_path / "vault-parent"
+    data_parent.mkdir()
+    vault_parent.mkdir()
+    data_path = data_parent / "data"
+    vault_path = vault_parent / "vault"
+    data_path.mkdir()
+    vault_path.mkdir()
+    real_replace = backups_module.os.replace
+    crashed = False
+
+    def crash_after_first_vault_published_journal(source, destination) -> None:
+        nonlocal crashed
+        source_path = Path(source)
+        destination_path = Path(destination)
+        phase = None
+        if destination_path.name.startswith(".careerops-restore-transaction-"):
+            phase = json.loads(source_path.read_text(encoding="utf-8"))["phase"]
+        real_replace(source, destination)
+        if (
+            not crashed
+            and phase == "vault_published"
+            and destination_path.parent == data_parent
+        ):
+            crashed = True
+            raise SimulatedRestoreCrash("first mirrored journal replace")
+
+    monkeypatch.setattr(
+        backups_module.os,
+        "replace",
+        crash_after_first_vault_published_journal,
+    )
+    with pytest.raises(SimulatedRestoreCrash, match="mirrored journal replace"):
+        restore_backup(backup.path, data_path, vault_path)
+
+    data_journal = next(data_parent.glob(".careerops-restore-transaction-*.json"))
+    vault_journal = next(vault_parent.glob(".careerops-restore-transaction-*.json"))
+    assert json.loads(data_journal.read_text(encoding="utf-8"))["phase"] == "vault_published"
+    assert json.loads(vault_journal.read_text(encoding="utf-8"))["phase"] == "data_published"
+    monkeypatch.setattr(backups_module.os, "replace", real_replace)
+
+    restore_backup(backup.path, data_path, vault_path)
+
+    assert (vault_path / "proof.txt").read_bytes() == b"journal-power-loss"
+    assert not list(data_parent.glob(".careerops-restore-transaction-*.json"))
+    assert not list(vault_parent.glob(".careerops-restore-transaction-*.json"))
 
 
 def test_restore_recovery_never_deletes_a_changed_partially_published_target(
