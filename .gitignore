@@ -1,6 +1,7 @@
 # Local private state
 data/
 vault/
+backups/
 exports/
 *.db
 *.sqlite

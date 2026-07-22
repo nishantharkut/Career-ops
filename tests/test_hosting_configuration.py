@@ -1,9 +1,39 @@
+import json
+import os
 from pathlib import Path
+import re
+import shutil
+import subprocess
 
 from fastapi.testclient import TestClient
+import pytest
 
 from apps.api.careerops_api.main import BasicAuthConfig, create_app
 from careerops.core.repository import CareerOpsRepository
+
+
+ROOT = Path(__file__).resolve().parents[1]
+
+
+def compose_config() -> dict:
+    docker = shutil.which("docker")
+    if docker is None:
+        pytest.skip("Docker CLI is unavailable")
+    environment = {
+        **os.environ,
+        "CAREEROPS_AUTH_USERNAME": "compose-test-user",
+        "CAREEROPS_AUTH_PASSWORD": "compose-test-password-with-32-characters",
+    }
+    completed = subprocess.run(
+        [docker, "compose", "-f", str(ROOT / "compose.yaml"), "config", "--format", "json"],
+        cwd=ROOT,
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stderr
+    return json.loads(completed.stdout)
 
 
 def make_repo(tmp_path: Path) -> CareerOpsRepository:
@@ -99,3 +129,95 @@ def test_api_serves_built_react_app_from_same_origin(tmp_path: Path):
     assert "CareerOps app shell" in client_route.text
     assert asset.status_code == 200
     assert "careerops" in asset.text
+
+
+def test_compose_persists_private_state_backups_and_local_model_data():
+    config = compose_config()
+    services = config["services"]
+    careerops = services["careerops"]
+    ollama = services["ollama"]
+
+    assert careerops["restart"] == "unless-stopped"
+    assert ollama["restart"] == "unless-stopped"
+    careerops_mounts = {item["target"]: item for item in careerops["volumes"]}
+    assert set(careerops_mounts) >= {"/app/data", "/app/vault", "/app/backups"}
+    assert all(careerops_mounts[path].get("read_only", False) is False for path in careerops_mounts)
+    ollama_mounts = {item["target"]: item for item in ollama["volumes"]}
+    assert "/root/.ollama" in ollama_mounts
+    assert ollama_mounts["/root/.ollama"].get("read_only", False) is False
+
+
+def test_compose_requires_auth_and_contains_no_source_credentials():
+    config = compose_config()
+    environment = config["services"]["careerops"]["environment"]
+    compose_source = (ROOT / "compose.yaml").read_text(encoding="utf-8")
+    example_source = (ROOT / ".env.example").read_text(encoding="utf-8")
+
+    assert environment["CAREEROPS_REQUIRE_AUTH"] == "true"
+    assert environment["CAREEROPS_AUTH_USERNAME"] == "compose-test-user"
+    assert environment["CAREEROPS_AUTH_PASSWORD"] == "compose-test-password-with-32-characters"
+    assert "nishant" not in compose_source.casefold()
+    assert "nishant" not in example_source.casefold()
+    assert "replace-with" not in compose_source.casefold()
+    assert "replace-with" not in example_source.casefold()
+    assert "CAREEROPS_AUTH_USERNAME: ${CAREEROPS_AUTH_USERNAME:?" in compose_source
+    assert "CAREEROPS_AUTH_PASSWORD: ${CAREEROPS_AUTH_PASSWORD:?" in compose_source
+    assert "CAREEROPS_AUTH_USERNAME=" in example_source
+    assert "CAREEROPS_AUTH_PASSWORD=" in example_source
+
+
+def test_compose_uses_explicit_fail_closed_provider_configuration():
+    config = compose_config()
+    environment = config["services"]["careerops"]["environment"]
+    source = (ROOT / "compose.yaml").read_text(encoding="utf-8")
+
+    assert environment["CAREEROPS_CODEX_ENABLED"] == "false"
+    assert environment["CAREEROPS_CODEX_COMMANDS"] == "codex2,codex"
+    assert environment["CAREEROPS_OLLAMA_URL"] == "http://ollama:11434"
+    assert environment["CAREEROPS_OLLAMA_MODEL"] == "qwen2.5:7b"
+    assert environment["CAREEROPS_OLLAMA_MANAGED_MODE"] == "container"
+    assert "AUTHORITY" not in source
+    assert "CAPABILITY" not in source
+    assert "ISOLATION_EVIDENCE" not in source
+    assert "API_KEY" not in source
+    assert "fallback" not in source.casefold()
+
+
+def test_ollama_has_internal_no_egress_network_without_published_port():
+    config = compose_config()
+    services = config["services"]
+    ollama = services["ollama"]
+    careerops = services["careerops"]
+
+    assert set(ollama["networks"]) == {"ollama_private"}
+    assert config["networks"]["ollama_private"]["internal"] is True
+    assert "ports" not in ollama
+    assert "expose" in ollama and ollama["expose"] == ["11434"]
+    assert set(careerops["networks"]) == {"public_api", "ollama_private"}
+    assert config["networks"]["public_api"].get("internal", False) is False
+    assert ollama["environment"]["OLLAMA_NO_CLOUD"] == "1"
+    assert ollama["environment"]["OLLAMA_HOST"] == "0.0.0.0:11434"
+
+
+def test_compose_healthchecks_and_least_privilege_are_enabled():
+    config = compose_config()
+    for service_name in ("careerops", "ollama"):
+        service = config["services"][service_name]
+        assert service["healthcheck"]["test"]
+        assert service["read_only"] is True
+        assert "ALL" in service["cap_drop"]
+        assert "no-new-privileges:true" in service["security_opt"]
+        assert any(item.startswith("/tmp:") for item in service["tmpfs"])
+    assert config["services"]["careerops"]["depends_on"]["ollama"]["condition"] == "service_healthy"
+
+
+def test_compose_remains_self_hosted_without_paid_managed_dependencies():
+    config = compose_config()
+    assert set(config["services"]) == {"careerops", "ollama"}
+    assert Path(config["services"]["careerops"]["build"]["context"]).resolve() == ROOT.resolve()
+    image = config["services"]["ollama"]["image"]
+    assert re.fullmatch(r"ollama/ollama@sha256:[0-9a-f]{64}", image)
+    assert not any(
+        key in config["services"]["careerops"]["environment"]
+        for key in ("OPENAI_API_KEY", "ANTHROPIC_API_KEY", "AWS_ACCESS_KEY_ID")
+    )

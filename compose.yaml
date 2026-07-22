@@ -1,18 +1,52 @@
 services:
   careerops:
-    build: .
+    build:
+      context: .
     restart: unless-stopped
+    read_only: true
+    user: "${CAREEROPS_UID:-1000}:${CAREEROPS_GID:-1000}"
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
     ports:
-      - "8765:8765"
+      - "${CAREEROPS_PORT:-8765}:8765"
     environment:
       CAREEROPS_DB_PATH: /app/data/careerops.db
       CAREEROPS_VAULT_PATH: /app/vault
+      CAREEROPS_BACKUP_PATH: /app/backups
       CAREEROPS_REQUIRE_AUTH: "true"
-      CAREEROPS_AUTH_USERNAME: ${CAREEROPS_AUTH_USERNAME}
-      CAREEROPS_AUTH_PASSWORD: ${CAREEROPS_AUTH_PASSWORD}
+      CAREEROPS_AUTH_USERNAME: ${CAREEROPS_AUTH_USERNAME:?set CAREEROPS_AUTH_USERNAME}
+      CAREEROPS_AUTH_PASSWORD: ${CAREEROPS_AUTH_PASSWORD:?set CAREEROPS_AUTH_PASSWORD}
+      CAREEROPS_ALLOWED_ORIGINS: ${CAREEROPS_ALLOWED_ORIGINS:-}
+      CAREEROPS_CODEX_ENABLED: "${CAREEROPS_CODEX_ENABLED:-false}"
+      CAREEROPS_CODEX_COMMANDS: ${CAREEROPS_CODEX_COMMANDS:-codex2,codex}
+      CAREEROPS_OLLAMA_URL: http://ollama:11434
+      CAREEROPS_OLLAMA_MODEL: ${CAREEROPS_OLLAMA_MODEL:-qwen2.5:7b}
+      CAREEROPS_OLLAMA_MANAGED_MODE: container
+      HOME: /tmp/careerops
+      XDG_CACHE_HOME: /tmp/careerops/cache
+      NO_PROXY: ollama,127.0.0.1,localhost
+      no_proxy: ollama,127.0.0.1,localhost
     volumes:
-      - ./data:/app/data
-      - ./vault:/app/vault
+      - type: bind
+        source: ./data
+        target: /app/data
+      - type: bind
+        source: ./vault
+        target: /app/vault
+      - type: bind
+        source: ./backups
+        target: /app/backups
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=512m
+    networks:
+      - public_api
+      - ollama_private
+    depends_on:
+      ollama:
+        condition: service_healthy
+        restart: true
     healthcheck:
       test:
         [
@@ -25,3 +59,50 @@ services:
       timeout: 5s
       retries: 3
       start_period: 30s
+
+  ollama:
+    image: ${CAREEROPS_OLLAMA_IMAGE:-ollama/ollama@sha256:6345fbc18bd73a1e16404be681dbc6fd291a027cab43ed541abe78c4c81051b0}
+    restart: unless-stopped
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    environment:
+      OLLAMA_HOST: 0.0.0.0:11434
+      OLLAMA_NO_CLOUD: "1"
+      OLLAMA_MODELS: /root/.ollama/models
+      CAREEROPS_OLLAMA_MODEL: ${CAREEROPS_OLLAMA_MODEL:-qwen2.5:7b}
+      HOME: /root
+      NO_PROXY: 127.0.0.1,localhost
+      no_proxy: 127.0.0.1,localhost
+    expose:
+      - "11434"
+    volumes:
+      - type: volume
+        source: ollama_models
+        target: /root/.ollama
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=256m
+    networks:
+      - ollama_private
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "ollama show \"$${CAREEROPS_OLLAMA_MODEL}\" >/dev/null 2>&1"
+        ]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+
+networks:
+  public_api:
+    driver: bridge
+  ollama_private:
+    driver: bridge
+    internal: true
+
+volumes:
+  ollama_models:
