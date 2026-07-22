@@ -34,7 +34,9 @@ Good labels:
 
 - `Add application`
 - `Render PDF`
-- `Analyze`
+- `Run verifier`
+- `Not AI`
+- `Run AI review`
 - `Missing evidence`
 - `Claim not verified`
 - `PDF is stale`
@@ -277,8 +279,12 @@ The product should still look like a focused internal tool.
 
 AI controls must be explicit and plain.
 
+Use `Run verifier` for the deterministic diagnostic. Mark its provider `(Not AI)` and show `Not AI. This verifier cannot unlock approval.` as status. Use `Run AI review` for AI-backed `analyze_fit`, the review path that can become approval-eligible.
+
 Required labels:
 
+- `Run verifier`
+- `Not AI`
 - `Run AI review`
 - `Local model`
 - `Codex deep review`
