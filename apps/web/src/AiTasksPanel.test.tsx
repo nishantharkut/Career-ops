@@ -249,6 +249,52 @@ describe("AI tasks panel", () => {
     expect(screen.getByText("Completed")).toBeInTheDocument();
   });
 
+  test("keeps terminal findings when the packet catches up to the polled task", async () => {
+    const pending = task({ task_type: "suggest_resume_edits", status: "pending", completed_at: null });
+    const completed = task({ task_type: "suggest_resume_edits", status: "completed" });
+    const safeFinding = {
+      id: "aif_safe",
+      task_id: completed.id,
+      finding_type: "resume_edit_suggestion",
+      severity: "info",
+      claim_text: "Use verified wording",
+      evidence_item_id: null,
+      recommendation: "Aligns the wording with the evidence",
+      verifier_state: "verified",
+      decision: "pending",
+      payload: { replacement_text: "Verified replacement" },
+      created_at: "",
+      updated_at: ""
+    };
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL) => {
+        const url = String(input);
+        if (url.endsWith("/ai/providers")) {
+          return jsonResponse([provider({ privacy_mode: "local_private", data_leaves_machine: false })]);
+        }
+        if (url.endsWith(`/ai-tasks/${completed.id}`)) return jsonResponse(completed);
+        if (url.endsWith(`/ai-tasks/${completed.id}/findings`)) return jsonResponse([safeFinding]);
+        throw new Error(`Unhandled request: ${url}`);
+      })
+    );
+    vi.useFakeTimers();
+    const view = render(
+      <AiTasksPanel applicationId="app_1" initialTask={pending} onPacketChanged={vi.fn()} />
+    );
+    await act(async () => Promise.resolve());
+
+    await act(async () => vi.advanceTimersByTimeAsync(1500));
+    expect(screen.getByText("Verified replacement")).toBeInTheDocument();
+
+    view.rerender(
+      <AiTasksPanel applicationId="app_1" initialTask={completed} onPacketChanged={vi.fn()} />
+    );
+    await act(async () => Promise.resolve());
+
+    expect(screen.getByText("Verified replacement")).toBeInTheDocument();
+  });
+
   test("retries a transient poll failure, clears the error, and stops at terminal", async () => {
     let gets = 0;
     const fetchMock = vi.fn(async (input: RequestInfo | URL) => {

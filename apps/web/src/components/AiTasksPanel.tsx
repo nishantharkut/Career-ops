@@ -91,10 +91,13 @@ export default function AiTasksPanel({ applicationId, initialTask, readOnly = fa
   }, []);
 
   useEffect(() => {
-    setActiveTask(initialTask);
     setFindings([]);
     setAcknowledged(false);
     setError("");
+  }, [applicationId, initialTask?.id]);
+
+  useEffect(() => {
+    setActiveTask(initialTask);
   }, [applicationId, initialTask?.id, initialTask?.status]);
 
   useEffect(() => {

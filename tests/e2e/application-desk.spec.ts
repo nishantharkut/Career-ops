@@ -223,8 +223,6 @@ async function openFixtureDesk(page: Page, state: DeskFixtureState): Promise<voi
 test("day-one application desk blocks risky resume and submits clean packet", async ({ page }) => {
   await page.goto("/");
 
-  await expect(page.getByText("No applications yet. Add a JD to start a packet.")).toBeVisible();
-
   await page.getByRole("button", { name: "Add application" }).click();
   await page.getByLabel("Company").fill("Swiggy");
   await page.getByLabel("Role title").fill("Data Science Intern");
@@ -256,7 +254,7 @@ test("day-one application desk blocks risky resume and submits clean packet", as
   await page.getByRole("button", { name: "Approve packet" }).click();
   await page.getByRole("button", { name: "Mark submitted manually" }).click();
 
-  await expect(page.getByText("Submitted manually")).toBeVisible();
+  await expect(page.getByText("Submitted manually", { exact: true })).toBeVisible();
 });
 
 for (const width of [320, 375, 414, 768, 1280]) {

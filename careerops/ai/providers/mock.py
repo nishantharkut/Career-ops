@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any, Mapping
 
@@ -19,7 +20,7 @@ from careerops.core.status import PrivacyMode
 
 @dataclass(frozen=True)
 class MockProvider:
-    raw_output: Mapping[str, Any] | str
+    raw_output: Mapping[str, Any] | str | Callable[[ProviderRequest], Mapping[str, Any] | str]
     model: str = "fixture-v1"
 
     def availability(self) -> ProviderAvailability:
@@ -34,19 +35,20 @@ class MockProvider:
         )
 
     def run(self, request: ProviderRequest) -> ProviderResult:
-        if isinstance(self.raw_output, str):
-            payload = parse_json_object(self.raw_output)
-            raw_output = self.raw_output
+        configured_output = self.raw_output(request) if callable(self.raw_output) else self.raw_output
+        if isinstance(configured_output, str):
+            payload = parse_json_object(configured_output)
+            raw_output = configured_output
         else:
             conversion_failed = False
             try:
-                payload = dict(self.raw_output)
+                payload = dict(configured_output)
             except Exception:
                 conversion_failed = True
             if conversion_failed:
                 raise ProviderOutputError("Mock provider output was invalid")
         output = validate_provider_output(request, payload)
-        if not isinstance(self.raw_output, str):
+        if not isinstance(configured_output, str):
             raw_output = serialize_provider_output(output)
         return build_provider_result(
             provider_kind="mock",

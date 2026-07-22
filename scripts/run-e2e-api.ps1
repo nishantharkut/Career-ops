@@ -4,24 +4,34 @@ $Root = Split-Path -Parent $PSScriptRoot
 $RootPath = [System.IO.Path]::GetFullPath($Root)
 Set-Location $RootPath
 
-$Targets = @(
-    "data/e2e-careerops.db",
-    "data/e2e-careerops.db-wal",
-    "data/e2e-careerops.db-shm",
-    "vault-e2e"
-)
+$TempRoot = [System.IO.Path]::GetFullPath([System.IO.Path]::GetTempPath())
+$RunName = "careerops-e2e-$PID-$([System.Guid]::NewGuid().ToString('N'))"
+$RunRoot = [System.IO.Path]::GetFullPath((Join-Path $TempRoot $RunName))
+if (
+    -not $RunRoot.StartsWith($TempRoot, [System.StringComparison]::OrdinalIgnoreCase) -or
+    (Split-Path -Leaf $RunRoot) -ne $RunName -or
+    -not $RunName.StartsWith("careerops-e2e-", [System.StringComparison]::Ordinal)
+) {
+    throw "Refusing to use an unsafe E2E state path: $RunRoot"
+}
+New-Item -ItemType Directory -Path $RunRoot | Out-Null
 
-foreach ($Target in $Targets) {
-    $FullPath = [System.IO.Path]::GetFullPath((Join-Path $RootPath $Target))
-    if (-not $FullPath.StartsWith($RootPath, [System.StringComparison]::OrdinalIgnoreCase)) {
-        throw "Refusing to clean path outside project root: $FullPath"
-    }
-    if (Test-Path -LiteralPath $FullPath) {
-        Remove-Item -LiteralPath $FullPath -Recurse -Force
+$env:CAREEROPS_DB_PATH = Join-Path $RunRoot "careerops.db"
+$env:CAREEROPS_VAULT_PATH = Join-Path $RunRoot "vault"
+$env:CAREEROPS_AI_TEST_PROVIDER = "mock"
+
+try {
+    & ".\.venv\Scripts\python.exe" -m uvicorn apps.api.careerops_api.main:app --host 127.0.0.1 --port 8765
+    exit $LASTEXITCODE
+}
+finally {
+    $ResolvedRunRoot = [System.IO.Path]::GetFullPath($RunRoot)
+    if (
+        $ResolvedRunRoot.StartsWith($TempRoot, [System.StringComparison]::OrdinalIgnoreCase) -and
+        (Split-Path -Leaf $ResolvedRunRoot) -eq $RunName -and
+        $RunName.StartsWith("careerops-e2e-", [System.StringComparison]::Ordinal) -and
+        (Test-Path -LiteralPath $ResolvedRunRoot)
+    ) {
+        Remove-Item -LiteralPath $ResolvedRunRoot -Recurse -Force
     }
 }
-
-$env:CAREEROPS_DB_PATH = "data/e2e-careerops.db"
-$env:CAREEROPS_VAULT_PATH = "vault-e2e"
-
-& ".\.venv\Scripts\python.exe" -m uvicorn apps.api.careerops_api.main:app --host 127.0.0.1 --port 8765

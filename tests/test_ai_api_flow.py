@@ -670,9 +670,14 @@ def test_create_task_is_persisted_running_queryable_and_reloadable(tmp_path: Pat
     with TestClient(create_app(repo, provider_registry={config.id: provider})) as reloaded:
         terminal = reloaded.get(f"/ai-tasks/{task_id}")
         findings = reloaded.get(f"/ai-tasks/{task_id}/findings")
+        artifacts = reloaded.get(f"/ai-tasks/{task_id}/artifacts")
         assert terminal.status_code == 200
         assert terminal.json()["status"] == "completed"
         assert len(findings.json()) == 1
+        assert artifacts.status_code == 200
+        assert artifacts.json()
+        assert all("path" not in artifact for artifact in artifacts.json())
+        assert all("claim_token" not in artifact for artifact in artifacts.json())
         finding_id = findings.json()[0]["id"]
         accepted_finding = reloaded.post(
             f"/ai-findings/{finding_id}/decision", json={"decision": "accepted"}
@@ -953,6 +958,31 @@ def test_default_provider_setup_is_fail_closed_and_keeps_codex_identities_distin
     assert ollama["model"] == "fixture-local"
 
 
+def test_default_provider_setup_registers_mock_only_for_explicit_e2e_mode(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    repo = make_repo(tmp_path)
+    monkeypatch.setenv("CAREEROPS_AI_TEST_PROVIDER", "mock")
+
+    providers = TestClient(create_app(repo)).get("/ai/providers").json()
+
+    mock = next(item for item in providers if item["provider_kind"] == "mock")
+    assert mock["display_name"] == "E2E mock provider"
+    assert mock["available"] is True
+    assert mock["privacy_mode"] == "local_private"
+    assert mock["data_leaves_machine"] is False
+
+
+def test_default_provider_setup_rejects_unknown_test_provider(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    repo = make_repo(tmp_path)
+    monkeypatch.setenv("CAREEROPS_AI_TEST_PROVIDER", "not-a-provider")
+
+    with pytest.raises(RuntimeError, match="CAREEROPS_AI_TEST_PROVIDER is invalid"):
+        create_app(repo)
+
+
 def test_default_provider_setup_always_lists_unmanaged_ollama_without_network(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
@@ -1025,6 +1055,22 @@ def test_packet_reloads_selected_resume_report_latest_task_evidence_and_versions
     assert packet["versions"][0]["event_type"] == "packet.seeded"
     assert "tex_path" not in str(packet)
     assert "raw_text_path" not in str(packet)
+
+
+def test_resume_metadata_route_exposes_checksums_without_private_paths(tmp_path: Path):
+    repo = make_repo(tmp_path)
+    application = create_application(repo)
+    resume = select_resume(repo, application.id)
+
+    response = TestClient(create_app(repo, provider_registry={})).get(
+        f"/resumes/{resume.id}"
+    )
+
+    assert response.status_code == 200
+    assert response.json()["tex_sha256"] == resume.tex_sha256
+    assert response.json()["pdf_sha256"] == resume.pdf_sha256
+    assert "tex_path" not in response.text
+    assert "pdf_path" not in response.text
 
 
 def test_packet_uses_one_snapshot_during_concurrent_requirements_update(

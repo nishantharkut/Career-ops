@@ -379,6 +379,20 @@ def test_mock_provider_returns_validated_result_and_local_privacy(tmp_path: Path
     assert result.is_ai is True
 
 
+def test_mock_provider_can_derive_output_from_the_sealed_request(tmp_path: Path):
+    request = make_request(tmp_path)
+    observed: list[str] = []
+
+    def fixture_output(provider_request: ProviderRequest):
+        observed.append(provider_request.task_type)
+        return VALID_OUTPUTS[provider_request.task_type]
+
+    result = MockProvider(raw_output=fixture_output).run(request)
+
+    assert observed == ["analyze_fit"]
+    assert isinstance(result.structured_output, AnalyzeFitOutput)
+
+
 def test_mock_string_preserves_exact_raw_output_and_sha256(tmp_path: Path):
     raw = json.dumps(
         VALID_OUTPUTS["analyze_fit"],
