@@ -2,7 +2,7 @@ import { readFileSync } from "node:fs";
 
 import { expect, test, type Page, type TestInfo } from "@playwright/test";
 
-import { cleanResumePath, makeRiskyResume, sampleJdPath } from "./fixtures";
+import { sampleJdPath, writeCleanResume, writeRiskyResume } from "./fixtures";
 
 const API_ORIGIN = "http://127.0.0.1:8765";
 const NOW = "2026-07-22T08:00:00Z";
@@ -230,7 +230,9 @@ test("empty application desk shows the start state", async ({ page }) => {
   await expect(page.getByText("No applications yet. Add a JD to start a packet.")).toBeVisible();
 });
 
-test("day-one application desk blocks risky resume and submits clean packet", async ({ page }) => {
+test("day-one application desk blocks risky resume and submits clean packet", async ({ page }, testInfo) => {
+  const riskyResumePath = writeRiskyResume(testInfo.outputPath("risky_resume.tex"));
+  const cleanResumePath = writeCleanResume(testInfo.outputPath("clean_resume.tex"));
   await page.goto("/");
 
   await page.getByRole("button", { name: "Add application" }).click();
@@ -244,7 +246,7 @@ test("day-one application desk blocks risky resume and submits clean packet", as
   await expect(page.getByRole("heading", { name: "Swiggy" })).toBeVisible();
 
   await page.getByLabel("Resume name").fill("Risky resume");
-  await page.getByLabel("LaTeX file").setInputFiles(makeRiskyResume());
+  await page.getByLabel("LaTeX file").setInputFiles(riskyResumePath);
   await page.getByRole("button", { name: "Upload resume" }).click();
   await expect(page.getByText("Risky resume")).toBeVisible();
   await page.getByRole("button", { name: "Render PDF" }).click();

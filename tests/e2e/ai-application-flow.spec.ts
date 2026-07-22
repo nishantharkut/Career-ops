@@ -2,15 +2,16 @@ import { expect, Page, test } from "@playwright/test";
 import { readFileSync } from "node:fs";
 
 import {
-  cleanResumePath,
-  makeRiskyResume,
   safeResumeReplacement,
   sampleJdPath,
-  unsafeMetricClaim
+  unsafeMetricClaim,
+  writeCleanResume,
+  writeRiskyResume
 } from "./fixtures";
 
 const API_ORIGIN = "http://127.0.0.1:8765";
 const MOCK_PROVIDER_LABEL = "E2E mock provider";
+const E2E_CONTROL_HEADERS = { "X-CareerOps-E2E-Control": "careerops-e2e-control-v1" };
 
 type JsonObject = Record<string, unknown>;
 
@@ -106,6 +107,17 @@ async function packet(page: Page, applicationId: string): Promise<ApplicationPac
   return apiJson<ApplicationPacket>(page, `/applications/${applicationId}/packet`);
 }
 
+async function actualResumeSourceSha256(page: Page, resumeId: string): Promise<string> {
+  const response = await page.request.get(
+    `${API_ORIGIN}/__e2e__/resumes/${resumeId}/source-sha256`,
+    { headers: E2E_CONTROL_HEADERS }
+  );
+  expect(response.status(), await response.text()).toBe(200);
+  const payload = await response.json() as { sha256: string };
+  expect(payload.sha256).toMatch(/^[0-9a-f]{64}$/);
+  return payload.sha256;
+}
+
 async function selectApplication(page: Page, applicationId: string): Promise<void> {
   const applications = await apiJson<Array<{ id: string }>>(page, "/applications");
   const applicationIndex = applications.findIndex((application) => application.id === applicationId);
@@ -185,6 +197,8 @@ test("real mock provider completes the day-one application workflow with durable
   let applicationId: string;
   let profileFactId: string;
   const profileFactKey = `production_software_delivery_e2e_${testInfo.repeatEachIndex}`;
+  const riskyResumePath = writeRiskyResume(testInfo.outputPath("risky_resume.tex"));
+  const cleanResumePath = writeCleanResume(testInfo.outputPath("clean_resume.tex"));
 
   await test.step("create an application and analyze the JD through the persisted mock task runner", async () => {
     await page.goto("/");
@@ -245,8 +259,6 @@ test("real mock provider completes the day-one application workflow with durable
     await expect(page.getByText(profileFactKey, { exact: true })).toBeVisible();
   });
 
-  const riskyResumePath = makeRiskyResume();
-
   await test.step("block the unsafe 70+ output and reject the risky resume", async () => {
     await uploadResume(page, "Risky 70+ resume", riskyResumePath);
     await renderSelectedResume(page);
@@ -280,12 +292,15 @@ test("real mock provider completes the day-one application workflow with durable
   });
 
   let parentResume: ResumeRecord;
+  let parentSourceSha256: string;
   await test.step("replace the risky resume with a clean rendered parent and complete fit review", async () => {
     await uploadResume(page, "Clean application resume", cleanResumePath);
     parentResume = (await packet(page, applicationId)).selected_resume!;
     expect(parentResume.parent_resume_version_id).toBeNull();
+    parentSourceSha256 = await actualResumeSourceSha256(page, parentResume.id);
     const parentById = await apiJson<ResumeRecord>(page, `/resumes/${parentResume.id}`);
     expect(parentById.tex_sha256).toBe(parentResume.tex_sha256);
+    expect(parentSourceSha256).toBe(parentResume.tex_sha256);
 
     await renderSelectedResume(page);
     await runAiTask(page, "analyze_fit", "Run AI review", "Completed");
@@ -314,6 +329,7 @@ test("real mock provider completes the day-one application workflow with durable
     expect(childResume.tex_sha256).not.toBe(parentResume.tex_sha256);
     const parentAfterDraft = await apiJson<ResumeRecord>(page, `/resumes/${parentResume.id}`);
     expect(parentAfterDraft).toMatchObject({ id: parentResume.id, tex_sha256: parentResume.tex_sha256 });
+    expect(await actualResumeSourceSha256(page, parentResume.id)).toBe(parentSourceSha256);
     expect(draftPacket.versions).toEqual(expect.arrayContaining([
       expect.objectContaining({
         event_type: "resume_draft.created",

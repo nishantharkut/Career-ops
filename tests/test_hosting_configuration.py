@@ -61,6 +61,25 @@ def test_basic_auth_allows_cors_preflight_for_hosted_frontend(tmp_path: Path):
     assert response.headers["access-control-allow-origin"] == "https://careerops.example"
 
 
+def test_create_app_can_explicitly_disable_ambient_auth(
+    tmp_path: Path,
+    monkeypatch,
+):
+    monkeypatch.setenv("CAREEROPS_REQUIRE_AUTH", "true")
+    monkeypatch.setenv("CAREEROPS_AUTH_USERNAME", "ambient-user")
+    monkeypatch.setenv("CAREEROPS_AUTH_PASSWORD", "ambient-password")
+
+    client = TestClient(
+        create_app(
+            make_repo(tmp_path),
+            provider_registry={},
+            inherit_environment_auth=False,
+        )
+    )
+
+    assert client.get("/applications").status_code == 200
+
+
 def test_api_serves_built_react_app_from_same_origin(tmp_path: Path):
     static_dir = tmp_path / "dist"
     assets_dir = static_dir / "assets"

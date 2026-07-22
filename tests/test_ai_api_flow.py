@@ -8,7 +8,7 @@ from pathlib import Path
 import sqlite3
 from threading import Event, Lock, enumerate as enumerate_threads
 import time
-from typing import Any
+from typing import Any, get_type_hints
 
 import pytest
 from fastapi.testclient import TestClient
@@ -973,20 +973,6 @@ def test_default_provider_setup_never_registers_mock_from_test_environment(
     assert all(item["display_name"] != "E2E mock provider" for item in providers)
 
 
-def test_e2e_app_factory_registers_local_mock_provider(tmp_path: Path):
-    from tests.e2e_api_app import create_e2e_app
-
-    repo = make_repo(tmp_path)
-
-    providers = TestClient(create_e2e_app(repo)).get("/ai/providers").json()
-
-    mock = next(item for item in providers if item["provider_kind"] == "mock")
-    assert mock["display_name"] == "E2E mock provider"
-    assert mock["available"] is True
-    assert mock["privacy_mode"] == "local_private"
-    assert mock["data_leaves_machine"] is False
-
-
 def test_default_provider_setup_always_lists_unmanaged_ollama_without_network(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
@@ -1075,6 +1061,37 @@ def test_resume_metadata_route_exposes_checksums_without_private_paths(tmp_path:
     assert response.json()["pdf_sha256"] == resume.pdf_sha256
     assert "tex_path" not in response.text
     assert "pdf_path" not in response.text
+
+
+def test_ai_artifact_payload_type_hints_resolve():
+    hints = get_type_hints(api_main._ai_artifact_payload)
+
+    assert hints["artifact"].__name__ == "AiArtifact"
+    assert hints["return"] == dict[str, Any]
+
+
+def test_ai_task_artifact_route_maps_tamper_to_integrity_conflict(tmp_path: Path):
+    from careerops.ai.orchestrator import AiOrchestrator
+
+    repo = make_repo(tmp_path)
+    application = create_application(repo)
+    select_resume(repo, application.id)
+    status = availability()
+    config = create_provider_config(repo, status)
+    provider = ControlledProvider(status)
+    orchestrator = AiOrchestrator(repo, {config.id: provider})
+    task = orchestrator.enqueue(application.id, "analyze_fit", config.id)
+    assert orchestrator.run(task.id).status.value == "completed"
+    artifact = repo.list_ai_artifacts(task.id)[0]
+    artifact.path.write_bytes(b"tampered artifact")
+
+    response = TestClient(
+        create_app(repo, provider_registry={config.id: provider}),
+        raise_server_exceptions=False,
+    ).get(f"/ai-tasks/{task.id}/artifacts")
+
+    assert response.status_code == 409
+    assert response.json() == {"detail": "AI task artifact integrity check failed"}
 
 
 def test_packet_uses_one_snapshot_during_concurrent_requirements_update(

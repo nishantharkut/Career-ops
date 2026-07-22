@@ -50,6 +50,7 @@ from careerops.ai.providers.deterministic import DeterministicProvider
 from careerops.ai.providers.ollama import OllamaProvider
 from careerops.analyzers.fit import analyze_fit
 from careerops.core.models import (
+    AiArtifact,
     AiFinding,
     AiProviderConfig,
     AiTask,
@@ -244,6 +245,7 @@ def create_app(
     provider_registry: Mapping[str, AiProvider] | None = None,
     allowed_origins: list[str] | None = None,
     auth: BasicAuthConfig | None = None,
+    inherit_environment_auth: bool = True,
     static_dir: Path | None = None,
     task_poll_interval_seconds: float = 1.0,
     task_worker_count: int = 2,
@@ -285,7 +287,10 @@ def create_app(
     api.state.ai_orchestrator = orchestrator
     api.state.task_runner = task_runner
     api.state.task_runner_lifespan_started = False
-    _add_basic_auth_middleware(api, auth if auth is not None else _auth_from_env())
+    effective_auth = auth
+    if effective_auth is None and inherit_environment_auth:
+        effective_auth = _auth_from_env()
+    _add_basic_auth_middleware(api, effective_auth)
     api.add_middleware(
         CORSMiddleware,
         allow_origins=allowed_origins or _allowed_origins_from_env(),
@@ -576,7 +581,14 @@ def create_app(
             repo.get_ai_task(task_id)
         except KeyError as exc:
             raise HTTPException(status_code=404, detail="AI task not found") from exc
-        return [_ai_artifact_payload(item) for item in repo.list_ai_artifacts(task_id)]
+        try:
+            artifacts = repo.list_ai_artifacts(task_id)
+        except (OSError, ValueError) as exc:
+            raise HTTPException(
+                status_code=409,
+                detail="AI task artifact integrity check failed",
+            ) from exc
+        return [_ai_artifact_payload(item) for item in artifacts]
 
     @api.post("/ai-findings/{finding_id}/decision")
     def decide_ai_finding(
