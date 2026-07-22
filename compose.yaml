@@ -43,8 +43,12 @@ services:
     networks:
       - public_api
       - ollama_private
+      - attestation_private
     depends_on:
       ollama:
+        condition: service_healthy
+        restart: true
+      runtime-inspector:
         condition: service_healthy
         restart: true
     healthcheck:
@@ -59,6 +63,41 @@ services:
       timeout: 5s
       retries: 3
       start_period: 30s
+
+  runtime-inspector:
+    build:
+      context: .
+    command:
+      - python
+      - -m
+      - careerops.operations.container_runtime_inspector
+    restart: unless-stopped
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    volumes:
+      - type: bind
+        source: /var/run/docker.sock
+        target: /var/run/docker.sock
+        read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=64m
+    networks:
+      - attestation_private
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8766/health', timeout=2).read()"
+        ]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
 
   ollama:
     image: ${CAREEROPS_OLLAMA_IMAGE:-ollama/ollama@sha256:6345fbc18bd73a1e16404be681dbc6fd291a027cab43ed541abe78c4c81051b0}
@@ -101,6 +140,9 @@ networks:
   public_api:
     driver: bridge
   ollama_private:
+    driver: bridge
+    internal: true
+  attestation_private:
     driver: bridge
     internal: true
 

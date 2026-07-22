@@ -79,6 +79,11 @@ class AiOrchestrator:
         self._repository = repository
         self._providers = dict(providers)
 
+    def register_provider(self, provider_config_id: str, provider: AiProvider) -> None:
+        if not provider_config_id or provider is None:
+            raise ValueError("AI provider registration was invalid")
+        self._providers[provider_config_id] = provider
+
     def enqueue(
         self,
         application_id: str,

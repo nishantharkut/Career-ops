@@ -1,6 +1,6 @@
 param(
     [Parameter(Mandatory = $true)]
-    [ValidateSet("Launch", "Verify", "Stop")]
+    [ValidateSet("Launch", "Verify", "Stop", "Recover")]
     [string]$Action,
     [Parameter(Mandatory = $true)]
     [string]$ExecutablePath,
@@ -68,7 +68,169 @@ function Get-InstancePaths {
     return @{
         InstanceRoot = $ExpectedInstanceRoot
         OwnedExecutable = $OwnedExecutable
+        LaunchRecord = (Join-Path $ExpectedInstanceRoot "launch-record.json")
     }
+}
+
+function Write-LaunchRecord {
+    param(
+        [Parameter(Mandatory = $true)][hashtable]$Paths,
+        [Parameter(Mandatory = $true)][string]$State,
+        [Parameter(Mandatory = $true)][int]$OwnedProcessId,
+        [Parameter(Mandatory = $true)][string]$OwnedRuntimeHandle,
+        [Parameter(Mandatory = $true)][string]$Endpoint
+    )
+    $Payload = [ordered]@{
+        version = 1
+        runtime_instance_id = $RuntimeInstanceId
+        isolation_rule_id = $IsolationRuleId
+        owned_executable = $Paths.OwnedExecutable
+        endpoint = $Endpoint
+        model = $Model
+        process_id = $OwnedProcessId
+        runtime_handle = $OwnedRuntimeHandle
+        state = $State
+    } | ConvertTo-Json -Compress
+    $TemporaryRecord = "$($Paths.LaunchRecord).tmp-$([System.Guid]::NewGuid().ToString('N'))"
+    $Bytes = [System.Text.UTF8Encoding]::new($false).GetBytes($Payload)
+    $Stream = [System.IO.FileStream]::new(
+        $TemporaryRecord,
+        [System.IO.FileMode]::CreateNew,
+        [System.IO.FileAccess]::Write,
+        [System.IO.FileShare]::None
+    )
+    try {
+        $Stream.Write($Bytes, 0, $Bytes.Length)
+        $Stream.Flush($true)
+    }
+    finally {
+        $Stream.Dispose()
+    }
+    if (Test-Path -LiteralPath $Paths.LaunchRecord) {
+        [System.IO.File]::Replace($TemporaryRecord, $Paths.LaunchRecord, $null)
+    }
+    else {
+        [System.IO.File]::Move($TemporaryRecord, $Paths.LaunchRecord)
+    }
+}
+
+function Test-LoopbackListenerAddress {
+    param([Parameter(Mandatory = $true)][string]$Address)
+    $ParsedAddress = $null
+    if (-not [System.Net.IPAddress]::TryParse($Address, [ref]$ParsedAddress)) {
+        return $false
+    }
+    if ($ParsedAddress.AddressFamily -eq [System.Net.Sockets.AddressFamily]::InterNetwork) {
+        return $ParsedAddress.GetAddressBytes()[0] -eq 127
+    }
+    return [System.Net.IPAddress]::IsLoopback($ParsedAddress)
+}
+
+function Assert-PortUnbound {
+    $ExistingListeners = @(Get-NetTCPConnection `
+        -State Listen `
+        -LocalPort $Port `
+        -ErrorAction SilentlyContinue)
+    if ($ExistingListeners.Count -ne 0) {
+        throw "Managed Ollama port was already owned by another listener"
+    }
+}
+
+function Assert-EndpointOwnedByProcess {
+    param([Parameter(Mandatory = $true)][int]$OwnedProcessId)
+    $Deadline = [DateTimeOffset]::UtcNow.AddSeconds(30)
+    do {
+        $Listeners = @(Get-NetTCPConnection `
+            -State Listen `
+            -LocalPort $Port `
+            -ErrorAction SilentlyContinue)
+        if ($Listeners.Count -gt 0) {
+            foreach ($Listener in $Listeners) {
+                if (
+                    [int]$Listener.OwningProcess -ne $OwnedProcessId -or
+                    -not (Test-LoopbackListenerAddress -Address $Listener.LocalAddress)
+                ) {
+                    throw "Managed Ollama endpoint ownership did not match its process"
+                }
+            }
+            return
+        }
+        if ([DateTimeOffset]::UtcNow -ge $Deadline) {
+            throw "Managed Ollama process did not own its listening endpoint"
+        }
+        Start-Sleep -Milliseconds 100
+    } while ($true)
+}
+
+function Recover-PendingLaunches {
+    param([Parameter(Mandatory = $true)][string]$Root)
+    $Recovered = @()
+    if (-not (Test-Path -LiteralPath $Root)) {
+        return $Recovered
+    }
+    foreach ($Directory in @(Get-ChildItem -LiteralPath $Root -Directory -Force)) {
+        if (($Directory.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+            throw "Managed runtime recovery encountered a reparse point"
+        }
+        $RecordPath = Join-Path $Directory.FullName "launch-record.json"
+        if (-not (Test-Path -LiteralPath $RecordPath)) {
+            continue
+        }
+        $RecordItem = Get-Item -LiteralPath $RecordPath -Force
+        if (
+            ($RecordItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0 -or
+            $RecordItem.Length -gt 16384
+        ) {
+            throw "Managed runtime launch record was invalid"
+        }
+        $Record = Get-Content -LiteralPath $RecordPath -Raw -Encoding UTF8 | ConvertFrom-Json
+        $ExpectedExecutable = [System.IO.Path]::GetFullPath(
+            (Join-Path $Directory.FullName "bin\ollama.exe")
+        )
+        if (
+            $Record.version -ne 1 -or
+            $Record.runtime_instance_id -ne $Directory.Name -or
+            $Record.runtime_instance_id -notmatch $IdentifierPattern -or
+            $Record.isolation_rule_id -ne "CareerOps-Ollama-$($Directory.Name)" -or
+            [System.IO.Path]::GetFullPath([string]$Record.owned_executable) -ne $ExpectedExecutable
+        ) {
+            throw "Managed runtime launch record identity was invalid"
+        }
+        $CandidateProcesses = @()
+        if ([int]$Record.process_id -gt 0) {
+            $CandidateProcesses = @(Get-Process -Id ([int]$Record.process_id) -ErrorAction SilentlyContinue)
+        }
+        else {
+            $CandidateProcesses = @(Get-CimInstance Win32_Process | Where-Object {
+                $null -ne $_.ExecutablePath -and
+                [System.IO.Path]::GetFullPath($_.ExecutablePath) -eq $ExpectedExecutable
+            })
+        }
+        foreach ($Candidate in $CandidateProcesses) {
+            $CandidatePath = if ($null -ne $Candidate.Path) {
+                $Candidate.Path
+            }
+            else {
+                $Candidate.ExecutablePath
+            }
+            if ([System.IO.Path]::GetFullPath($CandidatePath) -ne $ExpectedExecutable) {
+                throw "Refusing to recover a process with a mismatched identity"
+            }
+            $CandidateId = if ($null -ne $Candidate.PSObject.Properties["ProcessId"]) {
+                [int]$Candidate.ProcessId
+            }
+            else {
+                [int]$Candidate.Id
+            }
+            Stop-Process -Id $CandidateId -Force -ErrorAction Stop
+        }
+        if (Get-NetFirewallRule -Name $Record.isolation_rule_id -ErrorAction SilentlyContinue) {
+            Remove-NetFirewallRule -Name $Record.isolation_rule_id -ErrorAction Stop
+        }
+        Remove-Item -LiteralPath $RecordPath -Force -ErrorAction Stop
+        $Recovered += $Directory.Name
+    }
+    return $Recovered
 }
 
 function Assert-FirewallBoundary {
@@ -163,6 +325,15 @@ if ($Model -notmatch $ModelPattern -or $Model.StartsWith(".") -or $Model.Contain
     throw "Managed Ollama model name was invalid"
 }
 
+if ($Action -eq "Recover") {
+    $RecoveredInstances = @(Recover-PendingLaunches -Root $ResolvedRuntimeRoot)
+    [ordered]@{
+        recovered = $true
+        runtime_instances = $RecoveredInstances
+    } | ConvertTo-Json -Compress
+    exit 0
+}
+
 if ($Action -eq "Launch") {
     $RuntimeInstanceId = "runtime-$([System.Guid]::NewGuid().ToString('N'))"
     $IsolationRuleId = "CareerOps-Ollama-$RuntimeInstanceId"
@@ -208,6 +379,13 @@ if ($Action -eq "Launch") {
         Assert-FirewallBoundary -RuleName $IsolationRuleId -OwnedExecutable $Paths.OwnedExecutable
 
         $Endpoint = "http://127.0.0.1:$Port"
+        Assert-PortUnbound
+        Write-LaunchRecord `
+            -Paths $Paths `
+            -State "firewall_ready" `
+            -OwnedProcessId 0 `
+            -OwnedRuntimeHandle "" `
+            -Endpoint $Endpoint
         $env:OLLAMA_HOST = "127.0.0.1:$Port"
         $env:OLLAMA_NO_CLOUD = "1"
         $env:OLLAMA_MODELS = $ManagedModelsPath
@@ -223,9 +401,17 @@ if ($Action -eq "Launch") {
             -RedirectStandardError (Join-Path $Paths.InstanceRoot "stderr.log")
         $ProcessId = $Process.Id
         $RuntimeHandle = "pid:$ProcessId"
+        Write-LaunchRecord `
+            -Paths $Paths `
+            -State "launched" `
+            -OwnedProcessId $ProcessId `
+            -OwnedRuntimeHandle $RuntimeHandle `
+            -Endpoint $Endpoint
         Assert-OwnedProcess -Root $Paths.InstanceRoot -OwnedExecutable $Paths.OwnedExecutable | Out-Null
         Assert-FirewallBoundary -RuleName $IsolationRuleId -OwnedExecutable $Paths.OwnedExecutable
+        Assert-EndpointOwnedByProcess -OwnedProcessId $ProcessId
         Assert-LocalModel -Endpoint $Endpoint
+        Assert-EndpointOwnedByProcess -OwnedProcessId $ProcessId
 
         [ordered]@{
             endpoint = $Endpoint
@@ -248,6 +434,9 @@ if ($Action -eq "Launch") {
         if ($RuleCreated -or (Get-NetFirewallRule -Name $IsolationRuleId -ErrorAction SilentlyContinue)) {
             Remove-NetFirewallRule -Name $IsolationRuleId -ErrorAction SilentlyContinue
         }
+        if ($null -ne $Paths -and (Test-Path -LiteralPath $Paths.LaunchRecord)) {
+            Remove-Item -LiteralPath $Paths.LaunchRecord -Force -ErrorAction SilentlyContinue
+        }
         throw
     }
     exit 0
@@ -259,7 +448,9 @@ $Paths = Get-InstancePaths -Root $ResolvedRuntimeRoot
 if ($Action -eq "Verify") {
     Assert-OwnedProcess -Root $Paths.InstanceRoot -OwnedExecutable $Paths.OwnedExecutable | Out-Null
     Assert-FirewallBoundary -RuleName $IsolationRuleId -OwnedExecutable $Paths.OwnedExecutable
+    Assert-EndpointOwnedByProcess -OwnedProcessId $ProcessId
     Assert-LocalModel -Endpoint "http://127.0.0.1:$Port"
+    Assert-EndpointOwnedByProcess -OwnedProcessId $ProcessId
     [ordered]@{
         verified = $true
         runtime_instance_id = $RuntimeInstanceId
@@ -280,6 +471,9 @@ if ($null -ne $OwnedProcess) {
 Remove-NetFirewallRule -Name $IsolationRuleId -ErrorAction Stop
 if (Get-NetFirewallRule -Name $IsolationRuleId -ErrorAction SilentlyContinue) {
     throw "Managed Ollama firewall rule was not removed"
+}
+if (Test-Path -LiteralPath $Paths.LaunchRecord) {
+    Remove-Item -LiteralPath $Paths.LaunchRecord -Force -ErrorAction Stop
 }
 [ordered]@{
     stopped = $true

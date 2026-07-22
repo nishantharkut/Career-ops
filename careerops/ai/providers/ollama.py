@@ -11,7 +11,7 @@ import re
 import secrets
 import socket
 import time
-from typing import Any
+from typing import Any, Literal
 from urllib.parse import urlsplit
 
 from careerops.ai.contracts import (
@@ -45,6 +45,7 @@ class _Endpoint:
     host: str
     port: int
     base_path: str
+    scope: Literal["loopback", "managed_container"]
 
     @property
     def canonical(self) -> str:
@@ -52,14 +53,27 @@ class _Endpoint:
         return f"{self.scheme}://{host}:{self.port}{self.base_path}"
 
 
-def _parse_endpoint(endpoint: str) -> _Endpoint | None:
+def _parse_endpoint(
+    endpoint: str,
+    *,
+    allow_managed_container: bool = False,
+) -> _Endpoint | None:
     try:
         parsed = urlsplit(endpoint.strip().rstrip("/"))
         scheme = parsed.scheme.casefold()
         host = (parsed.hostname or "").casefold()
         port = parsed.port or (443 if scheme == "https" else 80)
+        managed_container = bool(
+            allow_managed_container
+            and scheme == "http"
+            and host == "ollama"
+            and port == 11434
+            and parsed.path in {"", "/"}
+        )
         if host == "localhost":
             local_host = True
+        elif managed_container:
+            local_host = False
         else:
             address = ipaddress.ip_address(host)
             local_host = address.is_loopback
@@ -72,7 +86,7 @@ def _parse_endpoint(endpoint: str) -> _Endpoint | None:
             and not parsed.query
             and not parsed.fragment
             and 0 < port <= 65_535
-            and local_host
+            and (local_host or managed_container)
         )
     except ValueError:
         return None
@@ -83,11 +97,19 @@ def _parse_endpoint(endpoint: str) -> _Endpoint | None:
         host=host,
         port=port,
         base_path=parsed.path.rstrip("/"),
+        scope="managed_container" if managed_container else "loopback",
     )
 
 
-def canonicalize_ollama_endpoint(endpoint: str) -> str:
-    parsed = _parse_endpoint(endpoint)
+def canonicalize_ollama_endpoint(
+    endpoint: str,
+    *,
+    allow_managed_container: bool = False,
+) -> str:
+    parsed = _parse_endpoint(
+        endpoint,
+        allow_managed_container=allow_managed_container,
+    )
     if parsed is None:
         raise ValueError("Ollama endpoint was not canonicalizable")
     return parsed.canonical
@@ -124,7 +146,12 @@ class OllamaRuntimeAuthority:
     ) -> OllamaIsolationEvidence:
         unsigned = OllamaIsolationEvidence(
             attestation_version="ollama_isolation_v2",
-            canonical_endpoint=canonicalize_ollama_endpoint(endpoint),
+            canonical_endpoint=canonicalize_ollama_endpoint(
+                endpoint,
+                allow_managed_container=(
+                    egress_policy == "container_internal_no_egress"
+                ),
+            ),
             model=model,
             runtime_instance_id=runtime_instance_id,
             runtime_handle=runtime_handle,
@@ -156,7 +183,12 @@ class OllamaRuntimeAuthority:
                 type(evidence) is not OllamaIsolationEvidence
                 or set(evidence.__dict__) != exact_fields
                 or evidence.canonical_endpoint
-                != canonicalize_ollama_endpoint(endpoint)
+                != canonicalize_ollama_endpoint(
+                    endpoint,
+                    allow_managed_container=(
+                        evidence.egress_policy == "container_internal_no_egress"
+                    ),
+                )
                 or evidence.model != model
                 or evidence.runtime_instance_id != runtime_instance_id
                 or evidence.runtime_handle != runtime_handle
@@ -198,7 +230,7 @@ def _response_socket(response: http.client.HTTPResponse) -> socket.socket | None
     return value if isinstance(value, socket.socket) else None
 
 
-class _LoopbackTransport:
+class _PrivateTransport:
     def __init__(self, endpoint: _Endpoint):
         self.endpoint = endpoint
 
@@ -225,13 +257,24 @@ class _LoopbackTransport:
             connection.connect()
             peer = connection.sock.getpeername()[0] if connection.sock else ""
             try:
-                if not ipaddress.ip_address(peer).is_loopback:
+                peer_address = ipaddress.ip_address(peer)
+                if self.endpoint.scope == "loopback":
+                    peer_allowed = peer_address.is_loopback
+                else:
+                    peer_allowed = bool(
+                        peer_address.is_private
+                        and not peer_address.is_loopback
+                        and not peer_address.is_link_local
+                        and not peer_address.is_multicast
+                        and not peer_address.is_unspecified
+                    )
+                if not peer_allowed:
                     raise ProviderUnavailableError(
-                        "Ollama endpoint did not resolve to loopback"
+                        "Ollama endpoint resolved outside its verified private boundary"
                     )
             except ValueError as error:
                 raise ProviderUnavailableError(
-                    "Ollama endpoint did not resolve to loopback"
+                    "Ollama endpoint resolved outside its verified private boundary"
                 ) from error
 
             if connection.sock:
@@ -321,7 +364,6 @@ class OllamaProvider:
 
     def __post_init__(self) -> None:
         endpoint = self.endpoint.strip().rstrip("/")
-        parsed_endpoint = _parse_endpoint(endpoint)
         if not math.isfinite(self.timeout_seconds) or self.timeout_seconds <= 0:
             raise ValueError("timeout_seconds must be finite and positive")
         if self.isolation_evidence is not None and not isinstance(
@@ -332,6 +374,10 @@ class OllamaProvider:
             self.isolation_authority, OllamaRuntimeAuthority
         ):
             raise ValueError("isolation_authority must be a trusted authority")
+        parsed_endpoint = _parse_endpoint(
+            endpoint,
+            allow_managed_container=True,
+        )
         object.__setattr__(
             self,
             "endpoint",
@@ -341,7 +387,7 @@ class OllamaProvider:
 
     @staticmethod
     def _parse_endpoint(endpoint: str) -> _Endpoint | None:
-        return _parse_endpoint(endpoint)
+        return _parse_endpoint(endpoint, allow_managed_container=True)
 
     def _verified_isolation_evidence(self) -> OllamaIsolationEvidence | None:
         if (
@@ -465,6 +511,13 @@ class OllamaProvider:
             if self._parsed_endpoint is None:
                 raise ProviderUnavailableError(
                     "Ollama provider configuration is invalid"
+                )
+            if (
+                self._parsed_endpoint.scope == "managed_container"
+                and self._verified_isolation_evidence() is None
+            ):
+                raise ProviderUnavailableError(
+                    "Ollama isolation evidence is invalid or unavailable"
                 )
             return self._resolve_local_model(
                 time.monotonic() + self.timeout_seconds
@@ -717,7 +770,14 @@ class OllamaProvider:
     ) -> dict[str, Any]:
         if self._parsed_endpoint is None:
             raise ProviderUnavailableError("Ollama provider configuration is invalid")
-        status, raw = _LoopbackTransport(self._parsed_endpoint).request(
+        if (
+            self._parsed_endpoint.scope == "managed_container"
+            and self._verified_isolation_evidence() is None
+        ):
+            raise ProviderUnavailableError(
+                "Ollama isolation evidence is invalid or unavailable"
+            )
+        status, raw = _PrivateTransport(self._parsed_endpoint).request(
             method,
             path,
             body,

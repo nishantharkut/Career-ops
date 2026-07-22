@@ -435,6 +435,191 @@ def test_second_target_publish_failure_rolls_back_to_both_empty_targets(
     assert not list(tmp_path.glob(".careerops-restore-*"))
 
 
+class SimulatedRestoreCrash(BaseException):
+    pass
+
+
+@pytest.mark.parametrize(
+    "crash_boundary",
+    [
+        "data_target_held",
+        "vault_target_held",
+        "data_published",
+        "vault_published",
+        "committed",
+    ],
+)
+def test_restore_recovers_transaction_after_crash_at_every_publication_boundary(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    crash_boundary: str,
+):
+    repo = _make_repo(tmp_path)
+    proof = repo.vault_path / "evidence" / "proof.txt"
+    proof.write_bytes(b"transaction-proof")
+    backup = create_backup(repo.database_path, repo.vault_path, tmp_path / "backups")
+    data_path, vault_path = _empty_targets(tmp_path)
+
+    def crash(boundary: str) -> None:
+        if boundary == crash_boundary:
+            raise SimulatedRestoreCrash(boundary)
+
+    monkeypatch.setattr(
+        backups_module,
+        "_restore_publication_checkpoint",
+        crash,
+        raising=False,
+    )
+    with pytest.raises(SimulatedRestoreCrash, match=crash_boundary):
+        restore_backup(backup.path, data_path, vault_path)
+
+    journals = list(tmp_path.glob(".careerops-restore-transaction-*.json"))
+    assert journals, "an interrupted publication must remain recoverable"
+
+    monkeypatch.setattr(
+        backups_module,
+        "_restore_publication_checkpoint",
+        lambda _boundary: None,
+        raising=False,
+    )
+    result = restore_backup(backup.path, data_path, vault_path)
+
+    assert result.database_path == data_path / "careerops.db"
+    assert (vault_path / "evidence" / "proof.txt").read_bytes() == b"transaction-proof"
+    assert not list(tmp_path.glob(".careerops-restore-transaction-*.json"))
+    assert not list(tmp_path.glob(".careerops-empty-*"))
+
+
+def test_restore_preserves_journal_when_rollback_fails_then_recovers_on_next_entry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    repo = _make_repo(tmp_path)
+    (repo.vault_path / "proof.txt").write_bytes(b"recoverable")
+    backup = create_backup(repo.database_path, repo.vault_path, tmp_path / "backups")
+    data_path, vault_path = _empty_targets(tmp_path)
+
+    def crash_after_data_publish(boundary: str) -> None:
+        if boundary == "data_published":
+            raise SimulatedRestoreCrash(boundary)
+
+    monkeypatch.setattr(
+        backups_module,
+        "_restore_publication_checkpoint",
+        crash_after_data_publish,
+        raising=False,
+    )
+    with pytest.raises(SimulatedRestoreCrash):
+        restore_backup(backup.path, data_path, vault_path)
+
+    monkeypatch.setattr(
+        backups_module,
+        "_restore_publication_checkpoint",
+        lambda _boundary: None,
+        raising=False,
+    )
+    real_rename = backups_module._atomic_rename
+    failed_once = False
+
+    def fail_first_recovery_rename(source: Path, destination: Path) -> None:
+        nonlocal failed_once
+        if (
+            not failed_once
+            and source == data_path
+            and destination.name.startswith(".careerops-restore-data-")
+        ):
+            failed_once = True
+            raise OSError("injected rollback interruption")
+        real_rename(source, destination)
+
+    monkeypatch.setattr(backups_module, "_atomic_rename", fail_first_recovery_rename)
+
+    with pytest.raises(RestoreTargetError, match="recovery"):
+        restore_backup(backup.path, data_path, vault_path)
+
+    assert list(tmp_path.glob(".careerops-restore-transaction-*.json"))
+
+    result = restore_backup(backup.path, data_path, vault_path)
+
+    assert result.database_path.is_file()
+    assert (vault_path / "proof.txt").read_bytes() == b"recoverable"
+    assert not list(tmp_path.glob(".careerops-restore-transaction-*.json"))
+
+
+def test_restore_recovers_cross_parent_publication_from_single_authoritative_journal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    repo = _make_repo(tmp_path)
+    (repo.vault_path / "cross-parent.txt").write_bytes(b"cross-parent")
+    backup = create_backup(repo.database_path, repo.vault_path, tmp_path / "backups")
+    data_parent = tmp_path / "data-parent"
+    vault_parent = tmp_path / "vault-parent"
+    data_parent.mkdir()
+    vault_parent.mkdir()
+    data_path = data_parent / "data"
+    vault_path = vault_parent / "vault"
+    data_path.mkdir()
+    vault_path.mkdir()
+
+    def crash_after_vault_publish(boundary: str) -> None:
+        if boundary == "vault_published":
+            raise SimulatedRestoreCrash(boundary)
+
+    monkeypatch.setattr(
+        backups_module,
+        "_restore_publication_checkpoint",
+        crash_after_vault_publish,
+    )
+    with pytest.raises(SimulatedRestoreCrash):
+        restore_backup(backup.path, data_path, vault_path)
+
+    journals = list(data_parent.glob(".careerops-restore-transaction-*.json"))
+    assert len(journals) == 1
+    assert not list(vault_parent.glob(".careerops-restore-transaction-*.json"))
+    monkeypatch.setattr(
+        backups_module,
+        "_restore_publication_checkpoint",
+        lambda _boundary: None,
+    )
+
+    restore_backup(backup.path, data_path, vault_path)
+
+    assert (vault_path / "cross-parent.txt").read_bytes() == b"cross-parent"
+    assert not list(data_parent.glob(".careerops-restore-transaction-*.json"))
+
+
+def test_restore_recovery_never_deletes_a_changed_partially_published_target(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    repo = _make_repo(tmp_path)
+    backup = create_backup(repo.database_path, repo.vault_path, tmp_path / "backups")
+    data_path, vault_path = _empty_targets(tmp_path)
+
+    def crash_after_data_publish(boundary: str) -> None:
+        if boundary == "data_published":
+            raise SimulatedRestoreCrash(boundary)
+
+    monkeypatch.setattr(
+        backups_module,
+        "_restore_publication_checkpoint",
+        crash_after_data_publish,
+    )
+    with pytest.raises(SimulatedRestoreCrash):
+        restore_backup(backup.path, data_path, vault_path)
+    changed_file = data_path / "must-not-be-deleted.txt"
+    changed_file.write_bytes(b"caller-owned-after-crash")
+    monkeypatch.setattr(
+        backups_module,
+        "_restore_publication_checkpoint",
+        lambda _boundary: None,
+    )
+
+    with pytest.raises(RestoreTargetError, match="changed"):
+        restore_backup(backup.path, data_path, vault_path)
+
+    assert changed_file.read_bytes() == b"caller-owned-after-crash"
+    assert list(tmp_path.glob(".careerops-restore-transaction-*.json"))
+
+
 def test_backup_and_restore_scripts_require_all_explicit_paths():
     root = Path(__file__).resolve().parents[1]
     backup_script = (root / "scripts" / "backup.ps1").read_text(encoding="utf-8")

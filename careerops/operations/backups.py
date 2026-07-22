@@ -114,6 +114,29 @@ class _RestoreTargets:
     vault_identity: tuple[int, int, int, int]
 
 
+@dataclass(frozen=True)
+class _RestoreLayout:
+    transaction_id: str
+    data: Path
+    vault: Path
+    data_stage: Path
+    vault_stage: Path
+    data_hold: Path
+    vault_hold: Path
+    journals: tuple[Path, ...]
+
+
+@dataclass(frozen=True)
+class _RestoreTransaction:
+    layout: _RestoreLayout
+    archive_sha256: str
+    manifest_sha256: str
+    file_count: int
+    total_bytes: int
+    data_identity: tuple[int, int]
+    vault_identity: tuple[int, int]
+
+
 class _DuplicateJsonMember(ValueError):
     pass
 
@@ -635,10 +658,6 @@ def _revalidate_empty_target(path: Path, identity: tuple[int, int, int, int]) ->
         raise RestoreTargetError("Restore target could not be revalidated") from error
 
 
-def _owned_empty_placeholder(target: Path) -> Path:
-    return target.parent / f".careerops-empty-{target.name}-{uuid4().hex}"
-
-
 def _safe_remove_tree(path: Path | None, parent: Path) -> None:
     if path is None or not path.exists():
         return
@@ -647,44 +666,427 @@ def _safe_remove_tree(path: Path | None, parent: Path) -> None:
     shutil.rmtree(path)
 
 
+def _restore_layout(data_path: Path | str, vault_path: Path | str) -> _RestoreLayout:
+    data = _absolute(data_path)
+    vault = _absolute(vault_path)
+    try:
+        _assert_no_link_components(data)
+        _assert_no_link_components(vault)
+        _regular_directory(data.parent, "Data target parent")
+        _regular_directory(vault.parent, "Vault target parent")
+    except BackupPathError as error:
+        raise RestoreTargetError("Restore target parents must be existing non-link directories") from error
+    if data == vault or data.is_relative_to(vault) or vault.is_relative_to(data):
+        raise RestoreTargetError("Data and vault targets must be separate directories")
+    identity_bytes = (
+        f"{os.path.normcase(str(data))}\0{os.path.normcase(str(vault))}"
+    ).encode("utf-8")
+    transaction_id = hashlib.sha256(identity_bytes).hexdigest()[:32]
+    journal_name = f".careerops-restore-transaction-{transaction_id}.json"
+    journals = (data.parent / journal_name,)
+    return _RestoreLayout(
+        transaction_id=transaction_id,
+        data=data,
+        vault=vault,
+        data_stage=data.parent / f".careerops-restore-data-{transaction_id}",
+        vault_stage=vault.parent / f".careerops-restore-vault-{transaction_id}",
+        data_hold=data.parent / f".careerops-empty-data-{transaction_id}",
+        vault_hold=vault.parent / f".careerops-empty-vault-{transaction_id}",
+        journals=journals,
+    )
+
+
+def _journal_payload(transaction: _RestoreTransaction, phase: str) -> dict[str, Any]:
+    if phase not in {
+        "prepared",
+        "data_target_held",
+        "vault_target_held",
+        "data_published",
+        "vault_published",
+        "committed",
+    }:
+        raise RestoreTargetError("Restore transaction phase was invalid")
+    layout = transaction.layout
+    payload: dict[str, Any] = {
+        "version": 1,
+        "transaction_id": layout.transaction_id,
+        "phase": phase,
+        "data_target": str(layout.data),
+        "vault_target": str(layout.vault),
+        "data_stage": str(layout.data_stage),
+        "vault_stage": str(layout.vault_stage),
+        "data_hold": str(layout.data_hold),
+        "vault_hold": str(layout.vault_hold),
+        "archive_sha256": transaction.archive_sha256,
+        "manifest_sha256": transaction.manifest_sha256,
+        "file_count": transaction.file_count,
+        "total_bytes": transaction.total_bytes,
+        "data_identity": list(transaction.data_identity),
+        "vault_identity": list(transaction.vault_identity),
+    }
+    checksum_bytes = json.dumps(
+        payload,
+        allow_nan=False,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    payload["journal_sha256"] = hashlib.sha256(checksum_bytes).hexdigest()
+    return payload
+
+
+def _journal_bytes(transaction: _RestoreTransaction, phase: str) -> bytes:
+    return json.dumps(
+        _journal_payload(transaction, phase),
+        allow_nan=False,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+
+
+def _write_restore_journals(transaction: _RestoreTransaction, phase: str) -> None:
+    raw = _journal_bytes(transaction, phase)
+    for journal in transaction.layout.journals:
+        temporary = journal.parent / f".{journal.name}.tmp-{uuid4().hex}"
+        try:
+            with temporary.open("xb") as stream:
+                stream.write(raw)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary, journal)
+            _fsync_directory(journal.parent)
+        except OSError as error:
+            if temporary.exists() and not _is_link_or_reparse(temporary):
+                temporary.unlink()
+            raise RestoreTargetError("Restore transaction journal could not be persisted") from error
+
+
+def _read_restore_journal(path: Path, layout: _RestoreLayout) -> tuple[_RestoreTransaction, str]:
+    try:
+        value = path.lstat()
+        if _is_link_or_reparse(path) or not stat.S_ISREG(value.st_mode) or value.st_size > 32 * 1024:
+            raise RestoreTargetError("Restore transaction journal was invalid")
+        raw = path.read_bytes()
+        payload = json.loads(raw, object_pairs_hook=_strict_json_object)
+    except RestoreTargetError:
+        raise
+    except (OSError, UnicodeError, ValueError, _DuplicateJsonMember) as error:
+        raise RestoreTargetError("Restore transaction journal was invalid") from error
+    expected_fields = {
+        "version",
+        "transaction_id",
+        "phase",
+        "data_target",
+        "vault_target",
+        "data_stage",
+        "vault_stage",
+        "data_hold",
+        "vault_hold",
+        "archive_sha256",
+        "manifest_sha256",
+        "file_count",
+        "total_bytes",
+        "data_identity",
+        "vault_identity",
+        "journal_sha256",
+    }
+    if type(payload) is not dict or set(payload) != expected_fields:
+        raise RestoreTargetError("Restore transaction journal was invalid")
+    checksum = payload.pop("journal_sha256")
+    checksum_bytes = json.dumps(
+        payload,
+        allow_nan=False,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    fixed_paths = {
+        "data_target": layout.data,
+        "vault_target": layout.vault,
+        "data_stage": layout.data_stage,
+        "vault_stage": layout.vault_stage,
+        "data_hold": layout.data_hold,
+        "vault_hold": layout.vault_hold,
+    }
+    identities = (payload.get("data_identity"), payload.get("vault_identity"))
+    invalid = bool(
+        payload.get("version") != 1
+        or payload.get("transaction_id") != layout.transaction_id
+        or type(checksum) is not str
+        or SHA256_PATTERN.fullmatch(checksum) is None
+        or not secrets_compare_digest(hashlib.sha256(checksum_bytes).hexdigest(), checksum)
+        or any(payload.get(name) != str(expected) for name, expected in fixed_paths.items())
+        or type(payload.get("archive_sha256")) is not str
+        or SHA256_PATTERN.fullmatch(payload["archive_sha256"]) is None
+        or type(payload.get("manifest_sha256")) is not str
+        or SHA256_PATTERN.fullmatch(payload["manifest_sha256"]) is None
+        or type(payload.get("file_count")) is not int
+        or payload["file_count"] <= 0
+        or type(payload.get("total_bytes")) is not int
+        or payload["total_bytes"] <= 0
+        or any(
+            not isinstance(identity, list)
+            or len(identity) != 2
+            or any(type(item) is not int or item < 0 for item in identity)
+            for identity in identities
+        )
+    )
+    if invalid:
+        raise RestoreTargetError("Restore transaction journal was invalid")
+    try:
+        transaction = _RestoreTransaction(
+            layout=layout,
+            archive_sha256=payload["archive_sha256"],
+            manifest_sha256=payload["manifest_sha256"],
+            file_count=payload["file_count"],
+            total_bytes=payload["total_bytes"],
+            data_identity=tuple(payload["data_identity"]),
+            vault_identity=tuple(payload["vault_identity"]),
+        )
+        phase = payload["phase"]
+        _journal_payload(transaction, phase)
+    except (TypeError, RestoreTargetError) as error:
+        raise RestoreTargetError("Restore transaction journal was invalid") from error
+    return transaction, phase
+
+
+def _restore_journals_exist(layout: _RestoreLayout) -> bool:
+    return any(path.exists() or path.is_symlink() for path in layout.journals)
+
+
+def _validate_original_hold(path: Path, identity: tuple[int, int]) -> None:
+    try:
+        value = path.lstat()
+        if (
+            _is_link_or_reparse(path)
+            or not stat.S_ISDIR(value.st_mode)
+            or (value.st_dev, value.st_ino) != identity
+            or next(path.iterdir(), None) is not None
+        ):
+            raise RestoreTargetError("Restore recovery found a changed target placeholder")
+    except RestoreTargetError:
+        raise
+    except OSError as error:
+        raise RestoreTargetError("Restore recovery could not inspect a target placeholder") from error
+
+
+def _rollback_target(
+    *,
+    target: Path,
+    hold: Path,
+    stage: Path,
+    identity: tuple[int, int],
+    records: list[_FileRecord],
+    target_kind: str,
+) -> None:
+    hold_exists = hold.exists() or hold.is_symlink()
+    target_exists = target.exists() or target.is_symlink()
+    stage_exists = stage.exists() or stage.is_symlink()
+    if hold_exists:
+        _validate_original_hold(hold, identity)
+        if target_exists:
+            if stage_exists or _is_link_or_reparse(target) or not target.is_dir():
+                raise RestoreTargetError("Restore recovery found ambiguous published data")
+            _verify_restore_target_files(target, records, target_kind)
+            _atomic_rename(target, stage)
+            target_exists = False
+        if not target_exists:
+            _atomic_rename(hold, target)
+        return
+    if not target_exists:
+        raise RestoreTargetError("Restore recovery could not locate the original target")
+    _validate_original_hold(target, identity)
+
+
+def _remove_restore_journals(layout: _RestoreLayout) -> None:
+    for journal in layout.journals:
+        if journal.exists() or journal.is_symlink():
+            if _is_link_or_reparse(journal) or not journal.is_file():
+                raise RestoreTargetError("Restore transaction journal changed during recovery")
+            journal.unlink()
+            _fsync_directory(journal.parent)
+
+
+def _recover_restore_transaction(
+    layout: _RestoreLayout,
+    *,
+    archive_sha256: str,
+    manifest_sha256: str,
+    records: list[_FileRecord],
+) -> _RestoreTransaction | None:
+    existing = [path for path in layout.journals if path.exists() or path.is_symlink()]
+    if not existing:
+        return None
+    observed = [_read_restore_journal(path, layout) for path in existing]
+    transaction = observed[0][0]
+    if any(item[0] != transaction for item in observed[1:]):
+        raise RestoreTargetError("Restore transaction journals did not agree")
+    if (
+        transaction.archive_sha256 != archive_sha256
+        or transaction.manifest_sha256 != manifest_sha256
+        or transaction.file_count != len(records)
+        or transaction.total_bytes != sum(record.size for record in records)
+    ):
+        raise RestoreTargetError("Restore transaction did not match this backup")
+    fully_committed = bool(
+        len(existing) == len(layout.journals)
+        and all(phase == "committed" for _item, phase in observed)
+    )
+    if fully_committed:
+        for target, hold, stage, identity in (
+            (layout.data, layout.data_hold, layout.data_stage, transaction.data_identity),
+            (layout.vault, layout.vault_hold, layout.vault_stage, transaction.vault_identity),
+        ):
+            if (
+                not target.is_dir()
+                or _is_link_or_reparse(target)
+                or stage.exists()
+                or stage.is_symlink()
+            ):
+                raise RestoreTargetError("Committed restore transaction was incomplete")
+            if hold.exists() or hold.is_symlink():
+                _validate_original_hold(hold, identity)
+        return transaction
+    try:
+        _rollback_target(
+            target=layout.vault,
+            hold=layout.vault_hold,
+            stage=layout.vault_stage,
+            identity=transaction.vault_identity,
+            records=records,
+            target_kind="vault",
+        )
+        _rollback_target(
+            target=layout.data,
+            hold=layout.data_hold,
+            stage=layout.data_stage,
+            identity=transaction.data_identity,
+            records=records,
+            target_kind="data",
+        )
+        _safe_remove_tree(layout.data_stage, layout.data.parent)
+        _safe_remove_tree(layout.vault_stage, layout.vault.parent)
+        _remove_restore_journals(layout)
+        _fsync_directory(layout.data.parent)
+        if layout.vault.parent != layout.data.parent:
+            _fsync_directory(layout.vault.parent)
+    except RestoreTargetError:
+        raise
+    except (OSError, BackupError) as error:
+        raise RestoreTargetError("Restore transaction recovery could not complete") from error
+    return None
+
+
+def _finalize_committed_restore(transaction: _RestoreTransaction) -> None:
+    layout = transaction.layout
+    try:
+        if layout.data_hold.exists():
+            os.rmdir(layout.data_hold)
+        if layout.vault_hold.exists():
+            os.rmdir(layout.vault_hold)
+        _remove_restore_journals(layout)
+        _fsync_directory(layout.data.parent)
+        if layout.vault.parent != layout.data.parent:
+            _fsync_directory(layout.vault.parent)
+    except (OSError, BackupError) as error:
+        raise RestoreTargetError("Committed restore transaction could not be finalized") from error
+
+
+def _verify_restore_target_files(
+    target: Path,
+    records: list[_FileRecord],
+    target_kind: str,
+) -> None:
+    if target_kind == "data":
+        expected = {
+            record.path: record
+            for record in records
+            if record.path == DATABASE_ARCHIVE_PATH
+        }
+        try:
+            entries = list(target.iterdir())
+        except OSError as error:
+            raise RestoreTargetError("Restore recovery found changed published files") from error
+        if len(entries) != 1 or entries[0].name != "careerops.db":
+            raise RestoreTargetError("Restore recovery found changed published files")
+        observed: dict[str, Path] = {DATABASE_ARCHIVE_PATH: entries[0]}
+    elif target_kind == "vault":
+        expected = {
+            record.path: record
+            for record in records
+            if record.path != DATABASE_ARCHIVE_PATH
+        }
+        try:
+            observed = {
+                archive_path: source for archive_path, source in _vault_files(target)
+            }
+        except BackupError as error:
+            raise RestoreTargetError("Restore recovery found changed published files") from error
+    else:
+        raise RestoreTargetError("Restore recovery target kind was invalid")
+    if set(observed) != set(expected):
+        raise RestoreTargetError("Restore recovery found changed published files")
+    try:
+        for archive_path, source in observed.items():
+            record = expected[archive_path]
+            size, digest = _hash_path(source, max(record.size, 1))
+            if size != record.size or not secrets_compare_digest(digest, record.sha256):
+                raise RestoreTargetError("Restore recovery found changed published files")
+    except RestoreTargetError:
+        raise
+    except BackupError as error:
+        raise RestoreTargetError("Restore recovery found changed published files") from error
+
+
+def _verify_committed_files(transaction: _RestoreTransaction, records: list[_FileRecord]) -> None:
+    _verify_restore_target_files(transaction.layout.data, records, "data")
+    _verify_restore_target_files(transaction.layout.vault, records, "vault")
+
+
+def _restore_publication_checkpoint(_boundary: str) -> None:
+    return None
+
+
 def _publish_restore(
     targets: _RestoreTargets,
-    data_stage: Path,
-    vault_stage: Path,
+    transaction: _RestoreTransaction,
+    records: list[_FileRecord],
 ) -> None:
+    layout = transaction.layout
     _revalidate_empty_target(targets.data, targets.data_identity)
     _revalidate_empty_target(targets.vault, targets.vault_identity)
-    data_hold = _owned_empty_placeholder(targets.data)
-    vault_hold = _owned_empty_placeholder(targets.vault)
-    data_published = False
-    vault_published = False
+    _write_restore_journals(transaction, "prepared")
     try:
-        _atomic_rename(targets.data, data_hold)
-        _atomic_rename(targets.vault, vault_hold)
-        _atomic_rename(data_stage, targets.data)
-        data_published = True
-        _atomic_rename(vault_stage, targets.vault)
-        vault_published = True
-        os.rmdir(data_hold)
-        os.rmdir(vault_hold)
-        _fsync_directory(targets.data.parent)
-        if targets.vault.parent != targets.data.parent:
-            _fsync_directory(targets.vault.parent)
+        _atomic_rename(targets.data, layout.data_hold)
+        _restore_publication_checkpoint("data_target_held")
+        _write_restore_journals(transaction, "data_target_held")
+        _atomic_rename(targets.vault, layout.vault_hold)
+        _restore_publication_checkpoint("vault_target_held")
+        _write_restore_journals(transaction, "vault_target_held")
+        _atomic_rename(layout.data_stage, targets.data)
+        _restore_publication_checkpoint("data_published")
+        _write_restore_journals(transaction, "data_published")
+        _atomic_rename(layout.vault_stage, targets.vault)
+        _restore_publication_checkpoint("vault_published")
+        _write_restore_journals(transaction, "vault_published")
+        _write_restore_journals(transaction, "committed")
+        _restore_publication_checkpoint("committed")
+        _finalize_committed_restore(transaction)
     except (OSError, BackupError) as error:
-        rollback_error: OSError | BackupError | None = None
         try:
-            if vault_published and targets.vault.exists():
-                _atomic_rename(targets.vault, vault_stage)
-            if data_published and targets.data.exists():
-                _atomic_rename(targets.data, data_stage)
-            if vault_hold.exists() and not targets.vault.exists():
-                _atomic_rename(vault_hold, targets.vault)
-            if data_hold.exists() and not targets.data.exists():
-                _atomic_rename(data_hold, targets.data)
-        except (OSError, BackupError) as rollback:
-            rollback_error = rollback
-        if rollback_error is not None:
-            raise RestoreTargetError("Restore publication failed and rollback could not complete") from rollback_error
+            recovered_commit = _recover_restore_transaction(
+                layout,
+                archive_sha256=transaction.archive_sha256,
+                manifest_sha256=transaction.manifest_sha256,
+                records=records,
+            )
+            if recovered_commit is not None:
+                _finalize_committed_restore(recovered_commit)
+        except (OSError, BackupError) as rollback_error:
+            raise RestoreTargetError(
+                "Restore publication failed and recovery could not complete"
+            ) from rollback_error
         raise RestoreTargetError("Restore could not be published atomically") from error
 
 
@@ -698,7 +1100,12 @@ def restore_backup(
     archive_path = _regular_file(archive_path, "Backup archive")
     if archive_path.stat().st_size > limits.max_archive_bytes:
         raise BackupIntegrityError("Backup archive exceeded its size limit")
-    targets = _restore_targets(data_path, vault_path)
+    archive_size, archive_sha256 = _hash_path(archive_path, limits.max_archive_bytes)
+    if archive_size <= 0:
+        raise BackupIntegrityError("Backup archive was empty")
+    layout = _restore_layout(data_path, vault_path)
+    recovered_commit: _RestoreTransaction | None = None
+    targets: _RestoreTargets | None = None
     data_stage: Path | None = None
     vault_stage: Path | None = None
     published = False
@@ -743,20 +1150,82 @@ def restore_backup(
                 if info.file_size != record.size:
                     raise BackupIntegrityError("Archive metadata did not match the manifest")
 
-            data_stage = Path(tempfile.mkdtemp(prefix=".careerops-restore-data-", dir=targets.data.parent))
-            vault_stage = Path(tempfile.mkdtemp(prefix=".careerops-restore-vault-", dir=targets.vault.parent))
-            for record in records:
-                destination = (
-                    data_stage / "careerops.db"
-                    if record.path == DATABASE_ARCHIVE_PATH
-                    else vault_stage / PurePosixPath(record.path).relative_to("vault")
+            declared_total_bytes = sum(item.size for item in records)
+            recovered_commit = _recover_restore_transaction(
+                layout,
+                archive_sha256=archive_sha256,
+                manifest_sha256=manifest_sha256,
+                records=records,
+            )
+            if recovered_commit is None:
+                targets = _restore_targets(data_path, vault_path)
+                reserved = (
+                    layout.data_stage,
+                    layout.vault_stage,
+                    layout.data_hold,
+                    layout.vault_hold,
                 )
-                _extract_member(archive, by_path[record.path], destination, record, limits)
+                if any(path.exists() or path.is_symlink() for path in reserved):
+                    raise RestoreTargetError("Restore transaction paths were already occupied")
+                layout.data_stage.mkdir()
+                layout.vault_stage.mkdir()
+                data_stage = layout.data_stage
+                vault_stage = layout.vault_stage
+                for record in records:
+                    destination = (
+                        data_stage / "careerops.db"
+                        if record.path == DATABASE_ARCHIVE_PATH
+                        else vault_stage / PurePosixPath(record.path).relative_to("vault")
+                    )
+                    _extract_member(archive, by_path[record.path], destination, record, limits)
 
+        if recovered_commit is not None:
+            if (
+                recovered_commit.archive_sha256 != archive_sha256
+                or recovered_commit.manifest_sha256 != manifest_sha256
+                or recovered_commit.file_count != len(records)
+                or recovered_commit.total_bytes != declared_total_bytes
+            ):
+                raise RestoreTargetError(
+                    "Committed restore transaction did not match this backup"
+                )
+            _verify_committed_files(recovered_commit, records)
+            database_stage = layout.data / "careerops.db"
+            try:
+                with closing(
+                    sqlite3.connect(
+                        f"{database_stage.as_uri()}?mode=ro&immutable=1",
+                        uri=True,
+                    )
+                ) as connection:
+                    if connection.execute("PRAGMA integrity_check").fetchone() != ("ok",):
+                        raise BackupIntegrityError(
+                            "Restored database failed its integrity check"
+                        )
+            except BackupError:
+                raise
+            except sqlite3.Error as error:
+                raise BackupIntegrityError("Restored database was not valid SQLite") from error
+            _finalize_committed_restore(recovered_commit)
+            published = True
+            return RestoreResult(
+                archive_path=archive_path,
+                manifest_sha256=manifest_sha256,
+                database_path=layout.data / "careerops.db",
+                vault_path=layout.vault,
+                file_count=len(records),
+                total_bytes=declared_total_bytes,
+            )
+
+        if data_stage is None or vault_stage is None or targets is None:
+            raise RestoreTargetError("Restore staging transaction was unavailable")
         database_stage = data_stage / "careerops.db"
         try:
             with closing(
-                sqlite3.connect(f"{database_stage.as_uri()}?mode=ro", uri=True)
+                sqlite3.connect(
+                    f"{database_stage.as_uri()}?mode=ro&immutable=1",
+                    uri=True,
+                )
             ) as connection:
                 if connection.execute("PRAGMA integrity_check").fetchone() != ("ok",):
                     raise BackupIntegrityError("Restored database failed its integrity check")
@@ -764,7 +1233,16 @@ def restore_backup(
             raise
         except sqlite3.Error as error:
             raise BackupIntegrityError("Restored database was not valid SQLite") from error
-        _publish_restore(targets, data_stage, vault_stage)
+        transaction = _RestoreTransaction(
+            layout=layout,
+            archive_sha256=archive_sha256,
+            manifest_sha256=manifest_sha256,
+            file_count=len(records),
+            total_bytes=declared_total_bytes,
+            data_identity=targets.data_identity[:2],
+            vault_identity=targets.vault_identity[:2],
+        )
+        _publish_restore(targets, transaction, records)
         published = True
         return RestoreResult(
             archive_path=archive_path,
@@ -772,16 +1250,16 @@ def restore_backup(
             database_path=targets.data / "careerops.db",
             vault_path=targets.vault,
             file_count=len(records),
-            total_bytes=sum(item.size for item in records),
+            total_bytes=declared_total_bytes,
         )
     except (zipfile.BadZipFile, EOFError, OSError) as error:
         if isinstance(error, BackupError):
             raise
         raise BackupIntegrityError("Backup archive was corrupt or unreadable") from error
     finally:
-        if not published:
-            _safe_remove_tree(data_stage, targets.data.parent)
-            _safe_remove_tree(vault_stage, targets.vault.parent)
+        if not published and not _restore_journals_exist(layout):
+            _safe_remove_tree(data_stage, layout.data.parent)
+            _safe_remove_tree(vault_stage, layout.vault.parent)
 
 
 def _cli() -> int:

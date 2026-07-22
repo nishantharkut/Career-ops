@@ -21,6 +21,7 @@ _RUNTIME_EXPORTS = frozenset(
     {
         "ManagedOllamaRuntime",
         "ManagedOllamaRuntimeFactory",
+        "DockerComposeOllamaLauncher",
         "ManagedRuntimeConfigurationError",
         "ManagedRuntimeError",
         "ManagedRuntimeIsolationError",

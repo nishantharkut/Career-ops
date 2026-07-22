@@ -10,6 +10,9 @@ import stat
 import subprocess
 from threading import RLock
 from typing import Any, Callable, Literal, Protocol
+from urllib.error import HTTPError, URLError
+from urllib.parse import quote
+from urllib.request import ProxyHandler, Request, build_opener
 from uuid import uuid4
 
 from careerops.ai.contracts import OllamaIsolationEvidence, ProviderError
@@ -104,6 +107,7 @@ class ManagedRuntimeLauncher(Protocol):
 
 
 ProviderBuilder = Callable[..., Any]
+InspectorTransport = Callable[[str, str, dict[str, Any] | None], dict[str, Any]]
 
 
 @dataclass(frozen=True)
@@ -197,14 +201,27 @@ def _validate_record(record: RuntimeLaunchRecord, model: str) -> str:
     if type(record) is not RuntimeLaunchRecord:
         raise ManagedRuntimeIsolationError("Managed runtime launcher returned an invalid identity")
     try:
-        endpoint = canonicalize_ollama_endpoint(record.endpoint)
+        endpoint = canonicalize_ollama_endpoint(
+            record.endpoint,
+            allow_managed_container=(record.handle_kind == "container"),
+        )
     except ValueError as error:
         raise ManagedRuntimeIsolationError(
             "Managed Ollama endpoint was not private loopback"
         ) from error
+    endpoint_matches_handle = bool(
+        (
+            record.handle_kind == "process"
+            and endpoint.startswith(("http://127.0.0.1:", "http://[::1]:"))
+        )
+        or (
+            record.handle_kind == "container"
+            and endpoint == "http://ollama:11434"
+        )
+    )
     if (
         endpoint != record.endpoint
-        or not endpoint.startswith("http://127.0.0.1:")
+        or not endpoint_matches_handle
         or record.model != model
         or record.egress_enforced is not True
         or record.cloud_disabled is not True
@@ -507,7 +524,11 @@ class WindowsPowerShellOllamaLauncher:
         return payload
 
     def launch(self, *, model: str, runtime_root: Path) -> RuntimeLaunchRecord:
-        payload = self._run(self._base_command("Launch", model, runtime_root))
+        try:
+            payload = self._run(self._base_command("Launch", model, runtime_root))
+        except ManagedRuntimeLaunchError:
+            self._recover_failed_launch(model=model, runtime_root=runtime_root)
+            raise
         expected = {
             "endpoint",
             "model",
@@ -529,6 +550,27 @@ class WindowsPowerShellOllamaLauncher:
             raise ManagedRuntimeLaunchError("Managed Ollama launcher identity was invalid") from error
         self._runtime_roots[record.runtime_instance_id] = runtime_root
         return record
+
+    def _recover_failed_launch(self, *, model: str, runtime_root: Path) -> None:
+        try:
+            payload = self._run(self._base_command("Recover", model, runtime_root))
+        except ManagedRuntimeError as error:
+            raise ManagedRuntimeLaunchError(
+                "Managed Ollama launcher failed and journal recovery did not complete"
+            ) from error
+        instances = payload.get("runtime_instances")
+        if (
+            payload.get("recovered") is not True
+            or set(payload) != {"recovered", "runtime_instances"}
+            or not isinstance(instances, list)
+            or not all(
+                type(item) is str and IDENTIFIER_PATTERN.fullmatch(item)
+                for item in instances
+            )
+        ):
+            raise ManagedRuntimeLaunchError(
+                "Managed Ollama launcher journal recovery was invalid"
+            )
 
     def verify(self, record: RuntimeLaunchRecord) -> bool:
         runtime_root = self._runtime_roots.get(record.runtime_instance_id)
@@ -559,3 +601,179 @@ class WindowsPowerShellOllamaLauncher:
         }:
             raise ManagedRuntimeLaunchError("Managed Ollama cleanup result was invalid")
         self._runtime_roots.pop(record.runtime_instance_id, None)
+
+
+class DockerComposeOllamaLauncher:
+    """Adopts only the Compose Ollama instance verified by the local inspector."""
+
+    _INSPECTOR_ORIGIN = "http://runtime-inspector:8766"
+    _MAX_RESPONSE_BYTES = 64 * 1024
+
+    def __init__(self, *, transport: InspectorTransport | None = None):
+        self._transport = transport or self._request_inspector
+        if not callable(self._transport):
+            raise ManagedRuntimeConfigurationError(
+                "Managed container inspector transport was invalid"
+            )
+        self._active: dict[str, RuntimeLaunchRecord] = {}
+        self._lock = RLock()
+
+    def launch(self, *, model: str, runtime_root: Path) -> RuntimeLaunchRecord:
+        del runtime_root
+        model = _validate_model(model)
+        path = f"/v1/ollama-runtime?model={quote(model, safe='')}"
+        payload = self._call("GET", path, None)
+        record = self._record_from_payload(payload)
+        if record.model != model:
+            raise ManagedRuntimeIsolationError(
+                "Managed container model identity did not match"
+            )
+        with self._lock:
+            self._active[record.runtime_instance_id] = record
+        return record
+
+    def verify(self, record: RuntimeLaunchRecord) -> bool:
+        with self._lock:
+            if self._active.get(record.runtime_instance_id) != record:
+                return False
+        path = f"/v1/ollama-runtime?model={quote(record.model, safe='')}"
+        try:
+            observed = self._record_from_payload(self._call("GET", path, None))
+        except ManagedRuntimeError:
+            return False
+        return observed == record
+
+    def cleanup(self, record: RuntimeLaunchRecord) -> None:
+        with self._lock:
+            if self._active.get(record.runtime_instance_id) != record:
+                raise ManagedRuntimeLaunchError(
+                    "Managed container runtime binding was unavailable"
+                )
+        payload = self._call(
+            "POST",
+            "/v1/ollama-runtime/cleanup",
+            {
+                "runtime_instance_id": record.runtime_instance_id,
+                "container_id": record.container_id,
+            },
+        )
+        if payload != {
+            "stopped": True,
+            "runtime_instance_id": record.runtime_instance_id,
+        }:
+            raise ManagedRuntimeLaunchError(
+                "Managed container cleanup result was invalid"
+            )
+        with self._lock:
+            self._active.pop(record.runtime_instance_id, None)
+
+    def _call(
+        self,
+        method: str,
+        path: str,
+        body: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        try:
+            payload = self._transport(method, path, body)
+        except ManagedRuntimeError:
+            raise
+        except Exception as error:
+            raise ManagedRuntimeLaunchError(
+                "Managed container inspector was unavailable"
+            ) from error
+        if type(payload) is not dict:
+            raise ManagedRuntimeLaunchError(
+                "Managed container inspector returned invalid JSON"
+            )
+        return payload
+
+    @staticmethod
+    def _record_from_payload(payload: dict[str, Any]) -> RuntimeLaunchRecord:
+        expected = {
+            "endpoint",
+            "model",
+            "runtime_instance_id",
+            "runtime_handle",
+            "handle_kind",
+            "process_id",
+            "container_id",
+            "egress_policy",
+            "egress_enforced",
+            "cloud_disabled",
+            "isolation_rule_id",
+        }
+        if set(payload) != expected:
+            raise ManagedRuntimeLaunchError(
+                "Managed container inspector identity was incomplete"
+            )
+        try:
+            record = RuntimeLaunchRecord(**payload)
+        except (TypeError, ValueError) as error:
+            raise ManagedRuntimeLaunchError(
+                "Managed container inspector identity was invalid"
+            ) from error
+        if (
+            record.handle_kind != "container"
+            or record.endpoint != "http://ollama:11434"
+            or record.egress_policy != "container_internal_no_egress"
+            or record.egress_enforced is not True
+            or record.cloud_disabled is not True
+        ):
+            raise ManagedRuntimeIsolationError(
+                "Managed container isolation evidence did not match"
+            )
+        return record
+
+    def _request_inspector(
+        self,
+        method: str,
+        path: str,
+        body: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        if method not in {"GET", "POST"} or not path.startswith("/v1/ollama-runtime"):
+            raise ManagedRuntimeConfigurationError(
+                "Managed container inspector request was invalid"
+            )
+        data = None
+        headers = {"Accept": "application/json", "Connection": "close"}
+        if body is not None:
+            data = json.dumps(
+                body,
+                allow_nan=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            ).encode("utf-8")
+            headers["Content-Type"] = "application/json"
+        request = Request(
+            f"{self._INSPECTOR_ORIGIN}{path}",
+            data=data,
+            headers=headers,
+            method=method,
+        )
+        try:
+            with build_opener(ProxyHandler({})).open(request, timeout=10) as response:
+                raw_length = response.headers.get("Content-Length")
+                if raw_length is not None and int(raw_length) > self._MAX_RESPONSE_BYTES:
+                    raise ManagedRuntimeLaunchError(
+                        "Managed container inspector response was too large"
+                    )
+                raw = response.read(self._MAX_RESPONSE_BYTES + 1)
+        except (HTTPError, URLError, OSError, TimeoutError, ValueError) as error:
+            raise ManagedRuntimeLaunchError(
+                "Managed container inspector was unavailable"
+            ) from error
+        if len(raw) > self._MAX_RESPONSE_BYTES:
+            raise ManagedRuntimeLaunchError(
+                "Managed container inspector response was too large"
+            )
+        try:
+            payload = json.loads(raw)
+        except (UnicodeError, ValueError) as error:
+            raise ManagedRuntimeLaunchError(
+                "Managed container inspector returned invalid JSON"
+            ) from error
+        if type(payload) is not dict:
+            raise ManagedRuntimeLaunchError(
+                "Managed container inspector returned invalid JSON"
+            )
+        return payload

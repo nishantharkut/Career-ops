@@ -70,6 +70,13 @@ from careerops.core.repository import (
     redact,
 )
 from careerops.gates.risk import evaluate_risks
+from careerops.operations.ollama_runtime import (
+    DockerComposeOllamaLauncher,
+    ManagedOllamaRuntime,
+    ManagedOllamaRuntimeFactory,
+    ManagedRuntimeError,
+    ManagedRuntimeLauncher,
+)
 from careerops.parsers.jd_parser import parse_jd
 from careerops.parsers.pdf_parser import parse_pdf
 from careerops.renderers.latex import render_latex, sha256_file
@@ -249,12 +256,15 @@ def create_app(
     static_dir: Path | None = None,
     task_poll_interval_seconds: float = 1.0,
     task_worker_count: int = 2,
+    environment: Mapping[str, str] | None = None,
+    managed_runtime_launcher: ManagedRuntimeLauncher | None = None,
 ) -> FastAPI:
+    effective_environment = dict(os.environ if environment is None else environment)
     repo = repository or default_repository()
     registry = (
         dict(provider_registry)
         if provider_registry is not None
-        else _default_provider_registry(repo)
+        else _default_provider_registry(repo, effective_environment)
     )
     orchestrator = AiOrchestrator(repo, registry)
     task_runner = AiTaskRunner(
@@ -267,18 +277,83 @@ def create_app(
     @asynccontextmanager
     async def lifespan(_api: FastAPI):
         runner_started = False
+        startup_ready = False
+        managed_factory: ManagedOllamaRuntimeFactory | None = None
+        managed_runtime: ManagedOllamaRuntime | None = None
         try:
+            managed_mode = effective_environment.get(
+                "CAREEROPS_OLLAMA_MANAGED_MODE", ""
+            ).strip().casefold()
+            if managed_mode:
+                try:
+                    if managed_mode != "container":
+                        raise ManagedRuntimeError(
+                            "Configured managed Ollama mode was unsupported"
+                        )
+                    if (
+                        effective_environment.get("CAREEROPS_OLLAMA_URL")
+                        != "http://ollama:11434"
+                    ):
+                        raise ManagedRuntimeError(
+                            "Managed Ollama endpoint did not match the Compose service"
+                        )
+                    configured_runtime_root = effective_environment.get(
+                        "CAREEROPS_OLLAMA_RUNTIME_ROOT", ""
+                    ).strip()
+                    runtime_root = (
+                        Path(configured_runtime_root)
+                        if configured_runtime_root
+                        else repo.database_path.parent / ".managed-ollama"
+                    )
+                    if not runtime_root.is_absolute():
+                        runtime_root = (
+                            Path(__file__).resolve().parents[3] / runtime_root
+                        )
+                    managed_factory = ManagedOllamaRuntimeFactory(
+                        launcher=(
+                            managed_runtime_launcher
+                            if managed_runtime_launcher is not None
+                            else DockerComposeOllamaLauncher()
+                        ),
+                        runtime_root=runtime_root,
+                    )
+                    managed_runtime = managed_factory.launch(
+                        model=(
+                            effective_environment.get("CAREEROPS_OLLAMA_MODEL")
+                            or "qwen2.5:7b"
+                        )
+                    )
+                    config = _register_provider(
+                        repo,
+                        registry,
+                        managed_runtime.provider,
+                        display_name=f"Ollama {managed_runtime.model}",
+                        enabled=True,
+                    )
+                    orchestrator.register_provider(config.id, managed_runtime.provider)
+                    _api.state.managed_ollama_runtime = managed_runtime
+                    _api.state.managed_ollama_error = ""
+                except ManagedRuntimeError as exc:
+                    _api.state.managed_ollama_runtime = None
+                    _api.state.managed_ollama_error = type(exc).__name__
             try:
                 runner_started = task_runner.start()
             except Exception as exc:
                 raise RuntimeError("AI task runner failed to start") from exc
             if not runner_started:
                 raise RuntimeError("AI task runner failed to start")
+            startup_ready = True
             _api.state.task_runner_lifespan_started = True
             yield
         finally:
             _api.state.task_runner_lifespan_started = False
             task_runner.stop()
+            if (
+                managed_factory is not None
+                and managed_runtime is not None
+                and not startup_ready
+            ):
+                managed_factory.stop(managed_runtime)
 
     root = Path(__file__).resolve().parents[3]
     api = FastAPI(title="CareerOps Local API", lifespan=lifespan)
@@ -287,6 +362,8 @@ def create_app(
     api.state.ai_orchestrator = orchestrator
     api.state.task_runner = task_runner
     api.state.task_runner_lifespan_started = False
+    api.state.managed_ollama_runtime = None
+    api.state.managed_ollama_error = ""
     effective_auth = auth
     if effective_auth is None and inherit_environment_auth:
         effective_auth = _auth_from_env()

@@ -193,7 +193,11 @@ def test_ollama_has_internal_no_egress_network_without_published_port():
     assert config["networks"]["ollama_private"]["internal"] is True
     assert "ports" not in ollama
     assert "expose" in ollama and ollama["expose"] == ["11434"]
-    assert set(careerops["networks"]) == {"public_api", "ollama_private"}
+    assert set(careerops["networks"]) == {
+        "attestation_private",
+        "public_api",
+        "ollama_private",
+    }
     assert config["networks"]["public_api"].get("internal", False) is False
     assert ollama["environment"]["OLLAMA_NO_CLOUD"] == "1"
     assert ollama["environment"]["OLLAMA_HOST"] == "0.0.0.0:11434"
@@ -209,11 +213,37 @@ def test_compose_healthchecks_and_least_privilege_are_enabled():
         assert "no-new-privileges:true" in service["security_opt"]
         assert any(item.startswith("/tmp:") for item in service["tmpfs"])
     assert config["services"]["careerops"]["depends_on"]["ollama"]["condition"] == "service_healthy"
+    assert (
+        config["services"]["careerops"]["depends_on"]["runtime-inspector"]["condition"]
+        == "service_healthy"
+    )
+
+
+def test_compose_runtime_inspector_is_internal_unpublished_and_socket_scoped():
+    config = compose_config()
+    inspector = config["services"]["runtime-inspector"]
+
+    assert set(inspector["networks"]) == {"attestation_private"}
+    assert config["networks"]["attestation_private"]["internal"] is True
+    assert "ports" not in inspector
+    assert "expose" not in inspector
+    assert inspector["read_only"] is True
+    assert "ALL" in inspector["cap_drop"]
+    assert "no-new-privileges:true" in inspector["security_opt"]
+    socket_mount = next(
+        item for item in inspector["volumes"] if item["target"] == "/var/run/docker.sock"
+    )
+    assert socket_mount["read_only"] is True
+    assert inspector["command"] == [
+        "python",
+        "-m",
+        "careerops.operations.container_runtime_inspector",
+    ]
 
 
 def test_compose_remains_self_hosted_without_paid_managed_dependencies():
     config = compose_config()
-    assert set(config["services"]) == {"careerops", "ollama"}
+    assert set(config["services"]) == {"careerops", "ollama", "runtime-inspector"}
     assert Path(config["services"]["careerops"]["build"]["context"]).resolve() == ROOT.resolve()
     image = config["services"]["ollama"]["image"]
     assert re.fullmatch(r"ollama/ollama@sha256:[0-9a-f]{64}", image)
