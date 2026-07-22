@@ -75,6 +75,18 @@ Sha256Text = Annotated[
     str,
     StringConstraints(pattern=r"^[0-9a-f]{64}$"),
 ]
+ContainerImageReference = Annotated[
+    str,
+    StringConstraints(
+        min_length=73,
+        max_length=2_048,
+        pattern=r"^[a-z0-9][a-z0-9._:/-]*@sha256:[0-9a-f]{64}$",
+    ),
+]
+ContainerImageId = Annotated[
+    str,
+    StringConstraints(pattern=r"^sha256:[0-9a-f]{64}$"),
+]
 
 
 class _DuplicateJsonMember(ValueError):
@@ -165,11 +177,13 @@ class StrictModel(BaseModel):
 
 
 class OllamaIsolationEvidence(StrictModel):
-    attestation_version: Literal["ollama_isolation_v2"]
+    attestation_version: Literal["ollama_isolation_v3"]
     canonical_endpoint: BoundMetadataText
     model: RuntimeHandleText
     runtime_instance_id: Identifier
     runtime_handle: RuntimeHandleText
+    container_image_reference: ContainerImageReference | None
+    container_image_id: ContainerImageId | None
     egress_policy: Literal[
         "container_internal_no_egress",
         "os_firewall_block",
@@ -179,11 +193,29 @@ class OllamaIsolationEvidence(StrictModel):
     issuer_instance_id: Identifier
     integrity: Sha256Text
 
+    @model_validator(mode="after")
+    def validate_container_image_identity(self) -> OllamaIsolationEvidence:
+        has_container_image = bool(
+            self.container_image_reference is not None
+            and self.container_image_id is not None
+        )
+        has_partial_image = bool(
+            (self.container_image_reference is None)
+            != (self.container_image_id is None)
+        )
+        if has_partial_image or has_container_image != (
+            self.egress_policy == "container_internal_no_egress"
+        ):
+            raise ValueError("Container image identity did not match runtime policy")
+        return self
+
     def canonical_payload_bytes(self) -> bytes:
         payload = {
             "attestation_version": self.attestation_version,
             "canonical_endpoint": self.canonical_endpoint,
             "cloud_disabled": self.cloud_disabled,
+            "container_image_id": self.container_image_id,
+            "container_image_reference": self.container_image_reference,
             "egress_enforced": self.egress_enforced,
             "egress_policy": self.egress_policy,
             "issuer_instance_id": self.issuer_instance_id,
@@ -521,6 +553,8 @@ class InvocationMetadata(StrictModel):
     attestation_version: MetadataText = ""
     runtime_instance_id: MetadataText = ""
     runtime_handle: MetadataText = ""
+    container_image_reference: MetadataText = ""
+    container_image_id: MetadataText = ""
     issuer_instance_id: MetadataText = ""
     egress_policy: MetadataText = ""
     cloud_disabled: bool = False
@@ -552,6 +586,8 @@ class ProviderAvailability(StrictModel):
     attestation_version: MetadataText = ""
     runtime_instance_id: MetadataText = ""
     runtime_handle: MetadataText = ""
+    container_image_reference: MetadataText = ""
+    container_image_id: MetadataText = ""
     issuer_instance_id: MetadataText = ""
     egress_policy: MetadataText = ""
     cloud_disabled: bool = False

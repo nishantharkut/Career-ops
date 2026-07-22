@@ -134,6 +134,8 @@ def provider_binding_from_result(result: Any) -> dict[str, Any]:
                 "attestation_version",
                 "runtime_instance_id",
                 "runtime_handle",
+                "container_image_reference",
+                "container_image_id",
                 "issuer_instance_id",
                 "egress_policy",
                 "cloud_disabled",
@@ -439,6 +441,8 @@ OLLAMA_MODEL = "qwen2.5:7b"
 OLLAMA_DIGEST = "a" * 64
 OLLAMA_RUNTIME_INSTANCE = "careerops_ollama_test"
 OLLAMA_RUNTIME_HANDLE = "container:careerops_ollama_test"
+OLLAMA_CONTAINER_IMAGE_REFERENCE = "ollama/ollama@sha256:" + ("c" * 64)
+OLLAMA_CONTAINER_IMAGE_ID = "sha256:" + ("d" * 64)
 OLLAMA_AUTHORITY = ollama_provider_module.OllamaRuntimeAuthority(
     issuer_instance_id="careerops_api_test",
     key=b"careerops-test-ollama-authority-key",
@@ -448,6 +452,8 @@ OLLAMA_ISOLATION = OLLAMA_AUTHORITY.issue(
     model=OLLAMA_MODEL,
     runtime_instance_id=OLLAMA_RUNTIME_INSTANCE,
     runtime_handle=OLLAMA_RUNTIME_HANDLE,
+    container_image_reference=OLLAMA_CONTAINER_IMAGE_REFERENCE,
+    container_image_id=OLLAMA_CONTAINER_IMAGE_ID,
     egress_policy="container_internal_no_egress",
 )
 
@@ -460,6 +466,12 @@ def isolated_ollama(**values: Any) -> OllamaProvider:
         "runtime_instance_id", OLLAMA_RUNTIME_INSTANCE
     )
     runtime_handle = configured.pop("runtime_handle", OLLAMA_RUNTIME_HANDLE)
+    container_image_reference = configured.pop(
+        "container_image_reference", OLLAMA_CONTAINER_IMAGE_REFERENCE
+    )
+    container_image_id = configured.pop(
+        "container_image_id", OLLAMA_CONTAINER_IMAGE_ID
+    )
     authority = configured.pop("isolation_authority", OLLAMA_AUTHORITY)
     evidence = configured.pop("isolation_evidence", None)
     if evidence is None:
@@ -474,6 +486,8 @@ def isolated_ollama(**values: Any) -> OllamaProvider:
             model=model,
             runtime_instance_id=runtime_instance_id,
             runtime_handle=runtime_handle,
+            container_image_reference=container_image_reference,
+            container_image_id=container_image_id,
             egress_policy="container_internal_no_egress",
         )
     return OllamaProvider(
@@ -481,6 +495,8 @@ def isolated_ollama(**values: Any) -> OllamaProvider:
         model=model,
         runtime_instance_id=runtime_instance_id,
         runtime_handle=runtime_handle,
+        container_image_reference=container_image_reference,
+        container_image_id=container_image_id,
         isolation_authority=authority,
         isolation_evidence=evidence,
         runtime_verifier=ollama_provider_module._bind_ollama_runtime_verifier(
@@ -651,6 +667,8 @@ def test_ollama_reverifies_runtime_immediately_before_sending_task_content(
             model=OLLAMA_MODEL,
             runtime_instance_id="runtime_live_recheck",
             runtime_handle="pid:5511",
+            container_image_reference=None,
+            container_image_id=None,
             egress_policy="os_firewall_block",
         )
         provider = OllamaProvider(
@@ -658,6 +676,8 @@ def test_ollama_reverifies_runtime_immediately_before_sending_task_content(
             model=OLLAMA_MODEL,
             runtime_instance_id="runtime_live_recheck",
             runtime_handle="pid:5511",
+            container_image_reference=None,
+            container_image_id=None,
             isolation_authority=authority,
             isolation_evidence=evidence,
             runtime_verifier=ollama_provider_module._bind_ollama_runtime_verifier(
@@ -687,6 +707,10 @@ def test_ollama_isolation_evidence_is_strict_structured_and_frozen():
                 "environment_override": True,
             }
         )
+    missing_image_identity = evidence.model_dump()
+    missing_image_identity.pop("container_image_reference", None)
+    with pytest.raises(ValidationError):
+        ai_contracts.OllamaIsolationEvidence.model_validate(missing_image_identity)
 
 
 def test_ollama_runtime_authority_requires_private_256_bit_key():
@@ -726,6 +750,8 @@ def test_ollama_endpoint_canonicalization_normalizes_ipv6_loopback():
         "model",
         "runtime_instance",
         "runtime_handle",
+        "image_reference",
+        "image_id",
         "authority",
         "tamper",
     ],
@@ -765,6 +791,16 @@ def test_ollama_bound_capability_mismatch_fails_before_any_request(
                 if mismatch == "runtime_handle"
                 else provider_handle
             ),
+            container_image_reference=(
+                "ollama/ollama@sha256:" + ("e" * 64)
+                if mismatch == "image_reference"
+                else OLLAMA_CONTAINER_IMAGE_REFERENCE
+            ),
+            container_image_id=(
+                "sha256:" + ("e" * 64)
+                if mismatch == "image_id"
+                else OLLAMA_CONTAINER_IMAGE_ID
+            ),
             egress_policy="container_internal_no_egress",
         )
         selected_authority = (
@@ -781,8 +817,15 @@ def test_ollama_bound_capability_mismatch_fails_before_any_request(
             model=provider_model,
             runtime_instance_id=provider_runtime,
             runtime_handle=provider_handle,
+            container_image_reference=OLLAMA_CONTAINER_IMAGE_REFERENCE,
+            container_image_id=OLLAMA_CONTAINER_IMAGE_ID,
             isolation_authority=selected_authority,
             isolation_evidence=evidence,
+            runtime_verifier=ollama_provider_module._bind_ollama_runtime_verifier(
+                authority,
+                evidence,
+                lambda: True,
+            ),
         )
 
         availability = provider.availability()
@@ -808,6 +851,8 @@ def test_ollama_bound_capability_accepts_equivalent_canonical_endpoint(
             model=OLLAMA_MODEL,
             runtime_instance_id="runtime_test_a",
             runtime_handle="process:12345",
+            container_image_reference=None,
+            container_image_id=None,
             egress_policy="os_firewall_block",
         )
         provider = OllamaProvider(
@@ -815,6 +860,8 @@ def test_ollama_bound_capability_accepts_equivalent_canonical_endpoint(
             model=OLLAMA_MODEL,
             runtime_instance_id="runtime_test_a",
             runtime_handle="process:12345",
+            container_image_reference=None,
+            container_image_id=None,
             isolation_authority=authority,
             isolation_evidence=evidence,
             runtime_verifier=ollama_provider_module._bind_ollama_runtime_verifier(
@@ -994,6 +1041,8 @@ def test_ollama_local_private_result_persists_complete_justification(
             model=OLLAMA_MODEL,
             runtime_instance_id="runtime_provenance",
             runtime_handle="container:ollama_provenance",
+            container_image_reference=OLLAMA_CONTAINER_IMAGE_REFERENCE,
+            container_image_id=OLLAMA_CONTAINER_IMAGE_ID,
             egress_policy="container_internal_no_egress",
         )
         provider = OllamaProvider(
@@ -1001,6 +1050,8 @@ def test_ollama_local_private_result_persists_complete_justification(
             model=OLLAMA_MODEL,
             runtime_instance_id="runtime_provenance",
             runtime_handle="container:ollama_provenance",
+            container_image_reference=OLLAMA_CONTAINER_IMAGE_REFERENCE,
+            container_image_id=OLLAMA_CONTAINER_IMAGE_ID,
             isolation_authority=authority,
             isolation_evidence=evidence,
             runtime_verifier=ollama_provider_module._bind_ollama_runtime_verifier(
@@ -1023,9 +1074,14 @@ def test_ollama_local_private_result_persists_complete_justification(
     ).hexdigest()
     for provenance in (availability, result.invocation):
         assert provenance.endpoint == endpoint
-        assert provenance.attestation_version == "ollama_isolation_v2"
+        assert provenance.attestation_version == "ollama_isolation_v3"
         assert provenance.runtime_instance_id == "runtime_provenance"
         assert provenance.runtime_handle == "container:ollama_provenance"
+        assert (
+            provenance.container_image_reference
+            == OLLAMA_CONTAINER_IMAGE_REFERENCE
+        )
+        assert provenance.container_image_id == OLLAMA_CONTAINER_IMAGE_ID
         assert provenance.issuer_instance_id == "careerops_api_provenance"
         assert provenance.egress_policy == "container_internal_no_egress"
         assert provenance.cloud_disabled is True

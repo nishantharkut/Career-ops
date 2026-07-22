@@ -142,10 +142,12 @@ class OllamaRuntimeAuthority:
         model: str,
         runtime_instance_id: str,
         runtime_handle: str,
+        container_image_reference: str | None,
+        container_image_id: str | None,
         egress_policy: str,
     ) -> OllamaIsolationEvidence:
         unsigned = OllamaIsolationEvidence(
-            attestation_version="ollama_isolation_v2",
+            attestation_version="ollama_isolation_v3",
             canonical_endpoint=canonicalize_ollama_endpoint(
                 endpoint,
                 allow_managed_container=(
@@ -155,6 +157,8 @@ class OllamaRuntimeAuthority:
             model=model,
             runtime_instance_id=runtime_instance_id,
             runtime_handle=runtime_handle,
+            container_image_reference=container_image_reference,
+            container_image_id=container_image_id,
             egress_policy=egress_policy,
             cloud_disabled=True,
             egress_enforced=True,
@@ -176,6 +180,8 @@ class OllamaRuntimeAuthority:
         model: str,
         runtime_instance_id: str,
         runtime_handle: str,
+        container_image_reference: str | None,
+        container_image_id: str | None,
     ) -> bool:
         try:
             exact_fields = set(type(evidence).model_fields)
@@ -192,6 +198,8 @@ class OllamaRuntimeAuthority:
                 or evidence.model != model
                 or evidence.runtime_instance_id != runtime_instance_id
                 or evidence.runtime_handle != runtime_handle
+                or evidence.container_image_reference != container_image_reference
+                or evidence.container_image_id != container_image_id
                 or evidence.issuer_instance_id != self.issuer_instance_id
                 or evidence.cloud_disabled is not True
                 or evidence.egress_enforced is not True
@@ -405,6 +413,8 @@ class OllamaProvider:
     timeout_seconds: float = 30
     runtime_instance_id: str = ""
     runtime_handle: str = ""
+    container_image_reference: str | None = field(default=None, repr=False)
+    container_image_id: str | None = field(default=None, repr=False)
     isolation_authority: OllamaRuntimeAuthority | None = field(
         default=None,
         repr=False,
@@ -469,6 +479,8 @@ class OllamaProvider:
                     model=self.model,
                     runtime_instance_id=self.runtime_instance_id,
                     runtime_handle=self.runtime_handle,
+                    container_image_reference=self.container_image_reference,
+                    container_image_id=self.container_image_id,
                 )
                 and self.runtime_verifier.verifies(
                     self.isolation_authority,
@@ -492,6 +504,8 @@ class OllamaProvider:
                     self.isolation_evidence is not None,
                     bool(self.runtime_instance_id),
                     bool(self.runtime_handle),
+                    self.container_image_reference is not None,
+                    self.container_image_id is not None,
                 )
             )
             return self._availability_status(
@@ -563,6 +577,8 @@ class OllamaProvider:
             "attestation_version": evidence.attestation_version,
             "runtime_instance_id": evidence.runtime_instance_id,
             "runtime_handle": evidence.runtime_handle,
+            "container_image_reference": evidence.container_image_reference or "",
+            "container_image_id": evidence.container_image_id or "",
             "issuer_instance_id": evidence.issuer_instance_id,
             "egress_policy": evidence.egress_policy,
             "cloud_disabled": evidence.cloud_disabled,

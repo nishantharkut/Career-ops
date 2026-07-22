@@ -432,6 +432,8 @@ if ($Action -eq "Launch") {
             handle_kind = "process"
             process_id = $ProcessId
             container_id = $null
+            container_image_reference = $null
+            container_image_id = $null
             egress_policy = "os_firewall_block"
             egress_enforced = $true
             cloud_disabled = $true

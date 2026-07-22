@@ -19,7 +19,10 @@ MAX_DOCKER_RESPONSE_BYTES = 2 * 1024 * 1024
 MAX_REQUEST_BYTES = 4 * 1024
 CONTAINER_ID = re.compile(r"[0-9a-f]{12,64}\Z")
 FULL_CONTAINER_ID = re.compile(r"[0-9a-f]{64}\Z")
-DIGEST_IMAGE = re.compile(r"[^\s@]+@sha256:[0-9a-f]{64}\Z")
+DIGEST_IMAGE = re.compile(
+    r"[a-z0-9][a-z0-9._:/-]*@sha256:[0-9a-f]{64}\Z"
+)
+IMAGE_ID = re.compile(r"sha256:[0-9a-f]{64}\Z")
 MODEL = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/-]{0,255}\Z")
 
 
@@ -126,6 +129,8 @@ class InspectedRuntime:
     handle_kind: str
     process_id: None
     container_id: str
+    container_image_reference: str
+    container_image_id: str
     egress_policy: str
     egress_enforced: bool
     cloud_disabled: bool
@@ -181,8 +186,13 @@ def inspect_ollama_runtime(model: str) -> InspectedRuntime:
     if type(process_id) is not int or process_id <= 0:
         raise InspectorError("Ollama container process identity was invalid")
     config = _mapping(inspection.get("Config"), "Ollama configuration")
-    image = _string(config.get("Image"), "Ollama image")
-    if DIGEST_IMAGE.fullmatch(image) is None:
+    image_reference = _string(config.get("Image"), "Ollama image reference")
+    image_id = _string(inspection.get("Image"), "Ollama image ID").casefold()
+    if (
+        DIGEST_IMAGE.fullmatch(image_reference) is None
+        or image_reference != image_reference.casefold()
+        or IMAGE_ID.fullmatch(image_id) is None
+    ):
         raise InspectorError("Ollama image was not immutable")
     environment = _environment(config.get("Env"))
     if (
@@ -236,7 +246,10 @@ def inspect_ollama_runtime(model: str) -> InspectedRuntime:
     ):
         raise InspectorError("Ollama network address was outside the private boundary")
     runtime_hash = hashlib.sha256(
-        f"{container_id}\0{started_at}\0{network_id}\0{process_id}".encode("ascii")
+        (
+            f"{container_id}\0{started_at}\0{network_id}\0{process_id}\0"
+            f"{image_reference}\0{image_id}"
+        ).encode("ascii")
     ).hexdigest()
     return InspectedRuntime(
         endpoint="http://ollama:11434",
@@ -246,6 +259,8 @@ def inspect_ollama_runtime(model: str) -> InspectedRuntime:
         handle_kind="container",
         process_id=None,
         container_id=container_id,
+        container_image_reference=image_reference,
+        container_image_id=image_id,
         egress_policy="container_internal_no_egress",
         egress_enforced=True,
         cloud_disabled=True,

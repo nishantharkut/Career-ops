@@ -979,6 +979,8 @@ _PUBLIC_PROVIDER_BINDING_FIELDS = frozenset(
         "model_metadata_sha256",
         "show_metadata_sha256",
         "attestation_version",
+        "container_image_reference",
+        "container_image_id",
         "egress_policy",
         "cloud_disabled",
         "egress_enforced",

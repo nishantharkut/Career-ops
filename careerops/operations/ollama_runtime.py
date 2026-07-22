@@ -29,6 +29,10 @@ IDENTIFIER_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z")
 MODEL_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/-]{0,255}\Z")
 SHA256_PATTERN = re.compile(r"[0-9a-f]{64}\Z")
 CONTAINER_ID_PATTERN = re.compile(r"[0-9a-f]{12,64}\Z")
+CONTAINER_IMAGE_REFERENCE_PATTERN = re.compile(
+    r"[a-z0-9][a-z0-9._:/-]*@sha256:[0-9a-f]{64}\Z"
+)
+CONTAINER_IMAGE_ID_PATTERN = re.compile(r"sha256:[0-9a-f]{64}\Z")
 
 
 class ManagedRuntimeError(RuntimeError):
@@ -58,6 +62,8 @@ class RuntimeLaunchRecord:
     handle_kind: Literal["process", "container"]
     process_id: int | None
     container_id: str | None
+    container_image_reference: str | None
+    container_image_id: str | None
     egress_policy: Literal["os_firewall_block", "container_internal_no_egress"]
     egress_enforced: bool
     cloud_disabled: bool
@@ -84,6 +90,8 @@ class RuntimeLaunchRecord:
                 type(self.process_id) is not int
                 or self.process_id <= 0
                 or self.container_id is not None
+                or self.container_image_reference is not None
+                or self.container_image_id is not None
                 or self.runtime_handle != f"pid:{self.process_id}"
                 or self.egress_policy != "os_firewall_block"
             ):
@@ -93,6 +101,14 @@ class RuntimeLaunchRecord:
                 self.process_id is not None
                 or type(self.container_id) is not str
                 or CONTAINER_ID_PATTERN.fullmatch(self.container_id) is None
+                or type(self.container_image_reference) is not str
+                or CONTAINER_IMAGE_REFERENCE_PATTERN.fullmatch(
+                    self.container_image_reference
+                )
+                is None
+                or type(self.container_image_id) is not str
+                or CONTAINER_IMAGE_ID_PATTERN.fullmatch(self.container_image_id)
+                is None
                 or self.runtime_handle != f"container:{self.container_id}"
                 or self.egress_policy != "container_internal_no_egress"
             ):
@@ -117,6 +133,8 @@ class ManagedOllamaRuntime:
     model: str
     runtime_instance_id: str
     runtime_handle: str
+    container_image_reference: str | None
+    container_image_id: str | None
     egress_policy: str
     provider: Any = field(repr=False, compare=False)
     authority: OllamaRuntimeAuthority = field(repr=False, compare=False)
@@ -304,6 +322,8 @@ class ManagedOllamaRuntimeFactory:
                     model=model,
                     runtime_instance_id=record.runtime_instance_id,
                     runtime_handle=record.runtime_handle,
+                    container_image_reference=record.container_image_reference,
+                    container_image_id=record.container_image_id,
                     egress_policy=record.egress_policy,
                 )
                 self._launching[record.runtime_instance_id] = record
@@ -313,6 +333,8 @@ class ManagedOllamaRuntimeFactory:
                         model=model,
                         runtime_instance_id=record.runtime_instance_id,
                         runtime_handle=record.runtime_handle,
+                        container_image_reference=record.container_image_reference,
+                        container_image_id=record.container_image_id,
                         isolation_authority=self._authority,
                         isolation_evidence=evidence,
                         runtime_verifier=_bind_ollama_runtime_verifier(
@@ -343,6 +365,8 @@ class ManagedOllamaRuntimeFactory:
                     model=model,
                     runtime_instance_id=record.runtime_instance_id,
                     runtime_handle=record.runtime_handle,
+                    container_image_reference=record.container_image_reference,
+                    container_image_id=record.container_image_id,
                     egress_policy=record.egress_policy,
                     provider=provider,
                     authority=self._authority,
@@ -403,16 +427,25 @@ class ManagedOllamaRuntimeFactory:
                 return bool(
                     record.runtime_instance_id == managed.runtime_instance_id
                     and record.runtime_handle == managed.runtime_handle
+                    and record.container_image_reference
+                    == managed.container_image_reference
+                    and record.container_image_id == managed.container_image_id
                     and record.endpoint == managed.endpoint
                     and record.model == managed.model
                     and managed.provider.endpoint == managed.endpoint
                     and managed.provider.model == managed.model
+                    and managed.provider.container_image_reference
+                    == managed.container_image_reference
+                    and managed.provider.container_image_id
+                    == managed.container_image_id
                     and self._authority.verifies(
                         managed.evidence,
                         endpoint=managed.endpoint,
                         model=managed.model,
                         runtime_instance_id=managed.runtime_instance_id,
                         runtime_handle=managed.runtime_handle,
+                        container_image_reference=managed.container_image_reference,
+                        container_image_id=managed.container_image_id,
                     )
                     and self._launcher.verify(record)
                 )
@@ -564,6 +597,8 @@ class WindowsPowerShellOllamaLauncher:
             "handle_kind",
             "process_id",
             "container_id",
+            "container_image_reference",
+            "container_image_id",
             "egress_policy",
             "egress_enforced",
             "cloud_disabled",
@@ -724,6 +759,8 @@ class DockerComposeOllamaLauncher:
             "handle_kind",
             "process_id",
             "container_id",
+            "container_image_reference",
+            "container_image_id",
             "egress_policy",
             "egress_enforced",
             "cloud_disabled",

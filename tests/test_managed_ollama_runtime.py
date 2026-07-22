@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import replace
+from dataclasses import MISSING, replace
 from copy import deepcopy
 import json
 import os
@@ -33,6 +33,9 @@ from careerops.operations.ollama_runtime import (
 GOOD_DIGEST = "a" * 64
 GOOD_TAGS_SHA = "b" * 64
 GOOD_SHOW_SHA = "c" * 64
+CONTAINER_IMAGE_C = "ollama/ollama@sha256:" + ("c" * 64)
+CONTAINER_IMAGE_E = "ollama/ollama@sha256:" + ("e" * 64)
+CONTAINER_IMAGE_ID = "sha256:" + ("d" * 64)
 
 
 class FakeProvider:
@@ -41,6 +44,8 @@ class FakeProvider:
         self.model = values["model"]
         self.runtime_instance_id = values["runtime_instance_id"]
         self.runtime_handle = values["runtime_handle"]
+        self.container_image_reference = values["container_image_reference"]
+        self.container_image_id = values["container_image_id"]
         self.isolation_authority = values["isolation_authority"]
         self.isolation_evidence = values["isolation_evidence"]
         self.identity = OllamaModelIdentity(
@@ -103,6 +108,8 @@ def _record(
         "handle_kind": "process",
         "process_id": 4100 + sequence,
         "container_id": None,
+        "container_image_reference": None,
+        "container_image_id": None,
         "egress_policy": "os_firewall_block",
         "egress_enforced": True,
         "cloud_disabled": True,
@@ -144,6 +151,8 @@ def test_factory_launches_verifies_then_issues_authority_bound_capability(tmp_pa
         model=managed.model,
         runtime_instance_id=managed.runtime_instance_id,
         runtime_handle=managed.runtime_handle,
+        container_image_reference=None,
+        container_image_id=None,
     )
     assert managed.model_identity.digest == GOOD_DIGEST
     assert managed.runtime_handle == f"pid:{managed.process_id}"
@@ -303,6 +312,8 @@ def test_restart_invalidates_old_capability_and_creates_new_identity(tmp_path: P
         model=second.model,
         runtime_instance_id=second.runtime_instance_id,
         runtime_handle=second.runtime_handle,
+        container_image_reference=None,
+        container_image_id=None,
     )
 
 
@@ -408,6 +419,8 @@ def test_windows_launcher_uses_argument_lists_and_scrubs_ambient_ollama_state(
         "handle_kind": "process",
         "process_id": 4101,
         "container_id": None,
+        "container_image_reference": None,
+        "container_image_id": None,
         "egress_policy": "os_firewall_block",
         "egress_enforced": True,
         "cloud_disabled": True,
@@ -457,6 +470,13 @@ def test_record_requires_concrete_process_or_container_identity():
             runtime_handle="container:short",
             egress_policy="container_internal_no_egress",
         )
+
+
+def test_runtime_record_requires_explicit_container_image_identity_fields():
+    fields = RuntimeLaunchRecord.__dataclass_fields__
+
+    assert fields["container_image_reference"].default is MISSING
+    assert fields["container_image_id"].default is MISSING
 
 
 def test_windows_launcher_recovers_durable_launch_record_after_timeout(
@@ -649,6 +669,8 @@ def _container_record(*, model: str = "qwen2.5:7b") -> RuntimeLaunchRecord:
         handle_kind="container",
         process_id=None,
         container_id=container_id,
+        container_image_reference=CONTAINER_IMAGE_C,
+        container_image_id=CONTAINER_IMAGE_ID,
         egress_policy="container_internal_no_egress",
         egress_enforced=True,
         cloud_disabled=True,
@@ -707,6 +729,10 @@ def test_production_lifespan_enables_only_verified_compose_managed_ollama(
         assert ollama["available"] is True
         assert ollama["privacy_mode"] == PrivacyMode.LOCAL_PRIVATE.value
         assert ollama["endpoint"] == "http://ollama:11434"
+        assert ollama["current_metadata"]["container_image_reference"] == (
+            CONTAINER_IMAGE_C
+        )
+        assert ollama["current_metadata"]["container_image_id"] == CONTAINER_IMAGE_ID
         assert managed.provider is api.state.provider_registry[ollama["id"]]
         assert api.state.ai_orchestrator._providers[ollama["id"]] is managed.provider
         assert managed.authority.verifies(
@@ -715,7 +741,11 @@ def test_production_lifespan_enables_only_verified_compose_managed_ollama(
             model=managed.model,
             runtime_instance_id=managed.runtime_instance_id,
             runtime_handle=managed.runtime_handle,
+            container_image_reference=CONTAINER_IMAGE_C,
+            container_image_id=CONTAINER_IMAGE_ID,
         )
+        assert managed.evidence.container_image_reference == CONTAINER_IMAGE_C
+        assert managed.evidence.container_image_id == CONTAINER_IMAGE_ID
         assert launcher.events[:2] == ["launch", "verify"]
 
 
@@ -746,6 +776,50 @@ def test_production_managed_provider_reverifies_live_runtime_before_probe_and_ru
         launcher.current = replace(
             managed.launch_record,
             isolation_rule_id="network-replaced-after-startup",
+        )
+
+        ollama = next(
+            item
+            for item in client.get("/ai/providers").json()
+            if item["provider_kind"] == "ollama"
+        )
+
+        assert ollama["available"] is False
+        assert launcher.events == ["verify"]
+        assert ollama_calls == []
+        with pytest.raises(ProviderUnavailableError, match="isolation"):
+            managed.provider.run(object())
+        assert launcher.events == ["verify", "verify"]
+        assert ollama_calls == []
+
+
+def test_production_managed_provider_rejects_exact_container_image_digest_drift(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    repo = CareerOpsRepository(tmp_path / "data" / "careerops.db", tmp_path / "vault")
+    repo.initialize()
+    launcher = FakeLauncher()
+    launcher.next_record = _container_record()
+    ollama_calls: list[tuple[str, str, bytes | None]] = []
+
+    def local_model_response(self, method: str, path: str, body, deadline):
+        ollama_calls.append((method, path, body))
+        return _local_model_response(self, method, path, body, deadline)
+
+    monkeypatch.setattr(OllamaProvider, "_request_json", local_model_response)
+    api = create_app(
+        repo,
+        environment=_compose_environment(tmp_path),
+        managed_runtime_launcher=launcher,
+    )
+
+    with TestClient(api) as client:
+        managed = api.state.managed_ollama_runtime
+        launcher.events.clear()
+        ollama_calls.clear()
+        launcher.current = replace(
+            managed.launch_record,
+            container_image_reference=CONTAINER_IMAGE_E,
         )
 
         ollama = next(
@@ -892,6 +966,8 @@ def test_compose_launcher_reverifies_identity_and_uses_bounded_inspector_actions
         "handle_kind": "container",
         "process_id": None,
         "container_id": "a" * 64,
+        "container_image_reference": CONTAINER_IMAGE_C,
+        "container_image_id": CONTAINER_IMAGE_ID,
         "egress_policy": "container_internal_no_egress",
         "egress_enforced": True,
         "cloud_disabled": True,
@@ -928,6 +1004,34 @@ def test_compose_launcher_reverifies_identity_and_uses_bounded_inspector_actions
     ]
 
 
+def test_compose_launcher_rejects_exact_image_digest_drift_after_launch(
+    tmp_path: Path,
+):
+    payload = {
+        "endpoint": "http://ollama:11434",
+        "model": "qwen2.5:7b",
+        "runtime_instance_id": "runtime-compose-image-drift",
+        "runtime_handle": "container:" + ("a" * 64),
+        "handle_kind": "container",
+        "process_id": None,
+        "container_id": "a" * 64,
+        "container_image_reference": CONTAINER_IMAGE_C,
+        "container_image_id": CONTAINER_IMAGE_ID,
+        "egress_policy": "container_internal_no_egress",
+        "egress_enforced": True,
+        "cloud_disabled": True,
+        "isolation_rule_id": "network-" + ("b" * 32),
+    }
+
+    launcher = DockerComposeOllamaLauncher(
+        transport=lambda _method, _path, _body: dict(payload)
+    )
+    record = launcher.launch(model="qwen2.5:7b", runtime_root=tmp_path)
+    payload["container_image_reference"] = CONTAINER_IMAGE_E
+
+    assert launcher.verify(record) is False
+
+
 def _inspector_fixtures() -> dict[str, object]:
     container_id = "a" * 64
     network_id = "b" * 64
@@ -947,13 +1051,14 @@ def _inspector_fixtures() -> dict[str, object]:
                 "StartedAt": "2026-07-22T10:00:00Z",
             },
             "Config": {
-                "Image": "ollama/ollama@sha256:" + ("c" * 64),
+                "Image": CONTAINER_IMAGE_C,
                 "Env": [
                     "OLLAMA_NO_CLOUD=1",
                     "OLLAMA_HOST=0.0.0.0:11434",
                     "CAREEROPS_OLLAMA_MODEL=qwen2.5:7b",
                 ],
             },
+            "Image": CONTAINER_IMAGE_ID,
             "HostConfig": {"ReadonlyRootfs": True},
             "NetworkSettings": {
                 "Ports": {"11434/tcp": None},
@@ -1007,11 +1112,18 @@ def test_container_inspector_derives_concrete_identity_from_docker_state(
     runtime = inspector_module.inspect_ollama_runtime("qwen2.5:7b")
 
     assert runtime.container_id == "a" * 64
+    assert runtime.container_image_reference == CONTAINER_IMAGE_C
+    assert runtime.container_image_id == CONTAINER_IMAGE_ID
     assert runtime.runtime_handle == "container:" + ("a" * 64)
     assert re.fullmatch(r"runtime-[0-9a-f]{32}", runtime.runtime_instance_id)
     assert runtime.isolation_rule_id == "network-" + ("b" * 32)
     assert runtime.egress_enforced is True
     assert runtime.cloud_disabled is True
+
+    original_runtime_id = runtime.runtime_instance_id
+    values["ollama"]["Config"]["Image"] = CONTAINER_IMAGE_E
+    changed = inspector_module.inspect_ollama_runtime("qwen2.5:7b")
+    assert changed.runtime_instance_id != original_runtime_id
 
 
 @pytest.mark.parametrize("invalid_boundary", ["network", "cloud", "published_port"])

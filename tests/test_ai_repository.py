@@ -278,6 +278,8 @@ def provider_binding(
         "attestation_version": "",
         "runtime_instance_id": "",
         "runtime_handle": "",
+        "container_image_reference": "",
+        "container_image_id": "",
         "issuer_instance_id": "",
         "egress_policy": "",
         "cloud_disabled": False,
@@ -5405,6 +5407,67 @@ def test_v12_database_quarantines_unbound_configs_and_fences_running_tasks(
                 "UPDATE ai_provider_configs SET enabled = 1 WHERE id = ?",
                 (config["id"],),
             )
+
+
+def test_v15_upgrade_preserves_bindings_while_adding_container_image_identity(
+    tmp_path: Path,
+):
+    repo = make_repo(tmp_path)
+    application = create_application(repo)
+    provider = create_provider(repo)
+    task = create_task(repo, application.id, provider.id)
+    legacy_binding = provider_binding()
+    legacy_binding.pop("container_image_reference")
+    legacy_binding.pop("container_image_id")
+    legacy_json = json.dumps(legacy_binding, sort_keys=True, separators=(",", ":"))
+    legacy_sha256 = hashlib.sha256(legacy_json.encode("utf-8")).hexdigest()
+
+    with repo.connection() as connection:
+        connection.execute("DROP TRIGGER validate_provider_binding_sha_update")
+        connection.execute("DROP TRIGGER validate_ai_task_authority_immutable")
+        connection.execute(
+            """
+            UPDATE ai_provider_configs
+            SET availability_binding_json = ?, availability_binding_sha256 = ?
+            WHERE id = ?
+            """,
+            (legacy_json, legacy_sha256, provider.id),
+        )
+        connection.execute(
+            """
+            UPDATE ai_tasks
+            SET provider_binding_json = ?, provider_binding_sha256 = ?
+            WHERE id = ?
+            """,
+            (legacy_json, legacy_sha256, task.id),
+        )
+        connection.execute("PRAGMA user_version = 15")
+
+    repo.initialize()
+
+    expected_binding = {
+        **legacy_binding,
+        "container_image_reference": "",
+        "container_image_id": "",
+    }
+    expected_json = json.dumps(
+        expected_binding, sort_keys=True, separators=(",", ":")
+    )
+    expected_sha256 = hashlib.sha256(expected_json.encode("utf-8")).hexdigest()
+    with repo.connection() as connection:
+        upgraded_provider = connection.execute(
+            "SELECT * FROM ai_provider_configs WHERE id = ?", (provider.id,)
+        ).fetchone()
+        upgraded_task = connection.execute(
+            "SELECT * FROM ai_tasks WHERE id = ?", (task.id,)
+        ).fetchone()
+
+    assert LATEST_SCHEMA_VERSION == 16
+    assert upgraded_provider["enabled"] == 0
+    assert upgraded_provider["availability_binding_json"] == expected_json
+    assert upgraded_provider["availability_binding_sha256"] == expected_sha256
+    assert upgraded_task["provider_binding_json"] == expected_json
+    assert upgraded_task["provider_binding_sha256"] == expected_sha256
 
 
 def test_v12_upgrade_quarantines_duplicates_then_fails_closed_on_missing_artifact(

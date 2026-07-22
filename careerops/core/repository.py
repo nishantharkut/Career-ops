@@ -124,6 +124,8 @@ PROVIDER_BINDING_FIELDS = (
     "attestation_version",
     "runtime_instance_id",
     "runtime_handle",
+    "container_image_reference",
+    "container_image_id",
     "issuer_instance_id",
     "egress_policy",
     "cloud_disabled",

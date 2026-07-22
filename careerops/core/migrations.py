@@ -1,4 +1,5 @@
 from collections.abc import Callable
+import hashlib
 import json
 import os
 import sqlite3
@@ -603,6 +604,8 @@ def _add_provider_availability_bindings(connection: sqlite3.Connection) -> None:
         "attestation_version",
         "runtime_instance_id",
         "runtime_handle",
+        "container_image_reference",
+        "container_image_id",
         "issuer_instance_id",
         "egress_policy",
         "isolation_evidence_sha256",
@@ -645,7 +648,7 @@ def _add_provider_availability_bindings(connection: sqlite3.Connection) -> None:
                 OR (
                     SELECT COUNT(*)
                     FROM json_each(NEW.availability_binding_json)
-                ) != 24
+                ) != 26
                 OR length(NEW.availability_binding_json) > 32768
                 OR {field_conditions}
                 OR json_extract(
@@ -767,6 +770,113 @@ def _add_ai_artifact_storage_version(connection: sqlite3.Connection) -> None:
         )
 
 
+def _upgrade_provider_binding_image_fields(
+    raw_json: str, expected_sha256: str
+) -> tuple[str, str] | None:
+    text_fields = {
+        "provider_kind",
+        "model",
+        "privacy_mode",
+        "endpoint",
+        "identity_name",
+        "executable",
+        "executable_sha256",
+        "executable_version",
+        "codex_home",
+        "reasoning_effort",
+        "model_digest",
+        "model_metadata_sha256",
+        "show_metadata_sha256",
+        "attestation_version",
+        "runtime_instance_id",
+        "runtime_handle",
+        "issuer_instance_id",
+        "egress_policy",
+        "isolation_evidence_sha256",
+        "isolation_evidence_signature",
+    }
+    boolean_fields = {
+        "data_leaves_machine",
+        "is_ai",
+        "cloud_disabled",
+        "egress_enforced",
+    }
+    old_fields = text_fields | boolean_fields
+    image_fields = {"container_image_reference", "container_image_id"}
+    try:
+        binding = json.loads(raw_json)
+    except (TypeError, json.JSONDecodeError):
+        return None
+    if not isinstance(binding, dict) or set(binding) not in (
+        old_fields,
+        old_fields | image_fields,
+    ):
+        return None
+    if any(not isinstance(binding[field], str) for field in text_fields):
+        return None
+    if any(type(binding[field]) is not bool for field in boolean_fields):
+        return None
+    if any(
+        field in binding and not isinstance(binding[field], str)
+        for field in image_fields
+    ):
+        return None
+    canonical_before = json.dumps(binding, sort_keys=True, separators=(",", ":"))
+    if raw_json != canonical_before:
+        return None
+    if hashlib.sha256(raw_json.encode("utf-8")).hexdigest() != expected_sha256:
+        return None
+    binding.setdefault("container_image_reference", "")
+    binding.setdefault("container_image_id", "")
+    canonical_after = json.dumps(binding, sort_keys=True, separators=(",", ":"))
+    return (
+        canonical_after,
+        hashlib.sha256(canonical_after.encode("utf-8")).hexdigest(),
+    )
+
+
+def _add_provider_container_image_bindings(connection: sqlite3.Connection) -> None:
+    provider_bindings = connection.execute(
+        """
+        SELECT id, availability_binding_json, availability_binding_sha256
+        FROM ai_provider_configs
+        """
+    ).fetchall()
+    task_bindings = connection.execute(
+        """
+        SELECT id, provider_binding_json, provider_binding_sha256
+        FROM ai_tasks
+        """
+    ).fetchall()
+
+    # Rebuild the latest validation triggers and disable capabilities that
+    # predate image identity. Valid historical provenance is retained below.
+    _add_provider_availability_bindings(connection)
+    for provider_id, raw_json, expected_sha256 in provider_bindings:
+        upgraded = _upgrade_provider_binding_image_fields(raw_json, expected_sha256)
+        if upgraded is not None:
+            connection.execute(
+                """
+                UPDATE ai_provider_configs
+                SET availability_binding_json = ?, availability_binding_sha256 = ?
+                WHERE id = ?
+                """,
+                (*upgraded, provider_id),
+            )
+    for task_id, raw_json, expected_sha256 in task_bindings:
+        upgraded = _upgrade_provider_binding_image_fields(raw_json, expected_sha256)
+        if upgraded is not None:
+            connection.execute(
+                """
+                UPDATE ai_tasks
+                SET provider_binding_json = ?, provider_binding_sha256 = ?
+                WHERE id = ?
+                """,
+                (*upgraded, task_id),
+            )
+    _add_ai_prompt_and_artifact_authority(connection)
+
+
 MIGRATIONS: tuple[tuple[int, Migration], ...] = (
     (1, _add_application_role_type),
     (2, _add_application_submitted_at),
@@ -783,6 +893,7 @@ MIGRATIONS: tuple[tuple[int, Migration], ...] = (
     (13, _add_provider_availability_bindings),
     (14, _add_ai_prompt_and_artifact_authority),
     (15, _add_ai_artifact_storage_version),
+    (16, _add_provider_container_image_bindings),
 )
 
 LATEST_SCHEMA_VERSION = MIGRATIONS[-1][0]
