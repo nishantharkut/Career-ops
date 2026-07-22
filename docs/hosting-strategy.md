@@ -1,152 +1,134 @@
 # CareerOps Hosting Strategy
 
-## Decision
+Status: implemented v0 deployment boundary.
 
-CareerOps must support two deployment shapes:
+## Supported Shapes
 
-1. **Private local mode** for day-to-day resume processing.
-2. **Hostable self-contained mode** for a low/no-cost VM or container host.
+CareerOps runs in two supported shapes:
 
-The hosted v0 serves the React app and FastAPI API from the same origin, requires Basic Auth for private routes, uses SQLite plus file-vault persistent volumes, and exposes `/health` for uptime checks. It must not depend on hidden paid AI APIs, hosted resume analysis, or cloud-only storage.
+1. Local Windows development or one-origin serving with an optional managed Windows Ollama process or ChatGPT-authenticated Codex.
+2. Docker Compose on a user-controlled host with same-origin FastAPI and React, Basic Auth, persistent bind mounts, and managed Ollama.
 
-AI processing is a core product requirement, but the hosting boundary stays explicit:
+Both shapes keep submission manual and user-approved. AI runs only where the selected provider is installed, authenticated, reachable, and available.
 
-- Local/private mode should use a local OSS model runtime when available.
-- Codex worker mode should run on the user's machine or an explicitly trusted host.
-- Cloud AI mode is disabled by default and requires explicit provider configuration and per-task approval for private data.
-- The deterministic verifier remains available when AI is unavailable, but it is not the full intended product.
+## Same-Origin Application
 
-## Recommended Low/No-Cost Path
+`npm run build:web` creates `apps/web/dist`. FastAPI serves the built React files and API from one origin. Compose exposes port `8765`; `/health` is public, while Basic Auth protects the UI and private API routes.
 
-The recommended architecture is:
+Compose requires these private `.env` values:
 
-- `Dockerfile` builds the React app and FastAPI API into one container.
-- `compose.yaml` runs the app on port `8765`.
-- `./data` and `./vault` are mounted as persistent host volumes.
-- `restart: unless-stopped` restarts the service after process or VM restarts.
-- `/health` verifies the API can reach SQLite.
-- `CAREEROPS_AUTH_USERNAME` and `CAREEROPS_AUTH_PASSWORD` are required for public hosted use.
-- AI tasks run as resumable jobs so a provider failure or container restart does not corrupt application state.
-- Local OSS and Codex-worker AI modes can run outside the hosted container when the user wants private processing on their own machine.
+```text
+CAREEROPS_AUTH_USERNAME=<private username>
+CAREEROPS_AUTH_PASSWORD=<long random password>
+```
 
-This fits an Always Free VM or any cheap VPS. It is more reliable than a free serverless app with ephemeral storage because resume PDFs, LaTeX files, approval records, and SQLite data live on persistent volumes.
+`CAREEROPS_REQUIRE_AUTH=true` is set in Compose. Startup fails when credentials are absent. `CAREEROPS_ALLOWED_ORIGINS` is available for an explicitly separate frontend, but the shipped hosted shape does not need cross-origin access.
 
-Maximum uptime at low cost means:
+Basic Auth is not transport encryption. Put a TLS reverse proxy, a private HTTPS tunnel, or hosting-provider HTTPS in front of port `8765` before entering real profile, evidence, JD, or resume data over a network.
 
-- one small always-on service, not many fragile services;
-- persistent `data/` and `vault/` volumes as the source of truth;
-- health checks plus restart policy;
-- explicit backups before trusting the hosted copy;
-- no hidden dependency on a paid AI API for normal operation;
-- clear labels when the app is using local AI, Codex worker, cloud AI, or verifier-only fallback.
+## Persistent State
 
-## Options Compared
+The shipped Compose topology persists:
 
-### Option A: Free Static Host + Local Worker
+- `./data` at `/app/data` for SQLite
+- `./vault` at `/app/vault` for JD, resume, report, and AI artifacts
+- `./backups` at `/app/backups` for backup archives
+- `ollama_models` at `/root/.ollama` for local model data
 
-Use Cloudflare Pages or a similar static host for the UI and keep private processing local.
+`storage-init` runs once with only `CHOWN`, no network, and the three bind mounts. It sets the configured `CAREEROPS_UID` and `CAREEROPS_GID` ownership before the non-root API container starts.
 
-Pros:
+The API, Ollama runtime, runtime inspector, and Docker socket proxy use `restart: unless-stopped` and health checks. The API health check reaches local `/health`; Ollama health checks both `ollama list` and the configured model; the inspector verifies Docker access through the proxy.
 
-- Lowest cost.
-- Static UI has high availability.
-- Private resume files stay off third-party servers.
+Do not use ephemeral container files as the source of truth. Do not remove the named model volume unless a full model download is intended.
 
-Cons:
+## Managed Ollama Boundary
 
-- Browser-to-localhost access from a hosted HTTPS page can be fragile.
-- The local worker still has to run when processing is needed.
-- AI tasks still require a local model runtime, Codex worker, or explicitly approved cloud provider.
-- Not enough for true always-available use.
+### Bootstrap
 
-Use this later only if we build a robust local bridge and browser security checks.
+`ollama-bootstrap` uses the same digest-pinned Ollama image as the runtime. It is the only Ollama service attached to `model_bootstrap_egress`. On startup it:
 
-### Option B: Self-Contained Docker App On Free/Cheap VM
+1. Starts loopback-only Ollama with `OLLAMA_NO_CLOUD=1`.
+2. Waits for the local service.
+3. Checks the exact `CAREEROPS_OLLAMA_MODEL`.
+4. Pulls it only when absent.
+5. Verifies the model and exits.
 
-Run the app container on a VM with persistent mounted volumes.
+The first pull can be large and slow. The persistent volume makes subsequent startup reuse the downloaded model. The bootstrap container has egress only for this installation step; the runtime container is not attached to that network.
 
-Pros:
+### Runtime And Attestation
 
-- One URL for UI and API.
-- No CORS or browser-localhost problem.
-- Local open-source renderer and analyzer still work inside the container.
-- Restart policy and health checks support uptime.
-- Can be no-cost on an Always Free VM if capacity is available.
+The runtime `ollama` service:
 
-Cons:
+- sets `OLLAMA_NO_CLOUD=1`
+- publishes no host port
+- has a read-only root filesystem and dropped capabilities
+- attaches only to the internal `ollama_private` bridge
+- mounts the persistent model volume
+- starts only after bootstrap succeeds
 
-- Needs VM setup and basic security hardening.
-- Free VM capacity and idle policies are provider-dependent.
-- Public access must use auth and HTTPS before real personal data is entered.
+The Docker socket is not mounted into the API or inspector. A digest-pinned socket proxy exposes GET-only container, network, and version inspection. All mutation endpoints are disabled. `runtime-inspector` uses that proxy to attest exactly one Compose Ollama container, its full container ID, start identity, image reference and image ID, cloud-disabled environment, lack of host ports, single internal network, and private service address.
 
-This is the v0 hosting target and the recommended first production-like deployment path.
+The API adopts only that attested record. Its in-process `OllamaRuntimeAuthority` signs a capability bound to the canonical endpoint, exact model, runtime instance, container handle, image identities, and no-egress policy. The signing key is generated in the API process and is not stored in Compose, source, SQLite, or the inspector.
 
-### Option C: Cloud Run Or Similar Serverless Container
+Before availability and before every request, the provider verifies the signature and asks the inspector to reattest the exact runtime. It verifies local `/api/tags` and `/api/show` metadata, rejects remote/cloud metadata, sends a bounded schema request, and checks model metadata again after generation. Container, network, image, model, endpoint, capability, or metadata drift fails closed.
 
-Run the container on a scale-to-zero service.
+Only this verified path reports `local_private` and `data_leaves_machine=false`. A generic localhost daemon, external URL, environment assertion, or stale capability is unavailable and is never relabelled as private.
 
-Pros:
+## Provider Reachability
 
-- Managed uptime and scaling.
-- Low cost for light usage.
-- No VM maintenance.
+Managed Ollama is included in the Compose topology. It requires no paid API and sends task data only to the verified internal runtime.
 
-Cons:
+Codex uses a ChatGPT-authenticated CLI and is always `cloud_external`. The standard Linux image does not install Codex, persist a Codex home, or authenticate an account. Setting `CAREEROPS_CODEX_ENABLED=true` alone normally discovers no Codex provider in hosted Linux. A custom deployment must explicitly install the native CLI, provide the supported identity descriptor, authenticate the intended `CODEX_HOME`, and persist that home outside the read-only image. Each task still requires the UI acknowledgement and sends bounded task data to OpenAI.
 
-- A billing account can be required for free-tier usage.
-- Container filesystem is not a durable application database.
-- Durable storage needs an external database or object store, which moves private resume data into cloud systems.
-- LaTeX containers are large and can have cold starts.
+The deterministic verifier is always local, available, and not AI. It keeps safety checks usable when an AI provider is unavailable, but it does not claim semantic model review.
 
-Use this only after explicit approval for cloud storage and a production storage adapter.
+There is no OpenAI API adapter, bundled API key, paid scoring service, remote resume analyzer, or hidden cloud AI fallback in v0.
 
-### Option D: Supabase Or Hosted Database First
+## Start And Observe
 
-Use a hosted database and storage service as the primary backend.
+From the project root:
 
-Pros:
+```powershell
+Copy-Item -LiteralPath .env.example -Destination .env
+docker compose config
+docker compose up -d --build
+docker compose ps
+docker compose logs careerops ollama-bootstrap ollama runtime-inspector docker-socket-proxy
+```
 
-- Fast to build shared access and sync.
-- Free tier is useful for prototypes.
+Open `http://<host>:8765` only through the configured HTTPS boundary for real data. A healthy deployment has a `200` response from `/health`, a `401` response from private routes without Basic Auth, and a successful authenticated UI load.
 
-Cons:
+## Hosted Backup
 
-- Free projects can pause after inactivity.
-- Private resume artifacts would move to cloud storage.
-- Not compatible with the current local-private-processing requirement without client-side encryption and a local worker.
-- Cloud AI calls would also need explicit task-level approval and provenance records.
+The checksummed backup includes SQLite and the vault. It does not include the model volume because bootstrap can repopulate that volume.
 
-Not the v0 target.
+Use a quiet maintenance window. A conservative host sequence is:
 
-## Current Implementation Requirements
+```powershell
+Set-Location -LiteralPath "C:\N Drive\Internships + Placements\CareerOps"
+docker compose stop careerops
+.\scripts\backup.ps1 `
+  -BackupRoot "C:\CareerOpsBackups" `
+  -DataPath "C:\N Drive\Internships + Placements\CareerOps\data" `
+  -VaultPath "C:\N Drive\Internships + Placements\CareerOps\vault"
+docker compose start careerops
+```
 
-The codebase supports:
+Copy the published ZIP and its printed archive SHA-256 to separate storage. Do not copy the live SQLite files manually. If any vault or database-bound artifact changes during snapshotting, the backup command fails instead of publishing a mixed archive.
 
-- Same-origin production serving from `apps/web/dist`.
-- `VITE_CAREEROPS_API` override for separate API hosting.
-- Localhost API default only during Vite development.
-- Configurable `CAREEROPS_ALLOWED_ORIGINS`.
-- Optional Basic Auth via `CAREEROPS_AUTH_USERNAME` and `CAREEROPS_AUTH_PASSWORD`.
-- Fail-fast auth when `CAREEROPS_REQUIRE_AUTH=true` but credentials are missing.
-- SQLite WAL mode, `synchronous=FULL`, and busy timeout.
-- Container health checks.
+Restore to separate empty paths, verify the restored application, then switch deployment mounts in a controlled maintenance window. The restore command never overwrites the active `data` or `vault` directories.
 
-## Security Rules
+## Failure Handling
 
-- Do not expose the API publicly without auth.
-- Do not put real resume data in a cloud database or object store without explicit user approval.
-- Do not use a free database with inactivity pauses as the only production source of truth.
-- Do not rely on ephemeral container storage for applications, resumes, reports, or approvals.
-- Add HTTPS through the host or reverse proxy before entering private data on a public URL.
+- **Bootstrap still running:** Follow `docker compose logs -f ollama-bootstrap`; a first model pull can take time and disk space.
+- **Bootstrap failed:** Check network/DNS and free disk space. Correct `CAREEROPS_OLLAMA_MODEL`, then rerun `docker compose up -d`.
+- **Managed runtime unavailable:** Inspect `careerops`, `ollama`, `runtime-inspector`, and `docker-socket-proxy` logs. Any attestation mismatch intentionally removes the provider.
+- **Runtime drift:** Run `docker compose up -d --build --force-recreate`. Do not add `-v` when the model volume should survive.
+- **Auth startup failure:** Set both auth values in the private `.env`; do not commit it.
+- **Bind-mount permission failure:** Inspect `storage-init`, confirm host directories are regular paths, and set host-compatible `CAREEROPS_UID` and `CAREEROPS_GID`.
+- **Health failure:** Check SQLite path permissions, bind-mount availability, model health, and dependency container state.
+- **Codex unavailable in Linux:** This is expected for the shipped image. Use managed Ollama or build and authenticate an explicit Codex-enabled image; never assume the host's Codex login exists inside the container.
 
-## Sources Checked
+## Deferred Boundaries
 
-- Checked again on 2026-07-21 because free-tier limits and pricing can change.
-- Cloudflare Pages free limits: https://developers.cloudflare.com/pages/platform/limits/
-- Cloudflare Workers free limits: https://developers.cloudflare.com/workers/platform/limits/
-- Cloudflare Pages pricing page: https://pages.cloudflare.com/
-- Google Cloud Run pricing/free tier: https://cloud.google.com/run/pricing
-- Google Cloud free tier billing requirement: https://docs.cloud.google.com/free/docs/free-cloud-features
-- Supabase pricing/free-tier pause behavior: https://supabase.com/pricing
-- Supabase free project pausing: https://supabase.com/docs/guides/platform/free-project-pausing
-- Oracle Always Free resources and idle reclaim policy: https://docs.oracle.com/en-us/iaas/Content/FreeTier/freetier_topic-Always_Free_Resources.htm
+Cloud job watching, public job discovery, email ingestion, automatic finding application, browser form filling, and automatic submission are not implemented. Any later public watcher must remain separate from private profile, resume, evidence, report, credentials, and application notes.

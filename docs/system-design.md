@@ -1,582 +1,177 @@
 # CareerOps System Design
 
-Status: approved direction with AI-first correction pending review.
+Status: approved and implemented Application Desk v0.
 
-Source of truth: `docs/context-reconstruction.md`, `docs/prd.md`, and `docs/superpowers/specs/2026-07-21-ai-first-careerops-design.md`.
+## Runtime Shape
 
-## 1. Architecture Decision
+CareerOps is a Python 3.14 FastAPI application with a React 19 frontend, SQLite database, and local file vault. Pydantic validates API and provider contracts. The same FastAPI process serves the built frontend in one-origin mode and owns the background AI task runner.
 
-CareerOps should be a local AI-assisted web application with a Python backend, a SQLite database, a local file vault, provider adapters, deterministic verification, and a React UI.
+The normal local layout is:
 
-Chosen stack:
+```text
+Browser
+  -> React workbench
+  -> FastAPI API
+       -> SQLite
+       -> file vault
+       -> LaTeX/PDF tools
+       -> selected provider adapter
+       -> deterministic verifier
+```
 
-- Backend: Python with FastAPI.
-- Data validation: Pydantic models.
-- Database: SQLite.
-- Database migrations: Alembic or a simple migration runner for v0.
-- Frontend: React with TypeScript and Vite.
-- UI style: token-based CSS, minimal operational design, Hallmark-informed audit rules.
-- AI orchestration: explicit AI task records with provider adapters and structured output schemas.
-- Primary AI target: local OSS runtime when installed.
-- Deep-review AI target: optional local Codex worker.
-- Cloud AI target: optional OpenAI API provider, disabled by default.
-- PDF and resume processing: local Python tools.
-- LaTeX rendering: local compiler adapter.
-- UI testing: Playwright.
-- Backend testing: pytest.
+Compose keeps the same application shape and adds storage initialization, managed Ollama bootstrap/runtime, a runtime inspector, and a GET-only Docker socket proxy.
 
-This stack is chosen because it is local-first, AI-capable, testable, simple to run, and can also be hosted as a low-cost self-contained container when auth, HTTPS, and persistent volumes are configured.
+## Durable Data
 
-## 2. High-Level Components
+SQLite stores structured state; the vault stores private file bytes. The repository initializes and migrates the database, creates owned vault directories, reconciles AI artifact storage, and recovers expired task claims.
 
-### Local API
+### Core Records
 
-Owns:
+- `Application` owns company, role, location, source, current JD snapshot, selected resume, current report, approval, submission state, notes, and timestamps.
+- `JobDescriptionSnapshot` points to the raw vaulted JD and checksum and holds parser/requirement groups.
+- `ResumeVersion` points to vaulted `.tex` and optional PDF bytes, their checksums, parent ID, render/parse state, and page count.
+- `EvidenceItem` and `ProfileFact` hold verification and privacy states.
+- `Report` binds application, JD snapshot, and resume IDs to fit/risk JSON and blocker/warning counts.
+- `Approval` binds application, resume, report, and PDF SHA-256.
+- `ApplicationVersion` and `AuditEvent` preserve immutable workflow and before/after history.
 
-- application records
-- resume records
-- evidence records
-- reports
-- approval state
-- file indexing
-- audit logs
-- AI task orchestration
-- provider configuration
-- deterministic verification of AI output
+### AI Records
 
-The API must fail closed. If validation, rendering, parsing, or report generation fails, the application cannot be approved.
+- `AiProviderConfig` stores provider kind, display/identity name, model, privacy mode, endpoint, an availability/provenance binding, and its checksum.
+- `AiTask` stores the application, task type, provider config, prompt ID/checksum, input IDs, privacy and provider binding snapshots, claim lease, invocation fence, status, and bounded error category.
+- `AiArtifact` stores artifact type, vault path, checksum, schema version, and claim ownership.
+- `AiFinding` stores claim/recommendation payload, severity, verifier state, and explicit user decision.
 
-### AI Task Orchestrator
+The API does not return private AI artifact paths. Repository reads revalidate path containment, regular-file/single-link identity, size, and checksum.
 
-The orchestrator owns model-facing work.
+### Vault Layout
 
-It must:
+Private runtime directories include:
 
-- build bounded context packets from selected artifacts
-- choose a configured provider
-- call the provider adapter
-- validate structured output
-- store output as versioned artifacts
-- run deterministic verifiers
-- expose status to the UI
+```text
+data/careerops.db
+vault/applications/
+vault/resumes/<resume id>/
+vault/evidence/
+vault/reports/
+vault/ai-tasks/<task id>/<attempt>/
+vault/ai-artifacts/<task id>/<artifact id>/
+vault/application-versions/
+backups/
+```
 
-AI tasks are asynchronous and resumable. Provider failure must leave application, resume, and approval state unchanged.
+Provider attempt files are separate from published AI artifacts. Published artifacts use repository-owned paths and atomic copy/publication checks.
 
-### Provider Adapter Layer
+## Application Flow
 
-Provider adapters normalize different AI runtimes into one contract.
+### Create And Correct JD
 
-Required provider kinds:
+The API writes the pasted JD to the vault and stores its checksum before returning the application. Deterministic parsing populates initial requirement groups. `analyze_jd` can add a raw AI group and uncertainty group. User corrections are stored separately and invalidate a current report based on older requirements.
 
-- `local_oss`: local model runtime, with Ollama as the recommended first target and LM Studio or another OpenAI-compatible runtime later.
-- `codex_worker`: local Codex worker for deep repository, evidence, and session review.
-- `openai_api`: optional cloud AI provider, disabled by default.
-- `deterministic`: rule-based fallback and verifier.
+### Import And Render Resume
 
-Provider output must include:
+Upload copies a single regular `.tex` file into a new resume version and selects it for the application. Rendering runs `latexmk` when available, otherwise `pdflatex`, inside a controlled output directory. The adapter stores stdout/stderr in `render.log`, requires a PDF on success, computes its SHA-256, parses its text, and records page count and status.
 
-- provider kind
-- model or runtime name
-- privacy mode
-- prompt version
-- structured JSON
-- raw output artifact path when safe
-- error summary when failed
+Risk analysis compares the current source bytes with the recorded source checksum. A mismatch is `PDF is stale` and blocks approval. Recovery restores the recorded source bytes or imports the corrected source as a new resume version before render and review are repeated.
+
+### Run Task
+
+1. The API validates application/provider/task compatibility and persists a `pending` task with provider and prompt bindings.
+2. The background runner submits the task. Repository compare-and-set changes one pending row to `running` with a claim token and lease.
+3. A heartbeat renews the claim during provider execution and artifact/finding finalization.
+4. The orchestrator snapshots current JD/resume identity and builds a bounded `ContextPacket` from task-relevant records.
+5. Prompt, context, and the exact checked-in JSON schema are written atomically to a task attempt directory and sealed into `ProviderRequest` snapshots.
+6. The selected provider reports current availability. It must match the task's persisted provider binding before invocation.
+7. The invocation fence is written before the external provider call.
+8. Raw provider output is bounded, parsed as strict JSON, and validated against the selected task model.
+9. Result metadata and invocation provenance must exactly match current availability and the persisted provider binding.
+10. The deterministic verifier produces safe or blocked findings.
+11. Context, raw output, validated output, and optional draft text are published as checksummed artifacts.
+12. One repository transaction finalizes status, findings, artifacts, report/JD side effects, audit events, and application history only if the claim and current JD/resume IDs still match.
+
+Terminal task states are `completed`, `blocked`, and `failed`. Public error summaries are limited to categories such as `provider_unavailable`, `provider_timeout`, `provider_error`, `invalid_output`, and `verification_failed`.
+
+### Decide And Draft
+
+Verified findings can move from `pending` to `accepted` or `rejected`; blocked findings cannot be accepted. Decisions are durable.
+
+Draft creation takes a completed `suggest_resume_edits` task and accepted verified finding IDs. It revalidates task/resume ownership, parent source checksum, evidence, rejected/private material, and exact single occurrence of each source span. All replacements are applied in memory and atomically published as a new child resume. The parent is not modified. Selecting the child clears current report/approval state and requires render/review again.
+
+### Approve, Export, Submit
+
+Approval revalidates report provenance, zero blockers, selected resume ID, current JD snapshot ID, PDF path and checksum, and current packet state. It records application ID, resume ID, report ID, and PDF SHA-256.
+
+JD, PDF, report, and approval exports revalidate that each artifact is current. Manual submission checks the complete approval/report/resume/JD relationship and current PDF bytes before recording `submitted_manual`.
+
+## Provider Boundaries
+
+### Codex
+
+Codex discovery is enabled only by `CAREEROPS_CODEX_ENABLED`. The ordered command list defaults to `codex2,codex`.
+
+For `codex2`, CareerOps accepts only the approved `.cmd` descriptor that sets `%USERPROFILE%\codex-account2\.codex` and delegates to `codex`. For both identities it resolves a native fixed-drive `codex.exe`, rejects links/multiple links/unsafe size, streams its SHA-256 under a deadline, validates semver output, and requires exact ChatGPT login status.
+
+Invocation uses the native executable directly with:
+
+- `exec`
+- ignored user config and rules plus strict config
+- explicit model and reasoning effort
+- no inherited shell environment
+- read-only sandbox
+- isolated `--cd` task attempt
+- no repository requirement
+- ephemeral session
+- exact output schema and output file
+
+Arguments are a list with `shell=False`; task content is bounded stdin. Stdout/stderr are not used as output. The output file is read with path, link, size, and identity checks. The executable hash is checked before and after execution. Provider metadata records identity, endpoint, executable/hash/version, Codex home, model, effort, command, and raw output checksum.
+
+`codex2` and `codex` are separate records and never fallback within a task. Both are `cloud_external`; the UI requires a per-run transfer acknowledgement.
+
+### Managed Ollama
+
+An `OllamaProvider` without verified isolation evidence returns unavailable. Its unverified status does not claim private processing.
+
+In Compose, a temporary egress bootstrap installs the configured model into a persistent volume. Runtime Ollama is cloud-disabled, unexposed, and attached only to an internal bridge. The inspector obtains exact container and network state through a mutation-disabled Docker socket proxy. It returns a concrete container ID/handle, immutable image reference and image ID, start/network-derived runtime ID, model, endpoint, and no-egress policy.
+
+In Windows mode, the PowerShell launcher copies the configured executable to an instance path, creates a journal, establishes a firewall block before process launch, starts `ollama.exe serve` with a reduced environment, and verifies executable hash/size, process start time, PID, loopback listener ownership, rule contents, and exact model. The runtime record uses a concrete `pid:<id>` handle.
+
+`ManagedOllamaRuntimeFactory` validates either record, requires launcher reverification, generates an API-process authority, signs `ollama_isolation_v3` evidence, binds a live runtime verifier, probes exact local model metadata, and returns the provider plus capability. The capability includes endpoint, model, runtime instance/handle, optional container image identities, cloud-disabled and egress flags, issuer, and integrity signature.
+
+Before availability and every run, the provider checks the authority signature and live verifier. It reads proxy-free `/api/tags` and `/api/show`, requires one exact local model name/digest/size, hashes both metadata responses, rejects remote/cloud fields, and calls `/api/chat` with `stream:false` and the JSON schema. It repeats model metadata checks after output validation. Any drift is unavailable or failed; only the verified path returns `local_private`.
 
 ### Deterministic Verifier
 
-The verifier is authoritative over AI confidence.
+The deterministic provider implements the same typed task interface but has `is_ai=false`, `data_leaves_machine=false`, and `verifier_only`. It provides structured safety fallback output and human-review decisions without semantic model execution.
 
-It checks:
+## Concurrency And Recovery
 
-- output schema
-- unsupported claims
-- evidence mismatch
-- stale PDF
-- unsafe title phrasing
-- NDA-sensitive wording
-- secret-like text
-- prompt-injection artifacts
-- approval bypass attempts
+Task claims use compare-and-set row updates, claim tokens, finite leases, and heartbeats. Artifact rows carry claim ownership. Finalization verifies the active claim, current provider binding, current application state, and expected JD/resume IDs in one transaction.
 
-If the verifier blocks an AI suggestion, the suggestion can be shown as blocked but cannot be accepted into an approved packet.
+Expired claims return to pending. Invocation fencing prevents automatic provider replay after an external call may have started. A stale worker cannot publish business state after losing its claim. Runner polling recovers pending work after restart.
 
-### Local Database
+File operations use exclusive creation, stable file identity checks, checksums, bounded reads, fsync, and atomic rename where required. The implementation rejects links, reparse points, hard links, path swaps, and changed identities at trust boundaries.
 
-SQLite stores structured records. It should not store large PDFs or LaTeX files directly. It stores paths, checksums, metadata, and relationships.
+## Hosted Topology
 
-### File Vault
+The Compose services are:
 
-The vault stores artifacts:
+- `storage-init`: no-network bind-mount ownership setup
+- `ollama-bootstrap`: one-shot model check/download on temporary egress
+- `ollama`: persistent cloud-disabled runtime on internal no-egress network
+- `docker-socket-proxy`: digest-pinned GET-only Docker API boundary
+- `runtime-inspector`: exact runtime/network/image attestation
+- `careerops`: non-root, read-only, same-origin FastAPI/React application
 
-- JD snapshots
-- LaTeX sources
-- rendered PDFs
-- reports
-- evidence files
-- exported packets
+`careerops` persists `/app/data`, `/app/vault`, and `/app/backups`; `ollama` persists its named model volume. Basic Auth protects private routes and `/health` remains public. HTTPS is supplied outside the container boundary.
 
-Files are addressed by stable IDs and checksums.
+The standard image does not install or authenticate Codex. Managed Ollama and the non-AI verifier have no paid cloud dependency. A custom hosted Codex installation remains external processing and requires the same per-task acknowledgement.
 
-### Resume Compiler Adapter
+## Backup And Restore
 
-The compiler adapter hides local TeX differences.
+Backup uses SQLite's online backup API for a consistent database file and a staged stable snapshot of vault files/directories. It validates database references to vaulted artifacts, rechecks source and staged identities/checksums, builds a canonical manifest, writes a bounded ZIP to an exclusive temporary file, computes archive SHA-256, and atomically publishes it. Concurrent mismatch aborts publication.
 
-It must:
+Restore binds one open archive descriptor, validates archive topology and limits, verifies the canonical manifest and every file, extracts to private staging directories, runs SQLite integrity checks, and snapshots staged topology. It then publishes data and vault through a durable two-parent transaction journal. Recovery verifies archive/manifest identity and target topology before committing or rolling back. Existing non-empty, changed, linked, or ambiguous targets are never replaced.
 
-- discover available local LaTeX tools
-- compile without remote services
-- capture stdout and stderr
-- produce a PDF checksum
-- report page count
-- detect missing PDF output
-- mark render failures clearly
+## Deferred Design
 
-It should support common local engines through adapters, such as `latexmk`, `pdflatex`, `xelatex`, or an existing local setup. The implementation should discover the available tool instead of assuming one.
-
-### Resume Parser
-
-The parser extracts text from rendered PDFs and checks whether the PDF is usable by ATS-style systems.
-
-It must check:
-
-- text extraction works
-- page count is one unless explicitly allowed
-- expected sections appear
-- dates and role titles are extractable
-- bullet text appears in the PDF text layer
-
-### JD Parser
-
-The parser extracts structured requirements from the job description.
-
-It should be hybrid:
-
-- AI extracts semantic requirements, hidden expectations, role family, and likely ATS terms.
-- Deterministic parsing extracts headings, required skills, preferred skills, responsibilities, eligibility constraints, location, duration, work mode, and year constraints.
-- The final result preserves uncertainty and records the provider.
-
-The deterministic parser remains a fallback and verifier. It is not the full product.
-
-### Fit Analyzer
-
-The fit analyzer compares JD requirements to resume and profile evidence.
-
-It should produce:
-
-- exact keyword matches
-- missing exact keywords
-- semantic matches
-- weak matches
-- knockout risks
-- profile evidence gaps
-- resume quality issues
-
-AI should handle semantic reasoning and edit suggestions. Deterministic checks should verify parse health, keyword coverage, evidence status, and blockers. A score without reasons is not acceptable.
-
-### Risk Gate Engine
-
-The risk gate engine blocks approval if a known failure mode appears.
-
-Required gate families:
-
-- evidence gates
-- privacy gates
-- resume-render gates
-- chronology gates
-- title gates
-- NDA wording gates
-- secret gates
-- approval gates
-
-### UI
-
-The UI is a workbench. In development it talks to the local API. In hosted production it is served by the FastAPI app and uses same-origin API requests.
-
-Primary screens:
-
-- Application Desk
-- Application Detail
-- Resume Versions
-- Evidence Vault
-- Report Review
-- Settings
-- AI Tasks
-
-No login is needed for local-only v0 because the app is single-user on the user's machine. Hosted v0 must enable Basic Auth before private data is entered.
-
-## 3. Data Model
-
-### Application
-
-Fields:
-
-- `id`
-- `company`
-- `role_title`
-- `role_family`
-- `location`
-- `source_url`
-- `source_kind`
-- `jd_snapshot_id`
-- `status`
-- `selected_resume_version_id`
-- `latest_report_id`
-- `approval_id`
-- `submission_state`
-- `deadline`
-- `created_at`
-- `updated_at`
-
-### JobDescriptionSnapshot
-
-Fields:
-
-- `id`
-- `application_id`
-- `source_url`
-- `raw_text_path`
-- `raw_text_sha256`
-- `captured_at`
-- `extracted_requirements_json`
-- `parser_version`
-
-### ResumeVersion
-
-Fields:
-
-- `id`
-- `name`
-- `role_family`
-- `tex_path`
-- `tex_sha256`
-- `pdf_path`
-- `pdf_sha256`
-- `parent_resume_version_id`
-- `render_status`
-- `parse_status`
-- `page_count`
-- `created_at`
-- `updated_at`
-
-### EvidenceItem
-
-Fields:
-
-- `id`
-- `claim_text`
-- `evidence_type`
-- `source_path`
-- `source_url`
-- `source_sha256`
-- `verification_state`
-- `privacy_level`
-- `notes`
-- `created_at`
-- `updated_at`
-
-Verification states:
-
-- `verified`
-- `user_stated`
-- `needs_verification`
-- `rejected`
-- `private_do_not_publish`
-
-### Claim
-
-Fields:
-
-- `id`
-- `claim_text`
-- `claim_kind`
-- `project_or_experience`
-- `evidence_item_id`
-- `verification_state`
-- `public_safe`
-- `created_at`
-- `updated_at`
-
-### Report
-
-Fields:
-
-- `id`
-- `application_id`
-- `resume_version_id`
-- `jd_snapshot_id`
-- `fit_summary`
-- `score_json`
-- `risk_json`
-- `recommendations_json`
-- `blocking_issue_count`
-- `warning_count`
-- `created_at`
-
-### AiProviderConfig
-
-Fields:
-
-- `id`
-- `provider_kind`
-- `display_name`
-- `enabled`
-- `privacy_mode`
-- `endpoint`
-- `model`
-- `created_at`
-- `updated_at`
-
-Secrets must not be stored in plaintext in SQLite.
-
-### AiTask
-
-Fields:
-
-- `id`
-- `application_id`
-- `task_type`
-- `provider_config_id`
-- `input_artifact_ids`
-- `output_artifact_ids`
-- `status`
-- `privacy_mode`
-- `started_at`
-- `completed_at`
-- `error_summary`
-
-### AiArtifact
-
-Fields:
-
-- `id`
-- `task_id`
-- `artifact_type`
-- `path`
-- `sha256`
-- `schema_version`
-- `created_at`
-
-### AiFinding
-
-Fields:
-
-- `id`
-- `task_id`
-- `finding_type`
-- `severity`
-- `claim_text`
-- `evidence_item_id`
-- `recommendation`
-- `verifier_state`
-
-### PromptTemplate
-
-Fields:
-
-- `id`
-- `name`
-- `task_type`
-- `version`
-- `template_path`
-- `sha256`
-- `created_at`
-
-### Approval
-
-Fields:
-
-- `id`
-- `application_id`
-- `resume_version_id`
-- `report_id`
-- `pdf_sha256`
-- `approved_at`
-- `approval_note`
-
-Approval is invalid if the selected resume, JD snapshot, PDF checksum, or report changes.
-
-### AuditEvent
-
-Fields:
-
-- `id`
-- `event_type`
-- `entity_type`
-- `entity_id`
-- `before_json`
-- `after_json`
-- `created_at`
-
-Audit logs must redact secret-like values.
-
-## 4. File Layout
-
-Recommended layout after implementation:
-
-```text
-CareerOps/
-  docs/
-  apps/
-    api/
-    web/
-  careerops/
-    core/
-    parsers/
-    analyzers/
-    ai/
-    renderers/
-    gates/
-  tests/
-  data/
-    careerops.db
-  vault/
-    applications/
-    resumes/
-    evidence/
-    reports/
-    ai-tasks/
-    exports/
-```
-
-`data/` and `vault/` must be treated as private local state.
-
-For hosted v0, `data/` and `vault/` must be mounted as persistent volumes. Ephemeral container storage is not acceptable for application history, resume versions, rendered PDFs, reports, or approvals.
-
-## 5. Data Flow
-
-### Create Application
-
-1. User enters company, role, source URL, and JD text.
-2. API writes a JD snapshot.
-3. AI task extracts semantic requirements when a provider is enabled.
-4. Deterministic parser extracts fallback requirements and verifier facts.
-5. Application status becomes `draft`.
-
-### Attach Resume
-
-1. User selects an existing resume version or creates a derived version.
-2. API records the resume relationship.
-3. Resume compiler renders PDF.
-4. Parser extracts text from PDF.
-5. PDF checksum and parse status are saved.
-
-### Analyze Application
-
-1. AI task compares JD requirements with resume text, profile facts, and evidence.
-2. Fit analyzer computes deterministic exact-match, parse-health, and evidence checks.
-3. Risk gate engine evaluates blocking issues.
-4. Report and AI artifacts are saved.
-5. Application status becomes `ready_for_review` if no blockers exist.
-6. Application status becomes `needs_evidence` or `needs_resume_update` if blockers exist.
-
-### Run AI Task
-
-1. User selects a structured task such as `Analyze JD`, `Suggest resume edits`, or `Codex deep review`.
-2. API builds a bounded context packet from approved artifacts only.
-3. Provider adapter runs the task.
-4. Output is validated against schema.
-5. Verifier evaluates safety and evidence.
-6. UI shows accepted, warning, and blocked suggestions separately.
-7. Accepting a suggestion creates a new draft artifact version.
-
-### Approve
-
-1. User reviews PDF, fit report, and risk report.
-2. User clicks approval action.
-3. API verifies selected resume, PDF checksum, JD snapshot, and report are current.
-4. Approval record is written.
-5. Application status becomes `approved`.
-
-### Manual Submission
-
-1. User submits outside the app.
-2. User records manual submission.
-3. App stores timestamp and notes.
-
-The app never auto-submits in v0.
-
-## 6. Scoring Design
-
-The score is local, AI-assisted, and explainable. It is not a Resume Worded score and not an employer ATS score.
-
-Suggested score parts:
-
-- requirement coverage
-- exact keyword coverage
-- semantic skill coverage
-- knockout risk
-- evidence confidence
-- resume parse health
-- resume quality checks
-- AI semantic match confidence
-- AI edit usefulness after verification
-
-The UI must show the parts before the total. If a total score is shown, it should be treated as a summary, not a truth.
-
-## 7. Error Handling
-
-Errors must be factual and actionable.
-
-Examples:
-
-- `PDF render failed. Open the render log and fix the LaTeX error.`
-- `PDF is stale. Render again before approval.`
-- `Claim has no evidence. Link evidence or remove the claim.`
-- `JD parser could not find eligibility rules. Review manually.`
-
-No generic `Something went wrong` messages.
-
-## 8. Security And Privacy
-
-The app must:
-
-- run locally by default
-- support same-origin hosted serving with auth
-- not send private data to cloud APIs unless cloud AI mode is explicitly configured and approved
-- redact secret-like values in logs
-- keep cloud watcher separate from private processing
-- keep approval and submission separate
-- avoid storing raw credentials
-- treat model prompts and outputs as private artifacts
-- prevent prompt injection from JD, resume, or session text
-
-Public hosting must not expose the API without auth and HTTPS. Free hosted databases or object stores must not become the source of truth unless the user explicitly approves storing private resume artifacts in cloud services.
-
-The historical session contains secret-handling failures. This system must treat secret leakage as a blocker.
-
-## 9. Testing Architecture
-
-Required test layers:
-
-- model tests
-- migration tests
-- parser tests
-- analyzer tests
-- gate tests
-- renderer tests
-- API integration tests
-- UI Playwright tests
-- visual and responsive checks
-- artifact integrity checks
-- AI provider adapter tests
-- AI task schema tests
-- prompt-injection tests
-- mock-provider CI tests
-- Codex worker command-construction tests
-
-The known historical failure modes must become test fixtures.
-
-## 10. Future Architecture
-
-Later phases may add:
-
-- repository inspection service
-- local embeddings and vector search
-- richer resume tailoring
-- cloud watcher for public job discovery
-- email alert ingestion
-- browser-assisted manual workflows
-- optional cloud AI provider
-
-These must not weaken the local privacy boundary.
+Cloud job watching, discovery, email ingestion, repository-wide autonomous review, automatic finding application, browser automation, and automatic submission are outside v0. Any later public watcher must not receive profile, resume, evidence, report, credentials, or private notes.

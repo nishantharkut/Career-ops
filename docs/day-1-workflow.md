@@ -1,252 +1,160 @@
 # CareerOps Day-1 Workflow
 
-Status: target workflow for the first AI-assisted usable release.
+Status: implemented v0 workflow.
 
-Purpose: define the exact path the user should be able to use for a real application tomorrow.
+This is the browser path for one India-focused internship application. CareerOps prepares and records the packet; the user submits it outside the app.
 
-## 1. Start
+## 1. Create The Application
 
-User starts the local app.
+1. Open the workbench and select `Add application`.
+2. Enter company, role title, and JD text. Location and source URL are optional.
+3. Select `Save application`.
 
-Expected screen:
+CareerOps writes the raw JD to the vault, stores its checksum in SQLite, creates an application record, and shows it in the Applications rail. The implemented UI imports a JD by pasted text; it does not fetch or scrape the source URL.
 
-- application list on the left
-- selected application or empty state in the center
-- AI tasks, checks, and approval panel on the right
+## 2. Analyze And Correct The JD
 
-If no applications exist, the empty state says:
+1. In `AI review`, choose a provider.
+2. Choose `Analyze JD` and select `Analyze JD`.
+3. Watch the persisted task move through `Pending`, `Running`, and `Completed` or a terminal error state. The browser polls every 1.5 seconds.
+4. Open the `Requirements` tab. `Raw AI` contains the structured provider result.
+5. Select `Add correction`, enter the corrected key and value, then select `Save corrections`.
 
-`No applications yet. Add a JD to start a packet.`
+Corrections are stored separately under `User corrected`; the raw AI group remains in history. Saving corrections invalidates a report that was based on older requirements.
 
-Primary action:
+## 3. Add Evidence And Profile Facts
 
-`Add application`
+1. Open `Evidence`.
+2. Create an evidence item with claim, type, optional source URL, verification state, and privacy level.
+3. Add a profile fact with its verification and privacy state.
+4. Link existing evidence by ID when needed.
 
-## 2. Add Application
+Only evidence and facts admitted by the bounded context builder are sent to a provider. Rejected, private, or unverified material remains available to deterministic verification and redaction rules but is not silently treated as publishable support.
 
-User enters:
+## 4. Import And Render A Resume
 
-- company
-- role title
-- source URL if available
-- JD text
-- deadline if known
-- location if known
+1. Open `Resume`.
+2. Enter a resume name and choose a `.tex` file.
+3. Select `Upload resume`. CareerOps copies the source into its vault and selects the new version.
+4. Select `Render PDF`.
 
-The app saves the raw JD snapshot before parsing.
+The renderer uses local `latexmk` or `pdflatex`, writes `render.log`, stores the PDF checksum, parses the text layer, and records page count and render/parse status. A failed render has no usable PDF and cannot produce an approvable packet.
 
-The user should see:
+The recorded source checksum is the PDF freshness boundary. If the vaulted source changes after import, the next analysis reports `PDF is stale`. Do not edit the vaulted copy. Restore its recorded bytes or upload the corrected `.tex` as a new resume version, then render and rerun.
 
-- `JD saved`
-- extracted requirements
-- fields marked `Unknown` when not found
+## 5. Choose A Provider And Task
 
-The system must not invent missing company, location, or eligibility details.
+The task menu contains:
 
-## 3. Review Extracted Requirements
+- `Analyze fit` with command `Run AI review`
+- `Analyze JD`
+- `Suggest resume edits`
+- `Draft cover letter`
+- `Review claims`
 
-The app shows extracted groups:
+The provider menu shows only registered provider records. `Codex account 2 (codex2)` is preferred when available; `Codex default (codex)` remains a separate choice. A task never changes to another identity after launch.
 
-- required skills
-- preferred skills
-- responsibilities
-- eligibility
-- location and work mode
-- knockout conditions
-- exact keywords
+For Codex, the panel states `Selected task data is sent through your signed-in Codex account`. Check `Acknowledge Codex data transfer for this run` before each launch. Codex is `cloud_external` and receives only the selected task's bounded prompt and context.
 
-User can edit extracted fields. Edits are saved as user corrections.
+Verified managed Ollama is `local_private`. Unmanaged Ollama is unavailable rather than being trusted from a localhost address. `Deterministic verifier` uses `Run verifier` and is explicitly not AI.
 
-The system records both:
+## 6. Launch And Inspect Provenance
 
-- raw parser output
-- user-corrected requirements
+Select the task command once. The run button is disabled while the task is pending or running. The status section shows:
 
-## 4. Select Resume
+- provider identity
+- model
+- privacy mode
+- task type and task ID
+- prompt template ID
+- prompt checksum
 
-User chooses:
+Provider binding, invocation metadata, context, raw output, validated output, and artifact checksums are persisted. A provider timeout, unavailable provider, malformed output, binding drift, or failed verifier leaves a terminal task record without silently applying content.
 
-- existing resume version
-- duplicate and tailor an existing version
-- import a LaTeX source
+## 7. Review Findings
 
-For v0, the app should support importing an existing `.tex` file and registering it as a resume version.
+Completed and blocked tasks show persisted findings:
 
-The app must show:
+- `Verified suggestion` or `Verified finding` can be accepted or rejected.
+- `Blocked by verifier` cannot be accepted and can be rejected.
+- A saved decision remains after reload.
 
-- source path
-- last source checksum
-- PDF path
-- render status
-- PDF freshness
-- parse status
-- page count
+AI confidence does not override schema, evidence, privacy, secret, rejected-claim, or exact-edit checks.
 
-If source changed after render, the app shows:
+## 8. Create A Child Resume Draft
 
-`PDF is stale. Render again before approval.`
+1. Run `Suggest resume edits` against the selected rendered resume.
+2. Accept at least one exact verified edit.
+3. Enter a draft name and select `Create resume draft`.
 
-## 5. Render PDF
+CareerOps checks that every selected finding belongs to the completed task and selected parent, is verified and accepted, and names source text that occurs exactly once. It applies all accepted replacements atomically to a new child `.tex` source. The parent resume ID, bytes, and checksum do not change.
 
-User clicks:
+The child becomes selected with no PDF. The UI reports `Draft created. Render it before review.`
 
-`Render PDF`
+## 9. Render And Rerun Review
 
-The compiler adapter runs the local LaTeX command.
+1. Select `Render PDF` for the child.
+2. Run `Run AI review` again.
+3. Resolve every blocker by uploading corrected source, creating another verified child, correcting requirements, adding evidence, rejecting unsafe findings, or selecting another resume.
+4. Render and rerun whenever a new child or newly uploaded resume becomes selected.
 
-Success state:
+The current report is bound to the current application, JD snapshot, and selected resume. Changing requirements or the selected resume invalidates the previous current report. A report with blockers keeps `Approve packet` disabled.
 
-- PDF path
-- PDF checksum
-- page count
-- parse status
+## 10. Review Claims
 
-Failure state:
+1. Choose `Review claims`.
+2. Launch the task against the stored profile facts and linked evidence.
+3. Inspect each supported, unsupported, private, or needs-review decision.
+4. Accept or reject each verified finding explicitly.
 
-- short error
-- render log link
-- no approval allowed
+A model decision is a finding, not an automatic profile edit.
 
-The app must not hide LaTeX errors.
+## 11. Approve The Exact Packet
 
-## 6. Analyze Fit
+When the latest report has zero blockers, select `Approve packet`.
 
-User clicks:
+The API rechecks that:
 
-`Run AI review`
+- the report belongs to the application
+- the report's resume ID is the selected resume ID
+- the report's JD snapshot ID is the current JD snapshot ID
+- the rendered PDF exists and its current checksum matches the resume record
+- the report has no blocking issues
+- no prior approval or submission already closes the packet
 
-The app builds a bounded context packet:
+The approval record stores the application ID, resume version ID, report ID, PDF SHA-256, approval timestamp, and note. Later packet mutation is rejected or invalidates current review state; it is not folded into the approval.
 
-- JD snapshot
-- selected resume version
-- rendered resume text
-- verified profile facts
-- linked evidence
-- rejected or risky claims
-- user writing preferences
+## 12. Export
 
-The provider runs only through an explicit task. In local private mode this should use a local OSS model when configured. If no AI provider is configured, the app may run the deterministic verifier, but the UI must label the output as `Verifier only`.
+The `Exports` section downloads available current artifacts:
 
-The app generates:
+- `Export JD`
+- `Export resume PDF`
+- `Export report`
+- `Export approval` after approval
 
-- fit report
-- risk report
-- recommended edits
-- AI suggestions with verifier status
-- provider and privacy metadata
+Artifact routes verify current ownership and checksums before serving files. A stale report or approval returns a conflict instead of exporting an old packet as current.
 
-Fit report shows:
+## 13. Submit Manually
 
-- strong matches
-- partial matches
-- missing requirements
-- exact keyword gaps
-- evidence confidence
-- knockout risks
-- semantic matches and missing context
+Submit the application on the employer's site. CareerOps does not open, fill, or submit that site.
 
-Risk report shows:
+After submission, select `Mark submitted manually`. This action is enabled only after approval and records the timestamp and note against the unchanged approved packet.
 
-- blockers
-- warnings
-- source for each issue
-- suggested next action
+## 14. Reload And History
 
-AI suggestions must not overwrite the resume. Accepted suggestions create a draft resume or application artifact version.
+Reload the browser and select the application again. The packet endpoint restores application state, selected parent/child resume relationship, latest task, findings and decisions, report, approval, evidence links, and submission state.
 
-## 7. Fix Issues
+Open `History` to inspect immutable application versions such as task completion, requirement correction, draft creation, approval, and manual submission.
 
-The user handles blockers:
+## Blockers And Recovery
 
-- add evidence
-- remove or rewrite a claim
-- update LaTeX
-- rerender PDF
-- rerun AI review or verifier
-
-The app must keep the previous report for history. It must not overwrite a report silently.
-
-## 8. Review Packet
-
-When there are no blockers, application status becomes:
-
-`Ready to review`
-
-The review panel shows:
-
-- exact company and role
-- selected resume version
-- PDF checksum
-- report ID
-- AI task ID if AI was used
-- provider and privacy mode
-- warning count
-- approval button
-
-The approval button label:
-
-`Approve packet`
-
-## 9. Approve
-
-When user approves, the app records:
-
-- application ID
-- resume version ID
-- report ID
-- PDF checksum
-- timestamp
-- user note if entered
-
-Status becomes:
-
-`Approved`
-
-If any input changes later, approval resets.
-
-## 10. Manual Submission
-
-The user submits outside the app.
-
-Afterward the user clicks:
-
-`Mark submitted manually`
-
-The app records:
-
-- submitted timestamp
-- submission note
-- final artifact references
-
-Status becomes:
-
-`Submitted manually`
-
-## 11. Expected Time
-
-For a normal JD and existing resume:
-
-- add application: 3 to 5 minutes
-- review requirements: 5 to 10 minutes
-- render and analyze: 2 to 5 minutes
-- fix issues: depends on blockers
-- approval: 2 minutes
-
-The goal is not instant automation. The goal is fewer unsafe submissions.
-
-## 12. Day-1 Acceptance Test
-
-The implementation must ship with an automated test that does this:
-
-1. Creates an application from a sample JD.
-2. Imports a sample LaTeX resume.
-3. Renders a PDF.
-4. Parses the PDF text.
-5. Runs AI review through a mock provider.
-6. Generates fit and risk reports.
-7. Blocks approval when the AI suggests or preserves a fixture claim without evidence.
-8. Passes after the claim is fixed, rejected, or evidence is linked.
-9. Approves the packet.
-10. Marks it submitted manually.
-
-The test must run locally.
+- **No provider:** Choose the verifier for safety checks or configure Codex/managed Ollama. The verifier is not an AI substitute.
+- **Codex acknowledgement missing:** The run command stays disabled. Check the per-run acknowledgement only after reviewing the selected provider and task.
+- **Task failed:** Read `error_summary`; fix availability, timeout, or output shape, then launch a new task. Do not switch identities inside the failed task.
+- **Blocked finding:** Reject it or add/correct evidence and run a new task. It cannot be accepted.
+- **LaTeX failed:** Inspect `vault\resumes\<resume id>\render\render.log`, fix the original source outside CareerOps, upload it as a new resume version, and render that version.
+- **PDF stale:** Restore the vaulted source to its recorded bytes or upload the current source as a new resume version, then render and rerun. The stale PDF/report is not approvable.
+- **Interrupted task:** Reload. Pending tasks are repolled and expired claims are recovered. Invocation fencing can convert an uncertain interrupted call to `provider_error` instead of invoking it twice.
+- **Approval refused:** Confirm the selected child is rendered, the current report was produced for that resume and JD, and the blocker count is zero.
+- **Submission refused:** Approve the exact current packet first.

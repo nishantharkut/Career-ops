@@ -1,203 +1,152 @@
 # CareerOps Quality Gates
 
-Status: required before implementation can be called complete.
+Status: implemented v0 gates and test coverage.
 
-Purpose: make old failure modes impossible to ship again.
+CareerOps treats provider output as a proposal. Schema validation, evidence checks, artifact integrity, and current packet identity remain authoritative.
 
-## 1. Gate Rule
+## AI Contract And Provenance
 
-An application packet is not ready until every blocking gate passes.
+The automated suite verifies that:
 
-Warnings can remain only when the report names the risk clearly and the user accepts it during approval.
+- only the five implemented task types and their bounded JSON schemas are accepted
+- prompt and context files are stable, bounded, regular files inside the task directory
+- provider output is bounded, strict JSON, schema-valid, and tied to a raw-output checksum
+- provider availability and invocation metadata agree with the persisted provider binding
+- task records retain provider ID, identity, model, privacy mode, prompt ID, prompt checksum, input IDs, and binding checksum
+- context, raw output, validated output, and draft text artifacts are vault-contained and checksummed
+- API artifact responses omit private vault paths and reject missing, stale, changed, or non-vault files
+- provider errors are reduced to bounded categories without source data, credentials, or provider stderr
 
-## 2. Evidence Gates
+Codex tests cover separate `codex2` and `codex` identities, preferred ordering, exact wrapper validation, native executable hashing, ChatGPT login status, read-only argument-list invocation, isolated task directories, output bounds, timeout cleanup, and no fallback after identity selection.
 
-Block approval when:
+Ollama tests cover authority-signed capabilities, exact endpoint/model/runtime binding, local model digest and metadata, pre-request runtime reverification, post-request provenance checks, remote/cloud metadata rejection, and fail-closed behavior without current isolation evidence.
 
-- a resume metric has no evidence record
-- a project claim is marked `needs_verification`
-- a rejected claim appears in a resume
-- a private-only evidence item appears in public text
-- a paper or research ownership claim is not verified
-- a repository metric has not been inspected or manually verified
+## Evidence And Finding Decisions
 
-Warnings:
+The verifier and integration tests prove that:
 
-- claim is user-stated but not externally verified
-- evidence exists but is old
-- evidence is private and cannot be shown to recruiters
+- unsupported metrics, secrets, private material, rejected claims, and evidence mismatches become blocked findings
+- blocked findings cannot be accepted
+- verified findings require an explicit accepted or rejected decision
+- claim review covers the exact supplied claim IDs
+- private and unverified evidence is not silently promoted to publishable support
+- user requirement corrections remain separate from raw AI output
+- accepted exact resume edits must belong to one completed task and current parent resume
+- each source span must occur exactly once and every replacement must pass evidence and privacy checks
+- draft creation is atomic, creates a child, and leaves the parent bytes and checksum unchanged
 
-## 3. Resume Gates
+The deterministic provider is tested as `is_ai=false` and `verifier_only`. UI tests require `Run verifier` and reject AI labelling for this fallback.
 
-Block approval when:
+## Concurrency And Recovery
 
-- LaTeX source changed after PDF render
-- PDF is missing
-- PDF checksum changed without a new report
-- PDF has more than one page unless the application explicitly allows it
-- PDF text extraction fails
-- rendered text does not contain expected sections
-- contact information is missing
-- chronology is not reverse chronological
-- role title conflicts with verified profile
-- selected resume version is not linked to the application
+Repository, orchestrator, API, and task-runner tests cover:
 
-Warnings:
+- compare-and-set claiming so one pending task has one active claim
+- finite claim leases and heartbeat renewal during provider and post-provider work
+- expired-claim recovery without allowing a stale worker to commit
+- invocation fencing so uncertain interrupted calls are not silently invoked twice
+- provider-binding drift between enqueue and run
+- concurrent requirement/resume/application changes during finalization
+- atomic task status, findings, artifacts, report side effects, and application version events
+- runner startup recovery, background polling, queue pressure, unhealthy runner handoff, and clean shutdown
+- artifact path, hard-link, identity-swap, and publication races
+- draft parent/source races and approved/submitted packet mutation refusal
 
-- whitespace is high
-- skills section is too generic
-- bullets lack evidence
-- role family mismatch is mild but not blocking
+An interrupted pending task is eligible for polling again. A task whose provider invocation may already have started can fail closed with `provider_error` rather than replaying the external call.
 
-## 4. JD Gates
+## Resume, Report, Approval, And Submission
 
-Block approval when:
+Tests verify:
 
-- JD snapshot is missing
-- source URL is missing and no manual JD text exists
-- parser found a knockout condition that the profile does not satisfy
-- internship year or graduation constraint appears incompatible
-- location or work mode conflicts with stated constraints
+- local LaTeX discovery, successful PDF/text parsing, and a retained render log on failure
+- stale source, missing/unparseable PDF, unsupported metrics, unverified claims, NDA-sensitive wording, and unsupported titles block the deterministic report
+- a report is bound to application ID, JD snapshot ID, and selected resume ID
+- requirement or resume selection changes invalidate the current report and approval state
+- approval requires the current zero-blocker report and current PDF bytes
+- approval stores application ID, resume ID, report ID, and PDF SHA-256
+- export routes reject stale report/approval ownership or changed PDF bytes
+- manual submission is impossible before approval and remains bound to the approved packet
+- reload restores selected resume, parent/child history, task provenance, findings, approval, and manual submission state
 
-Warnings:
+The mock-provider Playwright flow exercises create application, analyze JD, save a correction, add evidence and a profile fact, render risky and clean resumes, block and reject an unsafe claim, create a verified child draft, rerender and rerun, export artifacts, review claims, approve, submit manually, reload, and inspect history.
 
-- parser could not find eligibility rules
-- work mode is unclear
-- deadline is missing
-- company name is inferred
+## Managed Runtime And Hosting
 
-## 5. Privacy Gates
+Hosting tests parse the shipped Compose configuration and verify:
 
-Block approval when:
+- same-origin static serving and configurable development API origin
+- Basic Auth on private routes, public `/health`, and fail-fast required credentials
+- persistent app data, vault, backup, and model mounts
+- restart and health policies
+- non-root/read-only app and inspector settings
+- no bundled API key or authority key
+- one-shot storage initialization for exact bind mounts
+- one-shot model bootstrap on a temporary egress network
+- runtime Ollama attached only to an internal no-egress network with cloud disabled and no host port
+- digest-pinned Ollama and Docker socket proxy images
+- GET-only Docker API access with mutation surfaces disabled
+- inspector checks for exact container, image, network, environment, model, and runtime identity
+- API-issued capabilities rather than environment assertions
 
-- public text names NDA-sensitive modules
-- private repository names appear in public text without user approval
-- generated artifact contains secret-like text
-- logs include credential-like values
-- cloud watcher tries to read profile, resume, evidence, or report data
+Windows runtime tests verify the app-owned executable copy, reduced child environment, outbound firewall rule, loopback listener ownership, PID/start-time/executable identity, exact model availability, launch journal recovery, and cleanup ordering. Cleanup removes isolation only after the owned process and listener are proven gone.
 
-The app must default to redaction when unsure.
+## Backup And Restore
 
-## 6. Claim-Specific Gates From Reconstruction
+Backup tests verify:
 
-The following known issues must be encoded as regression tests:
+- a consistent SQLite online snapshot during writes
+- stable vault capture plus database-to-vault path/checksum validation
+- bounded file count, member size, total size, archive size, manifest size, and compression ratio
+- manifest, archive, and per-file SHA-256 values
+- source, staged-file, archive-path, link, hard-link, and identity-swap refusal
+- no archive publication when concurrent vault bytes or topology change
+- strict archive topology with no traversal, absolute, duplicate, case-colliding, symlink, or undeclared entries
+- explicit existing empty restore targets that are separate and non-link
+- SQLite integrity and extracted-file checksum verification before publication
+- two-target durable journal recovery and rollback across every publication phase
+- refusal to delete or overwrite a changed target after an interrupted restore
+- PowerShell wrappers with explicit absolute paths and no expression evaluation
 
-- QuickIntell must be represented as an internship, not full-time employment.
-- QuickIntell public title must not be overclaimed without user approval.
-- QuickIntell metrics such as `70+`, `108`, `40+`, `23+`, or percentage lifts must be verified before use.
-- NDA-sensitive QuickIntell module names must not appear in public application text.
-- `Covid-RARS` and `CuKD-XAI` paper-related claims must not imply completed publication unless verified.
-- ISAC/RIS work must not be claimed as the user's work unless independently proven.
-- Amazon HackOn and MLSS achievements can be used only in the exact verified form.
-- Playwright should not be added to resume skills unless the user explicitly approves it for that application.
-- Generic model-name dumping in skills is blocked.
-- Keyword banners are blocked.
+## Commands
 
-## 7. AI Gates
+Normal provider, runtime, hosting, and backup coverage:
 
-Block approval when:
+```powershell
+.\.venv\Scripts\python.exe -m pytest `
+  tests\test_ai_providers.py `
+  tests\test_ai_context_and_verifier.py `
+  tests\test_ai_orchestrator.py `
+  tests\test_ai_api_flow.py `
+  tests\test_resume_drafts.py `
+  tests\test_managed_ollama_runtime.py `
+  tests\test_hosting_configuration.py `
+  tests\test_backup_restore.py -q
+```
 
-- an AI-generated claim has no linked evidence
-- an AI suggestion contradicts a verified profile fact
-- an AI suggestion revives a rejected claim
-- an AI task output fails schema validation
-- an AI task output has no provider, model, prompt version, privacy mode, or checksum
-- a cloud AI provider handled private data without explicit configuration and task approval
-- an AI draft overwrote a resume source or approved artifact instead of creating a new version
-- prompt-injection text from a JD, resume, or session file appears to control system behavior
-- the UI hides that the output came from verifier-only fallback instead of full AI review
+UI and browser gates:
 
-Warnings:
+```powershell
+npm run test:web
+npm run build:web
+npm run test:e2e
+```
 
-- local AI provider is unavailable and only deterministic verifier output exists
-- AI confidence is low but no blocker is present
-- AI found a semantic match that still lacks public wording or evidence
-- Codex deep review used selected local files that should be reviewed before storing long-term
+Normal pytest excludes real providers through the configured `not live_provider` expression. Explicit marker selection is the opt-in:
 
-## 8. Approval Gates
+```powershell
+.\.venv\Scripts\python.exe -m pytest -m live_provider -q
+```
 
-Block approval when:
+The live tests use only synthetic JD fixture data under `tmp_path`. Codex selects `codex2` only and never falls back. Managed Ollama runs only through an explicitly configured managed runtime that has passed attestation; otherwise it skips with an unavailable reason.
 
-- report is older than selected PDF
-- report was generated for a different JD snapshot
-- selected resume changed after report
-- approval record checksum does not match current PDF
-- application has blocking risks
-- latest accepted AI suggestions have not been verified
+## Release Gate
 
-The user must be able to approve only after seeing:
+Before a release or merge:
 
-- selected PDF
-- fit report
-- risk report
-- AI task output when AI was used
-- provider and privacy mode when AI was used
-- blocking issue count
-- warning count
-- exact resume version
+1. Run the normal Python, web, build, and Playwright suites.
+2. Run the live marker on a machine with the intended real provider identities.
+3. Run the stale-claim consistency scan from Task 11.
+4. Run `git diff --check` and inspect the owned-file diff.
+5. Confirm no `.env`, credentials, runtime data, vault data, backups, model data, or provider output entered source control.
 
-## 9. Submission Gates
-
-The app must not submit applications in v0.
-
-Manual submission record can be saved only after:
-
-- application is approved
-- user confirms they submitted outside the app
-- timestamp and note are recorded
-
-## 10. UI Gates
-
-Block completion of the UI when:
-
-- primary labels wrap awkwardly at 320, 375, 414, or 768 px
-- any primary action lacks focus-visible state
-- buttons or inputs are smaller than 44 px touch target
-- important controls exist only on hover
-- table data is unreadable on small screens
-- the UI uses generic marketing copy
-- there is a card inside a card without a real information reason
-- there is a decorative hero or gradient-heavy layout
-- status labels are vague
-
-Required status labels:
-
-- `Draft`
-- `Needs evidence`
-- `Needs resume update`
-- `Ready to review`
-- `Approved`
-- `Submitted manually`
-- `Archived`
-
-## 11. Artifact Gates
-
-Block completion when:
-
-- report file is missing
-- report does not include source IDs
-- report cannot be traced to exact JD and resume version
-- export packet omits approval record
-- generated files overwrite user files silently
-
-## 12. Test Gates
-
-Before v0 is complete:
-
-- all unit tests must pass
-- all integration tests must pass
-- Playwright day-1 workflow must pass
-- PDF render and parse tests must pass
-- secret scan must pass
-- responsive screenshots must be inspected
-- stale PDF fixture must fail before fix and pass after render
-- invented metric fixture must block approval
-- unsupported title fixture must block approval
-- NDA wording fixture must block approval
-- AI-generated unsupported claim fixture must block approval
-- cloud AI disabled-by-default fixture must pass
-- provider-unavailable fallback fixture must show `Verifier only`
-
-## 13. Done Means
-
-Done means the system can stop a bad application packet and unsafe AI output, not just generate a polished one.
+The release is blocked by a failed normal test, unexpected live-provider failure, unreviewed privacy/provenance drift, stale packet export, or backup/restore integrity failure.

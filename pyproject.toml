@@ -27,6 +27,10 @@ exclude = ["apps.web*"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["."]
+addopts = ["-m", "not live_provider"]
+markers = [
+  "live_provider: run bounded smoke checks against explicitly available real AI providers",
+]
 filterwarnings = [
   "ignore:Using `httpx` with `starlette.testclient` is deprecated:starlette.exceptions.StarletteDeprecationWarning",
 ]
