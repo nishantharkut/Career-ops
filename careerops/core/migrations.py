@@ -2,6 +2,7 @@ from collections.abc import Callable
 from datetime import UTC, datetime
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import sqlite3
@@ -928,6 +929,9 @@ _V17_PROVIDER_BINDING_FIELDS = (
 _V17_PROVIDER_BOOLEAN_FIELDS = frozenset(
     {"data_leaves_machine", "is_ai", "cloud_disabled", "egress_enforced"}
 )
+_V17_AI_ARTIFACT_TYPES = frozenset(
+    {"context", "raw_output", "validated_output", "draft_text"}
+)
 _V17_MAX_AUTHORITY_FILE_BYTES = 16_000_000
 
 
@@ -939,6 +943,32 @@ def _v17_json(value: object) -> str:
         separators=(",", ":"),
         sort_keys=True,
     )
+
+
+def _v17_audit_value(value: object) -> object:
+    if value is None or type(value) in {bool, int, str}:
+        return value
+    if isinstance(value, float):
+        if math.isfinite(value):
+            return value
+        return {
+            "sqlite_storage_class": "real",
+            "value": str(value),
+        }
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        return {
+            "encoding": "hex",
+            "sqlite_storage_class": "blob",
+            "value": bytes(value).hex(),
+        }
+    if isinstance(value, dict):
+        return {str(key): _v17_audit_value(inner) for key, inner in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_v17_audit_value(inner) for inner in value]
+    return {
+        "python_type": type(value).__name__,
+        "value": str(value),
+    }
 
 
 def _v17_is_sha256(value: object) -> bool:
@@ -1057,17 +1087,72 @@ def _v17_read_authority_file(raw_path: object) -> tuple[bytes, str] | None:
     return b"".join(chunks), digest.hexdigest()
 
 
+def _v17_is_link_or_reparse(path_stat: os.stat_result) -> bool:
+    reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+    attributes = getattr(path_stat, "st_file_attributes", 0)
+    return stat.S_ISLNK(path_stat.st_mode) or bool(attributes & reparse_flag)
+
+
+def _v17_vault_relative_parts(
+    raw_path: object, vault_path: Path | None
+) -> tuple[str, ...] | None:
+    if not isinstance(raw_path, str) or not raw_path or vault_path is None:
+        return None
+    raw_candidate = Path(raw_path)
+    if not raw_candidate.is_absolute():
+        return None
+    vault_root = Path(os.path.abspath(vault_path))
+    candidate = Path(os.path.abspath(raw_candidate))
+    if str(candidate) != raw_path:
+        return None
+    try:
+        relative = candidate.relative_to(vault_root)
+        current = vault_root
+        root_stat = current.lstat()
+        if _v17_is_link_or_reparse(root_stat) or not stat.S_ISDIR(root_stat.st_mode):
+            return None
+        for index, part in enumerate(relative.parts):
+            current = current / part
+            path_stat = current.lstat()
+            if _v17_is_link_or_reparse(path_stat):
+                return None
+            if index < len(relative.parts) - 1:
+                if not stat.S_ISDIR(path_stat.st_mode):
+                    return None
+            elif not stat.S_ISREG(path_stat.st_mode) or path_stat.st_nlink != 1:
+                return None
+        if (
+            Path(os.path.realpath(vault_root)) != vault_root
+            or Path(os.path.realpath(candidate)) != candidate
+        ):
+            return None
+    except (FileNotFoundError, OSError, ValueError):
+        return None
+    return relative.parts
+
+
 def _v17_artifact_path_matches(
-    raw_path: object, task_id: str, artifact_id: str
+    raw_path: object,
+    task_id: str,
+    artifact_id: str,
+    vault_path: Path | None,
 ) -> bool:
-    if not isinstance(raw_path, str):
-        return False
-    parts = Path(raw_path).parts
-    expected = ("ai-artifacts", task_id, artifact_id)
-    if len(parts) < 4 or not parts[-1]:
-        return False
-    return tuple(os.path.normcase(part) for part in parts[-4:-1]) == tuple(
-        os.path.normcase(part) for part in expected
+    parts = _v17_vault_relative_parts(raw_path, vault_path)
+    return parts is not None and len(parts) == 4 and tuple(
+        os.path.normcase(part) for part in parts[:3]
+    ) == tuple(
+        os.path.normcase(part)
+        for part in ("ai-artifacts", task_id, artifact_id)
+    ) and bool(parts[3])
+
+
+def _v17_resume_path_matches(raw_path: object, vault_path: Path | None) -> bool:
+    parts = _v17_vault_relative_parts(raw_path, vault_path)
+    return (
+        parts is not None
+        and len(parts) >= 2
+        and os.path.normcase(parts[0]) == os.path.normcase("resumes")
+        and bool(parts[-1])
     )
 
 
@@ -1076,6 +1161,7 @@ def _v17_report_authority(
     application: sqlite3.Row,
     report: sqlite3.Row,
     resume: sqlite3.Row,
+    vault_path: Path | None,
 ) -> tuple[str, str] | None:
     try:
         if (
@@ -1089,6 +1175,11 @@ def _v17_report_authority(
         ):
             return None
 
+        if (
+            not _v17_resume_path_matches(resume["pdf_path"], vault_path)
+            or not _v17_resume_path_matches(resume["tex_path"], vault_path)
+        ):
+            return None
         pdf_file = _v17_read_authority_file(resume["pdf_path"])
         source_file = _v17_read_authority_file(resume["tex_path"])
         if (
@@ -1253,7 +1344,6 @@ def _v17_report_authority(
         artifact_contents: dict[str, bytes] = {}
         for artifact_id, item in manifest_by_id.items():
             artifact = artifacts[artifact_id]
-            file_contents = _v17_read_authority_file(artifact["path"])
             if (
                 artifact["task_id"] != task_id
                 or artifact["claim_token"] != claim_token
@@ -1262,11 +1352,12 @@ def _v17_report_authority(
                 or artifact["schema_version"] != "1"
                 or artifact["storage_version"] != 2
                 or not _v17_artifact_path_matches(
-                    artifact["path"], task_id, artifact_id
+                    artifact["path"], task_id, artifact_id, vault_path
                 )
-                or file_contents is None
-                or file_contents[1] != artifact["sha256"]
             ):
+                return None
+            file_contents = _v17_read_authority_file(artifact["path"])
+            if file_contents is None or file_contents[1] != artifact["sha256"]:
                 return None
             artifact_contents[artifact["artifact_type"]] = file_contents[0]
         attempt_artifact_ids = {
@@ -1337,13 +1428,168 @@ def _v17_report_authority(
     return task_id, resume["pdf_sha256"]
 
 
-def _v17_recover_unprovable_approvals(connection: sqlite3.Connection) -> None:
+def _v17_discard_unsafe_approval_artifacts(
+    connection: sqlite3.Connection, vault_path: Path | None
+) -> None:
+    approved_artifacts = connection.execute(
+        """
+        SELECT artifact.*, task.application_id
+        FROM ai_artifacts AS artifact
+        JOIN ai_tasks AS task ON task.id = artifact.task_id
+        JOIN applications AS application ON application.id = task.application_id
+        WHERE application.approval_id IS NOT NULL
+        ORDER BY task.application_id, artifact.created_at, artifact.id
+        """
+    ).fetchall()
+
+    unsafe_by_application: dict[str, list[tuple[sqlite3.Row, list[str]]]] = {}
+    for artifact in approved_artifacts:
+        if artifact["storage_version"] == 1:
+            raise ValueError(
+                "legacy AI artifacts must be upgraded before v17 migration"
+            )
+        rejection_reasons: list[str] = []
+        if artifact["storage_version"] != 2:
+            rejection_reasons.append("storage_version")
+        if artifact["artifact_type"] not in _V17_AI_ARTIFACT_TYPES:
+            rejection_reasons.append("artifact_type")
+        if artifact["schema_version"] != "1":
+            rejection_reasons.append("schema_version")
+        if not _v17_is_sha256(artifact["sha256"]):
+            rejection_reasons.append("sha256")
+        metadata_is_valid = not rejection_reasons
+        path_is_owned = _v17_artifact_path_matches(
+            artifact["path"], artifact["task_id"], artifact["id"], vault_path
+        )
+        if not path_is_owned:
+            rejection_reasons.append("repository_owned_path")
+        file_contents = (
+            _v17_read_authority_file(artifact["path"])
+            if metadata_is_valid and path_is_owned
+            else None
+        )
+        if metadata_is_valid and path_is_owned:
+            if file_contents is None:
+                rejection_reasons.append("stable_file")
+            elif file_contents[1] != artifact["sha256"]:
+                rejection_reasons.append("checksum")
+        if rejection_reasons:
+            unsafe_by_application.setdefault(artifact["application_id"], []).append(
+                (artifact, rejection_reasons)
+            )
+
+    reason = "AI artifacts were not provably repository-owned during v17 migration"
+    for application_id, unsafe_artifacts in unsafe_by_application.items():
+        artifacts = [artifact for artifact, _reasons in unsafe_artifacts]
+        artifact_ids = [artifact["id"] for artifact in artifacts]
+        placeholders = ", ".join("?" for _ in artifact_ids)
+        removed_links = connection.execute(
+            f"""
+            SELECT task_id, artifact_id, ordinal, created_at
+            FROM ai_task_input_artifacts
+            WHERE artifact_id IN ({placeholders})
+            ORDER BY task_id, ordinal, artifact_id
+            """,
+            artifact_ids,
+        ).fetchall()
+        dependent_task_ids = sorted({row["task_id"] for row in removed_links})
+        manifest_before: dict[str, object] = {}
+        for task_id in dependent_task_ids:
+            raw_manifest = connection.execute(
+                "SELECT input_artifact_ids_json FROM ai_tasks WHERE id = ?",
+                (task_id,),
+            ).fetchone()[0]
+            try:
+                manifest_before[task_id] = json.loads(raw_manifest)
+            except (TypeError, UnicodeDecodeError, json.JSONDecodeError):
+                manifest_before[task_id] = raw_manifest
+        connection.execute(
+            f"DELETE FROM ai_task_input_artifacts WHERE artifact_id IN ({placeholders})",
+            artifact_ids,
+        )
+        updated_task_manifests: list[dict[str, object]] = []
+        for task_id in dependent_task_ids:
+            remaining_ids = [
+                row["artifact_id"]
+                for row in connection.execute(
+                    """
+                    SELECT artifact_id FROM ai_task_input_artifacts
+                    WHERE task_id = ? ORDER BY ordinal ASC
+                    """,
+                    (task_id,),
+                ).fetchall()
+            ]
+            connection.execute(
+                "UPDATE ai_tasks SET input_artifact_ids_json = ? WHERE id = ?",
+                (_v17_json(remaining_ids), task_id),
+            )
+            updated_task_manifests.append(
+                {
+                    "after": remaining_ids,
+                    "before": manifest_before[task_id],
+                    "task_id": task_id,
+                }
+            )
+        connection.execute(
+            f"DELETE FROM ai_artifacts WHERE id IN ({placeholders})", artifact_ids
+        )
+        now = datetime.now(UTC).isoformat()
+        connection.execute(
+            """
+            INSERT INTO audit_events (
+                id, event_type, entity_type, entity_id,
+                before_json, after_json, created_at
+            ) VALUES (?, ?, 'application', ?, ?, ?, ?)
+            """,
+            (
+                f"aud_{uuid.uuid4().hex}",
+                "ai_artifacts.discarded_by_ai_authority_migration",
+                application_id,
+                _v17_json(
+                    _v17_audit_value(
+                        {
+                            "artifacts": [
+                                {
+                                    "artifact_type": artifact["artifact_type"],
+                                    "claim_token": artifact["claim_token"],
+                                    "created_at": artifact["created_at"],
+                                    "id": artifact["id"],
+                                    "path": artifact["path"],
+                                    "rejection_reasons": rejection_reasons,
+                                    "schema_version": artifact["schema_version"],
+                                    "sha256": artifact["sha256"],
+                                    "storage_version": artifact["storage_version"],
+                                    "task_id": artifact["task_id"],
+                                }
+                                for artifact, rejection_reasons in unsafe_artifacts
+                            ],
+                            "removed_input_links": [
+                                dict(row) for row in removed_links
+                            ],
+                        }
+                    )
+                ),
+                _v17_json(
+                    _v17_audit_value(
+                        {
+                            "artifact_ids": artifact_ids,
+                            "reason": reason,
+                            "updated_task_manifests": updated_task_manifests,
+                        }
+                    )
+                ),
+                now,
+            ),
+        )
+
+
+def _v17_recover_unprovable_approvals(
+    connection: sqlite3.Connection, vault_path: Path | None
+) -> None:
     reason = "AI approval authority could not be proven during v17 migration"
     applications = connection.execute(
         """
-        SELECT * FROM applications
-        WHERE approval_id IS NOT NULL
-          AND submission_state = 'not_submitted'
+        SELECT * FROM applications WHERE approval_id IS NOT NULL
         """
     ).fetchall()
     for application in applications:
@@ -1358,13 +1604,19 @@ def _v17_recover_unprovable_approvals(connection: sqlite3.Connection) -> None:
             "SELECT * FROM approvals WHERE id = ?", (application["approval_id"],)
         ).fetchone()
         authority = (
-            _v17_report_authority(connection, application, report, resume)
+            _v17_report_authority(
+                connection, application, report, resume, vault_path
+            )
             if report is not None and resume is not None
             else None
         )
+        is_submitted = (
+            application["submission_state"] != "not_submitted"
+            or application["submitted_at"] is not None
+            or application["status"] == "submitted_manual"
+        )
         preserve = (
-            application["status"] == "approved"
-            and authority is not None
+            authority is not None
             and report["ai_task_id"] == authority[0]
             and report["pdf_sha256"] == authority[1]
             and approval is not None
@@ -1372,10 +1624,49 @@ def _v17_recover_unprovable_approvals(connection: sqlite3.Connection) -> None:
             and approval["report_id"] == report["id"]
             and approval["resume_version_id"] == resume["id"]
             and approval["pdf_sha256"] == resume["pdf_sha256"]
+            and (application["status"] == "approved" or is_submitted)
         )
         if preserve:
             continue
         now = datetime.now(UTC).isoformat()
+        if is_submitted:
+            existing = connection.execute(
+                """
+                SELECT 1 FROM audit_events
+                WHERE event_type = ? AND entity_type = 'application'
+                  AND entity_id = ?
+                LIMIT 1
+                """,
+                (
+                    "application.submitted_authority_unprovable_by_ai_migration",
+                    application["id"],
+                ),
+            ).fetchone()
+            if existing is None:
+                historical_before = {
+                    "approval_id": application["approval_id"],
+                    "latest_report_id": application["latest_report_id"],
+                    "status": application["status"],
+                    "submission_state": application["submission_state"],
+                }
+                historical_after = {**historical_before, "reason": reason}
+                connection.execute(
+                    """
+                    INSERT INTO audit_events (
+                        id, event_type, entity_type, entity_id,
+                        before_json, after_json, created_at
+                    ) VALUES (?, ?, 'application', ?, ?, ?, ?)
+                    """,
+                    (
+                        f"aud_{uuid.uuid4().hex}",
+                        "application.submitted_authority_unprovable_by_ai_migration",
+                        application["id"],
+                        _v17_json(_v17_audit_value(historical_before)),
+                        _v17_json(_v17_audit_value(historical_after)),
+                        now,
+                    ),
+                )
+            continue
         before = {
             "approval_id": application["approval_id"],
             "latest_report_id": application["latest_report_id"],
@@ -1407,14 +1698,21 @@ def _v17_recover_unprovable_approvals(connection: sqlite3.Connection) -> None:
                 f"aud_{uuid.uuid4().hex}",
                 "application.approval_invalidated_by_ai_authority_migration",
                 application["id"],
-                _v17_json(before),
-                _v17_json(after),
+                _v17_json(_v17_audit_value(before)),
+                _v17_json(_v17_audit_value(after)),
                 now,
             ),
         )
 
 
-def _add_report_ai_approval_authority(connection: sqlite3.Connection) -> None:
+def _add_report_ai_approval_authority(
+    connection: sqlite3.Connection, vault_path: Path | None = None
+) -> None:
+    has_approval = connection.execute(
+        "SELECT 1 FROM applications WHERE approval_id IS NOT NULL LIMIT 1"
+    ).fetchone()
+    if has_approval is not None and vault_path is None:
+        raise ValueError("v17 migration requires the configured repository vault")
     report_columns = _column_names(connection, "reports")
     if "ai_task_id" not in report_columns:
         connection.execute(
@@ -1428,6 +1726,7 @@ def _add_report_ai_approval_authority(connection: sqlite3.Connection) -> None:
     previous_row_factory = connection.row_factory
     connection.row_factory = sqlite3.Row
     try:
+        _v17_discard_unsafe_approval_artifacts(connection, vault_path)
         applications = connection.execute(
             """
             SELECT * FROM applications
@@ -1449,7 +1748,7 @@ def _add_report_ai_approval_authority(connection: sqlite3.Connection) -> None:
             if report is None or resume is None:
                 continue
             authority = _v17_report_authority(
-                connection, application, report, resume
+                connection, application, report, resume, vault_path
             )
             if authority is None:
                 continue
@@ -1460,7 +1759,7 @@ def _add_report_ai_approval_authority(connection: sqlite3.Connection) -> None:
                 """,
                 (*authority, report["id"]),
             )
-        _v17_recover_unprovable_approvals(connection)
+        _v17_recover_unprovable_approvals(connection, vault_path)
     finally:
         connection.row_factory = previous_row_factory
 
@@ -1486,17 +1785,31 @@ MIGRATIONS: tuple[tuple[int, Migration], ...] = (
 )
 
 LATEST_SCHEMA_VERSION = MIGRATIONS[-1][0]
+PRE_AI_APPROVAL_AUTHORITY_SCHEMA_VERSION = 16
 
 
-def run_migrations(connection: sqlite3.Connection) -> None:
+def run_migrations(
+    connection: sqlite3.Connection,
+    *,
+    vault_path: Path | None = None,
+    target_version: int | None = None,
+) -> None:
+    maximum_version = (
+        LATEST_SCHEMA_VERSION if target_version is None else target_version
+    )
+    if maximum_version < 0 or maximum_version > LATEST_SCHEMA_VERSION:
+        raise ValueError("migration target version is invalid")
     current_version = connection.execute("PRAGMA user_version").fetchone()[0]
     for version, migration in MIGRATIONS:
-        if version <= current_version:
+        if version <= current_version or version > maximum_version:
             continue
 
         connection.execute("BEGIN IMMEDIATE")
         try:
-            migration(connection)
+            if version == 17:
+                _add_report_ai_approval_authority(connection, vault_path)
+            else:
+                migration(connection)
             connection.commit()
         except BaseException:
             connection.rollback()

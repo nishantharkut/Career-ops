@@ -22,6 +22,7 @@ from typing import Any, BinaryIO
 from uuid import uuid4
 
 from careerops.core.database import connect_database, initialize_database
+from careerops.core.migrations import PRE_AI_APPROVAL_AUTHORITY_SCHEMA_VERSION
 from careerops.core.models import (
     AiArtifact,
     AiFinding,
@@ -344,7 +345,6 @@ class CareerOpsRepository:
         return max(0.02, min(10.0, self.claim_lease_seconds / 3))
 
     def initialize(self) -> None:
-        initialize_database(self.database_path)
         for directory in (
             "applications",
             "resumes",
@@ -356,7 +356,13 @@ class CareerOpsRepository:
             "application-versions",
         ):
             (self.vault_path / directory).mkdir(parents=True, exist_ok=True)
+        initialize_database(
+            self.database_path,
+            vault_path=self.vault_path,
+            target_version=PRE_AI_APPROVAL_AUTHORITY_SCHEMA_VERSION,
+        )
         self._upgrade_legacy_ai_artifacts()
+        initialize_database(self.database_path, vault_path=self.vault_path)
         self._reconcile_ai_artifact_storage()
         self.requeue_interrupted_ai_tasks()
 

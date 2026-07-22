@@ -129,7 +129,16 @@ def connect_database(path: Path) -> Iterator[sqlite3.Connection]:
         connection.close()
 
 
-def initialize_database(path: Path) -> None:
+def initialize_database(
+    path: Path,
+    *,
+    vault_path: Path | None = None,
+    target_version: int | None = None,
+) -> None:
     with connect_database(path) as connection:
         connection.executescript(SCHEMA)
-        run_migrations(connection)
+        run_migrations(
+            connection,
+            vault_path=vault_path,
+            target_version=target_version,
+        )

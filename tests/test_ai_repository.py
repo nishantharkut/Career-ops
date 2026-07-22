@@ -1520,7 +1520,7 @@ def test_reconciliation_waits_for_legacy_copy_database_update(
     task_id, artifact_id, source_path = create_v14_legacy_artifact_database(
         database_path, vault_path
     )
-    initialize_database(database_path)
+    initialize_database(database_path, target_version=16)
     (vault_path / "ai-artifacts").mkdir(parents=True, exist_ok=True)
     interrupted_target = (
         vault_path
@@ -1765,7 +1765,7 @@ def test_legacy_upgrade_sweeps_orphans_but_preserves_reserved_target(
     task_id, artifact_id, source_path = create_v14_legacy_artifact_database(
         database_path, vault_path
     )
-    initialize_database(database_path)
+    initialize_database(database_path, target_version=16)
     reserved_target = (
         vault_path
         / "ai-artifacts"
@@ -2514,6 +2514,7 @@ def create_v16_approved_packet(
     tmp_path: Path,
     *,
     mismatch: str | None = None,
+    submitted: bool = False,
 ):
     database_path = tmp_path / "careerops-v16.db"
     vault_path = tmp_path / "vault-v16"
@@ -2521,6 +2522,8 @@ def create_v16_approved_packet(
     repo.initialize()
     application, resume, report, approval = create_approved_application(repo, tmp_path)
     assert report.ai_task_id is not None
+    if submitted:
+        repo.mark_submitted_manual(application.id, "Submitted before v17")
     if mismatch is not None:
         mutate_v16_authority_fixture(
             repo,
@@ -2564,6 +2567,498 @@ def test_v17_migration_preserves_provable_ai_approval_and_submission(
 
     assert submitted.status == "submitted_manual"
     assert submitted.approval_id == approval.id
+
+
+@pytest.mark.parametrize(
+    "duplicate_authority_snapshot",
+    [False, True],
+    ids=["unique-authority", "ambiguous-authority"],
+)
+def test_v17_migration_recovers_outside_vault_artifact_suffix_forgery(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    duplicate_authority_snapshot: bool,
+):
+    database_path, vault_path, application, _resume, report, approval = (
+        create_v16_approved_packet(tmp_path)
+    )
+    assert report.ai_task_id is not None
+    outside_root = tmp_path / "outside-vault"
+    with connect_database(database_path) as connection:
+        if duplicate_authority_snapshot:
+            authority_version = connection.execute(
+                """
+                SELECT * FROM application_versions
+                WHERE application_id = ? AND event_type = 'ai_task.completed'
+                """,
+                (application.id,),
+            ).fetchone()
+            assert authority_version is not None
+            connection.execute(
+                """
+                INSERT INTO application_versions (
+                    id, application_id, version_number, event_type,
+                    snapshot_json, created_at
+                ) VALUES (?, ?, ?, 'ai_task.completed', ?, ?)
+                """,
+                (
+                    "appv_duplicate_outside_vault_authority",
+                    application.id,
+                    authority_version["version_number"] + 1,
+                    authority_version["snapshot_json"],
+                    authority_version["created_at"],
+                ),
+            )
+        artifact_rows = connection.execute(
+            "SELECT id, path FROM ai_artifacts WHERE task_id = ? ORDER BY id",
+            (report.ai_task_id,),
+        ).fetchall()
+        assert len(artifact_rows) == 3
+        for artifact_row in artifact_rows:
+            outside_path = (
+                outside_root
+                / "ai-artifacts"
+                / report.ai_task_id
+                / artifact_row["id"]
+                / Path(artifact_row["path"]).name
+            )
+            outside_path.parent.mkdir(parents=True)
+            outside_path.write_bytes(Path(artifact_row["path"]).read_bytes())
+            connection.execute(
+                "UPDATE ai_artifacts SET path = ? WHERE id = ?",
+                (str(outside_path.resolve()), artifact_row["id"]),
+            )
+
+    real_open = os.open
+
+    def reject_external_open(path, *args, **kwargs):
+        candidate = Path(path)
+        if candidate == outside_root or outside_root in candidate.parents:
+            raise AssertionError("migration opened an unowned artifact")
+        return real_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "open", reject_external_open)
+    migrated = CareerOpsRepository(database_path, vault_path)
+    migrated.initialize()
+    migrated.initialize()
+
+    restored_report = migrated.get_report(report.id)
+    restored_application = migrated.get_application(application.id)
+    assert restored_report.ai_task_id is None
+    assert restored_report.pdf_sha256 is None
+    assert restored_application.status == "ready_for_review"
+    assert restored_application.approval_id is None
+    assert restored_application.latest_report_id is None
+    assert migrated.get_approval(approval.id).id == approval.id
+    recovery_events = [
+        event
+        for event in migrated.list_audit_events()
+        if event.event_type
+        == "application.approval_invalidated_by_ai_authority_migration"
+    ]
+    assert len(recovery_events) == 1
+    discard_events = [
+        event
+        for event in migrated.list_audit_events()
+        if event.event_type == "ai_artifacts.discarded_by_ai_authority_migration"
+    ]
+    assert len(discard_events) == 1
+    assert set(discard_events[0].after_json["artifact_ids"]) == {
+        artifact_row["id"] for artifact_row in artifact_rows
+    }
+    with connect_database(database_path) as connection:
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 17
+        assert connection.execute(
+            "SELECT COUNT(*) FROM ai_artifacts WHERE task_id = ?",
+            (report.ai_task_id,),
+        ).fetchone()[0] == 0
+
+
+def test_v17_migration_recovers_invalid_current_authority_artifact_metadata(
+    tmp_path: Path,
+):
+    database_path, vault_path, application, _resume, report, approval = (
+        create_v16_approved_packet(tmp_path)
+    )
+    assert report.ai_task_id is not None
+    with connect_database(database_path) as connection:
+        artifact_id = connection.execute(
+            """
+            SELECT id FROM ai_artifacts
+            WHERE task_id = ? AND artifact_type = 'context'
+            """,
+            (report.ai_task_id,),
+        ).fetchone()[0]
+        connection.execute("DROP TRIGGER validate_ai_artifact_metadata_update")
+        connection.execute(
+            "UPDATE ai_artifacts SET schema_version = 'forged' WHERE id = ?",
+            (artifact_id,),
+        )
+
+    migrated = CareerOpsRepository(database_path, vault_path)
+    migrated.initialize()
+    migrated.initialize()
+
+    restored_report = migrated.get_report(report.id)
+    restored_application = migrated.get_application(application.id)
+    assert restored_report.ai_task_id is None
+    assert restored_report.pdf_sha256 is None
+    assert restored_application.status == "ready_for_review"
+    assert restored_application.approval_id is None
+    assert restored_application.latest_report_id is None
+    assert migrated.get_approval(approval.id).id == approval.id
+    assert len(
+        [
+            event
+            for event in migrated.list_audit_events()
+            if event.event_type
+            == "application.approval_invalidated_by_ai_authority_migration"
+        ]
+    ) == 1
+    discard_events = [
+        event
+        for event in migrated.list_audit_events()
+        if event.event_type == "ai_artifacts.discarded_by_ai_authority_migration"
+    ]
+    assert len(discard_events) == 1
+    assert discard_events[0].after_json["artifact_ids"] == [artifact_id]
+    assert discard_events[0].before_json["artifacts"][0][
+        "rejection_reasons"
+    ] == ["schema_version"]
+    with connect_database(database_path) as connection:
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 17
+        assert connection.execute(
+            "SELECT COUNT(*) FROM ai_artifacts WHERE id = ?", (artifact_id,)
+        ).fetchone()[0] == 0
+
+
+def test_v17_migration_audits_blob_metadata_without_blocking_recovery(
+    tmp_path: Path,
+):
+    database_path, vault_path, application, _resume, report, _approval = (
+        create_v16_approved_packet(tmp_path)
+    )
+    assert report.ai_task_id is not None
+    with connect_database(database_path) as connection:
+        artifact_id = connection.execute(
+            "SELECT id FROM ai_artifacts WHERE task_id = ? ORDER BY id LIMIT 1",
+            (report.ai_task_id,),
+        ).fetchone()[0]
+        connection.execute("DROP TRIGGER validate_ai_artifact_metadata_update")
+        connection.execute(
+            "UPDATE ai_artifacts SET schema_version = ? WHERE id = ?",
+            (sqlite3.Binary(b"forged"), artifact_id),
+        )
+
+    migrated = CareerOpsRepository(database_path, vault_path)
+    migrated.initialize()
+    migrated.initialize()
+
+    assert migrated.get_application(application.id).status == "ready_for_review"
+    discard_events = [
+        event
+        for event in migrated.list_audit_events()
+        if event.event_type == "ai_artifacts.discarded_by_ai_authority_migration"
+    ]
+    assert len(discard_events) == 1
+    assert discard_events[0].before_json["artifacts"][0]["schema_version"] == {
+        "encoding": "hex",
+        "sqlite_storage_class": "blob",
+        "value": b"forged".hex(),
+    }
+    with connect_database(database_path) as connection:
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 17
+        assert connection.execute(
+            "SELECT COUNT(*) FROM ai_artifacts WHERE id = ?", (artifact_id,)
+        ).fetchone()[0] == 0
+
+
+def test_v17_migration_upgrades_valid_storage_v1_before_evaluating_authority(
+    tmp_path: Path,
+):
+    database_path, vault_path, application, _resume, report, approval = (
+        create_v16_approved_packet(tmp_path)
+    )
+    assert report.ai_task_id is not None
+    legacy_root = (
+        vault_path
+        / "ai-tasks"
+        / report.ai_task_id
+        / "attempt-v16-interrupted-upgrade"
+    )
+    legacy_root.mkdir(parents=True, exist_ok=True)
+    with connect_database(database_path) as connection:
+        rows = connection.execute(
+            "SELECT * FROM ai_artifacts WHERE task_id = ? ORDER BY id",
+            (report.ai_task_id,),
+        ).fetchall()
+        assert len(rows) == 3
+        connection.execute("DROP TRIGGER validate_ai_artifact_storage_update")
+        for row in rows:
+            legacy_path = legacy_root / f"{row['id']}.json"
+            legacy_path.write_bytes(Path(row["path"]).read_bytes())
+            connection.execute(
+                "UPDATE ai_artifacts SET path = ?, storage_version = 1 WHERE id = ?",
+                (str(legacy_path.resolve()), row["id"]),
+            )
+        next(
+            migration
+            for migration_version, migration in MIGRATIONS
+            if migration_version == 15
+        )(connection)
+
+    migrated = CareerOpsRepository(database_path, vault_path)
+    migrated.initialize()
+    migrated.initialize()
+
+    restored_application = migrated.get_application(application.id)
+    restored_report = migrated.get_report(report.id)
+    assert restored_application.status == "approved"
+    assert restored_application.approval_id == approval.id
+    assert restored_report.ai_task_id == report.ai_task_id
+    with connect_database(database_path) as connection:
+        upgraded = connection.execute(
+            "SELECT path, storage_version FROM ai_artifacts WHERE task_id = ?",
+            (report.ai_task_id,),
+        ).fetchall()
+    assert len(upgraded) == 3
+    assert all(row["storage_version"] == 2 for row in upgraded)
+    assert all(
+        Path(row["path"]).resolve().relative_to(vault_path.resolve()).parts[0]
+        == "ai-artifacts"
+        for row in upgraded
+    )
+    assert not any(
+        event.event_type.endswith("_by_ai_authority_migration")
+        for event in migrated.list_audit_events()
+    )
+
+
+@pytest.mark.parametrize(
+    "blob_manifest", [False, True], ids=["json-manifest", "blob-manifest"]
+)
+def test_v17_discard_repairs_dependent_task_input_manifest(
+    tmp_path: Path, blob_manifest: bool
+):
+    database_path, vault_path, application, _resume, report, _approval = (
+        create_v16_approved_packet(tmp_path)
+    )
+    assert report.ai_task_id is not None
+    dependent_task_id = "ait_dependent_on_discarded_artifact"
+    with connect_database(database_path) as connection:
+        artifact_id = connection.execute(
+            """
+            SELECT id FROM ai_artifacts
+            WHERE task_id = ? AND artifact_type = 'context'
+            """,
+            (report.ai_task_id,),
+        ).fetchone()[0]
+        source_task = connection.execute(
+            "SELECT * FROM ai_tasks WHERE id = ?", (report.ai_task_id,)
+        ).fetchone()
+        connection.execute(
+            """
+            INSERT INTO ai_tasks (
+                id, application_id, task_type, provider_config_id,
+                prompt_template_id, prompt_sha256, input_artifact_ids_json,
+                status, privacy_mode, provider_binding_json,
+                provider_binding_sha256, started_at, claim_expires_at,
+                invocation_started_at, completed_at, error_summary,
+                claim_token, created_at, updated_at
+            ) VALUES (?, ?, 'analyze_jd', ?, 'analyze_jd_v1', ?, ?, 'pending',
+                      ?, ?, ?, NULL, NULL, NULL, NULL, '', NULL, ?, ?)
+            """,
+            (
+                dependent_task_id,
+                application.id,
+                source_task["provider_config_id"],
+                source_task["prompt_sha256"],
+                json.dumps([artifact_id], separators=(",", ":")),
+                source_task["privacy_mode"],
+                source_task["provider_binding_json"],
+                source_task["provider_binding_sha256"],
+                "9999-01-01T00:00:00+00:00",
+                "9999-01-01T00:00:00+00:00",
+            ),
+        )
+        connection.execute(
+            """
+            INSERT INTO ai_task_input_artifacts (
+                task_id, artifact_id, ordinal, created_at
+            ) VALUES (?, ?, 0, ?)
+            """,
+            (dependent_task_id, artifact_id, "9999-01-01T00:00:00+00:00"),
+        )
+        if blob_manifest:
+            connection.execute(
+                "UPDATE ai_tasks SET input_artifact_ids_json = ? WHERE id = ?",
+                (sqlite3.Binary(b"\xff"), dependent_task_id),
+            )
+        connection.execute("DROP TRIGGER validate_ai_artifact_metadata_update")
+        connection.execute(
+            "UPDATE ai_artifacts SET schema_version = 'forged' WHERE id = ?",
+            (artifact_id,),
+        )
+
+    migrated = CareerOpsRepository(database_path, vault_path)
+    migrated.initialize()
+    packet = migrated.get_application_packet_snapshot(application.id)
+
+    assert packet.latest_ai_task is not None
+    assert packet.latest_ai_task.id == dependent_task_id
+    assert packet.latest_ai_task.input_artifact_ids == []
+    with connect_database(database_path) as connection:
+        dependent = connection.execute(
+            "SELECT input_artifact_ids_json FROM ai_tasks WHERE id = ?",
+            (dependent_task_id,),
+        ).fetchone()
+        links = connection.execute(
+            "SELECT * FROM ai_task_input_artifacts WHERE task_id = ?",
+            (dependent_task_id,),
+        ).fetchall()
+    assert dependent["input_artifact_ids_json"] == "[]"
+    assert links == []
+    discard_event = next(
+        event
+        for event in migrated.list_audit_events()
+        if event.event_type == "ai_artifacts.discarded_by_ai_authority_migration"
+    )
+    assert discard_event.before_json["artifacts"][0]["artifact_type"] == "context"
+    assert discard_event.before_json["removed_input_links"] == [
+        {
+            "artifact_id": artifact_id,
+            "created_at": "9999-01-01T00:00:00+00:00",
+            "ordinal": 0,
+            "task_id": dependent_task_id,
+        }
+    ]
+    assert discard_event.after_json["updated_task_manifests"] == [
+        {
+            "after": [],
+            "before": (
+                {
+                    "encoding": "hex",
+                    "sqlite_storage_class": "blob",
+                    "value": "ff",
+                }
+                if blob_manifest
+                else [artifact_id]
+            ),
+            "task_id": dependent_task_id,
+        }
+    ]
+
+
+@pytest.mark.parametrize(
+    "mismatch", ["report_json_only", "wrong_task_type"]
+)
+def test_v17_cleanup_does_not_depend_on_valid_authority_metadata(
+    tmp_path: Path,
+    mismatch: str,
+):
+    database_path, vault_path, application, _resume, report, _approval = (
+        create_v16_approved_packet(tmp_path, mismatch=mismatch)
+    )
+    assert report.ai_task_id is not None
+    with connect_database(database_path) as connection:
+        artifact_id = connection.execute(
+            "SELECT id FROM ai_artifacts WHERE task_id = ? ORDER BY id LIMIT 1",
+            (report.ai_task_id,),
+        ).fetchone()[0]
+        connection.execute("DROP TRIGGER validate_ai_artifact_metadata_update")
+        connection.execute(
+            "UPDATE ai_artifacts SET schema_version = 'forged' WHERE id = ?",
+            (artifact_id,),
+        )
+
+    migrated = CareerOpsRepository(database_path, vault_path)
+    migrated.initialize()
+    migrated.initialize()
+
+    assert migrated.get_application(application.id).status == "ready_for_review"
+    with connect_database(database_path) as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM ai_artifacts WHERE id = ?", (artifact_id,)
+        ).fetchone()[0] == 0
+
+
+def test_v17_low_level_initialization_requires_vault_before_evaluating_approval(
+    tmp_path: Path,
+):
+    database_path, _vault_path, application, _resume, _report, approval = (
+        create_v16_approved_packet(tmp_path, mismatch="report_json_only")
+    )
+
+    with pytest.raises(ValueError, match="configured repository vault"):
+        initialize_database(database_path)
+
+    with closing(sqlite3.connect(database_path)) as connection:
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 16
+        assert "ai_task_id" not in {
+            row[1] for row in connection.execute("PRAGMA table_info(reports)")
+        }
+        restored = connection.execute(
+            "SELECT approval_id, status FROM applications WHERE id = ?",
+            (application.id,),
+        ).fetchone()
+    assert restored == (approval.id, "approved")
+
+
+def test_v17_records_unprovable_submitted_packet_as_historical(
+    tmp_path: Path,
+):
+    database_path, vault_path, application, _resume, report, approval = (
+        create_v16_approved_packet(tmp_path, submitted=True)
+    )
+    assert report.ai_task_id is not None
+    with connect_database(database_path) as connection:
+        artifact_id = connection.execute(
+            "SELECT id FROM ai_artifacts WHERE task_id = ? ORDER BY id LIMIT 1",
+            (report.ai_task_id,),
+        ).fetchone()[0]
+        connection.execute("DROP TRIGGER validate_ai_artifact_metadata_update")
+        connection.execute(
+            "UPDATE ai_artifacts SET schema_version = 'forged' WHERE id = ?",
+            (artifact_id,),
+        )
+
+    migrated = CareerOpsRepository(database_path, vault_path)
+    migrated.initialize()
+    migrated.initialize()
+
+    restored = migrated.get_application(application.id)
+    restored_report = migrated.get_report(report.id)
+    assert restored.status == "submitted_manual"
+    assert restored.submission_state == "submitted_manual"
+    assert restored.approval_id == approval.id
+    assert restored.latest_report_id == report.id
+    assert restored_report.ai_task_id is None
+    assert restored_report.pdf_sha256 is None
+    assert not any(
+        event.event_type
+        == "application.approval_invalidated_by_ai_authority_migration"
+        for event in migrated.list_audit_events()
+    )
+    historical_events = [
+        event
+        for event in migrated.list_audit_events()
+        if event.event_type
+        == "application.submitted_authority_unprovable_by_ai_migration"
+    ]
+    assert len(historical_events) == 1
+    assert historical_events[0].before_json == {
+        "approval_id": approval.id,
+        "latest_report_id": report.id,
+        "status": "submitted_manual",
+        "submission_state": "submitted_manual",
+    }
+    assert historical_events[0].after_json == {
+        "approval_id": approval.id,
+        "latest_report_id": report.id,
+        "reason": "AI approval authority could not be proven during v17 migration",
+        "status": "submitted_manual",
+        "submission_state": "submitted_manual",
+    }
 
 
 @pytest.mark.parametrize(
