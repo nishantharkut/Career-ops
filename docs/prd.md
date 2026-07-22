@@ -8,6 +8,8 @@ CareerOps is a private, single-user application desk for India-focused internshi
 
 The product is a workbench, not a chat interface or submission bot. It does not claim to predict hiring outcomes.
 
+CareerOps does not reproduce, scrape, calibrate to, or claim equivalence with Resume Worded or any proprietary employer ATS score. Its fit score is a local, explainable aid tied to visible matches, gaps, risks, and recommendations. It is not a `90-95` promise, an employer score, or a hiring outcome.
+
 ## User And Operating Assumptions
 
 The v0 user:
@@ -77,7 +79,7 @@ Only a successfully verified managed runtime is `local_private`. A generic or un
 
 #### Deterministic Verifier
 
-The deterministic provider is available without an AI runtime. It performs useful safety and human-review checks with `is_ai=false`, `verifier_only`, and no data transfer. The UI labels its command `Run verifier`. It is not represented as semantic AI review.
+The deterministic provider is available without an AI runtime. It performs useful safety and human-review checks with `is_ai=false`, `verifier_only`, and no data transfer. The UI labels its command `Run verifier`. It is not represented as semantic AI review, and its output cannot authorize approval or submission.
 
 ### Review And Approval
 
@@ -85,7 +87,7 @@ The UI polls pending/running tasks, shows completed or blocked findings, and req
 
 `analyze_fit` materializes a report bound to the current application, JD snapshot, and resume. Deterministic gates cover stale or missing PDF state, parse failure, evidence gaps, unsupported metrics/titles, private or NDA-sensitive wording, rejected claims, and secret-like material. The local fit value is diagnostic and accompanied by matches, gaps, risks, and recommendations; it is not an employer result.
 
-Approval is available only for the current report with zero blockers and a current rendered PDF. The approval stores application ID, resume version ID, report ID, PDF SHA-256, timestamp, and note. Current JD ownership is enforced through the report binding.
+Approval is available only when the current zero-blocker report was materialized by a completed `analyze_fit` task whose persisted provider binding has `is_ai=true`, and the selected resume has a current rendered PDF. A verifier-only report is diagnostic and cannot satisfy this authority check. The approval stores application ID, resume version ID, report ID, PDF SHA-256, timestamp, and note. Current JD ownership is enforced through the report binding.
 
 The user exports the current JD, resume PDF, report, and approval. Artifact endpoints verify current ownership and bytes before download.
 

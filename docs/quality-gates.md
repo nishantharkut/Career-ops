@@ -37,6 +37,8 @@ The verifier and integration tests prove that:
 
 The deterministic provider is tested as `is_ai=false` and `verifier_only`. UI tests require `Run verifier` and reject AI labelling for this fallback.
 
+Approval tests require the current report to come from a completed `analyze_fit` task with a persisted `is_ai=true` provider binding. Verifier-only output cannot authorize approval or manual submission.
+
 ## Concurrency And Recovery
 
 Repository, orchestrator, API, and task-runner tests cover:
@@ -63,6 +65,7 @@ Tests verify:
 - a report is bound to application ID, JD snapshot ID, and selected resume ID
 - requirement or resume selection changes invalidate the current report and approval state
 - approval requires the current zero-blocker report and current PDF bytes
+- approval rejects a report without completed AI-backed `analyze_fit` provenance, including verifier-only output
 - approval stores application ID, resume ID, report ID, and PDF SHA-256
 - export routes reject stale report/approval ownership or changed PDF bytes
 - manual submission is impossible before approval and remains bound to the approved packet

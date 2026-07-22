@@ -99,7 +99,7 @@ Draft creation takes a completed `suggest_resume_edits` task and accepted verifi
 
 ### Approve, Export, Submit
 
-Approval revalidates report provenance, zero blockers, selected resume ID, current JD snapshot ID, PDF path and checksum, and current packet state. It records application ID, resume ID, report ID, and PDF SHA-256.
+Approval revalidates report provenance, zero blockers, selected resume ID, current JD snapshot ID, PDF path and checksum, and current packet state. The report must be the side effect of a completed `analyze_fit` task whose persisted provider binding has `is_ai=true`; verifier-only output cannot authorize approval or the submission that depends on it. Approval records application ID, resume ID, report ID, and PDF SHA-256.
 
 JD, PDF, report, and approval exports revalidate that each artifact is current. Manual submission checks the complete approval/report/resume/JD relationship and current PDF bytes before recording `submitted_manual`.
 
@@ -141,7 +141,7 @@ Before availability and every run, the provider checks the authority signature a
 
 ### Deterministic Verifier
 
-The deterministic provider implements the same typed task interface but has `is_ai=false`, `data_leaves_machine=false`, and `verifier_only`. It provides structured safety fallback output and human-review decisions without semantic model execution.
+The deterministic provider implements the same typed task interface but has `is_ai=false`, `data_leaves_machine=false`, and `verifier_only`. It provides structured safety fallback output and human-review decisions without semantic model execution. Its report output is diagnostic only and is excluded from approval authority.
 
 ## Concurrency And Recovery
 

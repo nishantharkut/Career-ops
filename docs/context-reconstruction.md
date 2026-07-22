@@ -1,6 +1,6 @@
 # CareerOps Context Reconstruction
 
-Status: approved reconstruction basis, amended with the AI-first correction. Implementation architecture still requires user approval before the next build phase.
+Status: approved reconstruction basis, amended with the AI-first correction; implementation proceeded from this basis.
 
 This document reconstructs context from the current CareerOps thread and the historical application/resume session. It is not a product design, PRD, architecture, or implementation plan.
 

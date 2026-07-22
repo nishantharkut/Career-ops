@@ -41,6 +41,16 @@ The API, Ollama runtime, runtime inspector, and Docker socket proxy use `restart
 
 Do not use ephemeral container files as the source of truth. Do not remove the named model volume unless a full model download is intended.
 
+## Recommended Low-Cost Host
+
+The approved v0 hosting decision is one self-contained Docker deployment on an Always Free or inexpensive VPS whose CPU, memory, disk, and bandwidth can support the selected Ollama model. FastAPI and React stay on one origin; SQLite, the vault, and backups use persistent host volumes; the Ollama model uses its persistent named volume. Copy checksummed CareerOps backups off the host on a schedule. If the host cannot run the selected model, AI is available only through another explicitly configured reachable provider; no paid or cloud provider is added implicitly.
+
+These alternatives are not v0:
+
+- Serverless containers or functions with ephemeral storage do not provide the stable SQLite, vault, model, or background-task process boundary this release uses.
+- A hosted database or object store is not the primary source of truth. Splitting the implemented SQLite-plus-vault transaction and backup topology across managed services would require a different persistence design and can add recurring cost.
+- A hosted page does not bridge to Ollama or another worker on the browser machine's `localhost`. That path is fragile across browser origin, HTTPS, firewall, process identity, and runtime-attestation boundaries.
+
 ## Managed Ollama Boundary
 
 ### Bootstrap
@@ -80,7 +90,7 @@ Managed Ollama is included in the Compose topology. It requires no paid API and 
 
 Codex uses a ChatGPT-authenticated CLI and is always `cloud_external`. The standard Linux image does not install Codex, persist a Codex home, or authenticate an account. Setting `CAREEROPS_CODEX_ENABLED=true` alone normally discovers no Codex provider in hosted Linux. A custom deployment must explicitly install the native CLI, provide the supported identity descriptor, authenticate the intended `CODEX_HOME`, and persist that home outside the read-only image. Each task still requires the UI acknowledgement and sends bounded task data to OpenAI.
 
-The deterministic verifier is always local, available, and not AI. It keeps safety checks usable when an AI provider is unavailable, but it does not claim semantic model review.
+The deterministic verifier is always local, available, and not AI. It keeps safety checks usable when an AI provider is unavailable, but it does not claim semantic model review and cannot authorize approval or submission without an AI-backed `analyze_fit` report.
 
 There is no OpenAI API adapter, bundled API key, paid scoring service, remote resume analyzer, or hidden cloud AI fallback in v0.
 

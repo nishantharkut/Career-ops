@@ -115,6 +115,7 @@ When the latest report has zero blockers, select `Approve packet`.
 
 The API rechecks that:
 
+- the report came from a completed AI-backed `analyze_fit` task, not the verifier-only provider
 - the report belongs to the application
 - the report's resume ID is the selected resume ID
 - the report's JD snapshot ID is the current JD snapshot ID
@@ -149,7 +150,7 @@ Open `History` to inspect immutable application versions such as task completion
 
 ## Blockers And Recovery
 
-- **No provider:** Choose the verifier for safety checks or configure Codex/managed Ollama. The verifier is not an AI substitute.
+- **No provider:** Choose the verifier for safety checks or configure Codex/managed Ollama. The verifier is not an AI substitute and cannot authorize approval or submission.
 - **Codex acknowledgement missing:** The run command stays disabled. Check the per-run acknowledgement only after reviewing the selected provider and task.
 - **Task failed:** Read `error_summary`; fix availability, timeout, or output shape, then launch a new task. Do not switch identities inside the failed task.
 - **Blocked finding:** Reject it or add/correct evidence and run a new task. It cannot be accepted.

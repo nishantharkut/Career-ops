@@ -128,13 +128,15 @@ npm run build:web
 npm run serve:hosted
 ```
 
-CareerOps copies the configured executable to `<runtime root>\<runtime instance>\bin\ollama.exe`, sets only the implemented child environment (`OLLAMA_HOST`, `OLLAMA_NO_CLOUD`, `OLLAMA_MODELS`, loopback proxy exclusions, and required Windows process variables), starts `ollama.exe serve`, verifies the executable hash, process start identity, PID, loopback listener, firewall rule, and exact installed model, then signs the capability in the API process.
+CareerOps copies the configured executable to `<runtime root>\<runtime instance>\bin\ollama.exe`. The Python-to-PowerShell launcher copies only this host allowlist: `SystemRoot`, `WINDIR`, `COMSPEC`, `PATHEXT`, `PATH`, `PSModulePath`, `TEMP`, and `TMP`. It sets `NO_PROXY` and `no_proxy` itself for loopback access; those values are not inherited.
+
+PowerShell clears the final Ollama child environment. Its base set is only the available `PATH`, `SystemRoot`, `WINDIR`, `TEMP`, and `TMP` values, plus `OLLAMA_HOST`, `OLLAMA_NO_CLOUD`, `OLLAMA_MODELS`, `NO_PROXY`, and `no_proxy`. Application auth, API keys, Codex state or tokens, and unrelated environment variables are excluded from both stages. CareerOps then starts `ollama.exe serve`, verifies the executable hash, process start identity, PID, loopback listener, firewall rule, and exact installed model, and signs the capability in the API process.
 
 On clean API shutdown, CareerOps verifies and stops that exact process, verifies that the listener is gone, removes its firewall rule, and removes the launch record. The model directory and instance files remain. Failed launches run journal recovery; cleanup refuses to stop a process or remove a rule whose recorded identity no longer matches.
 
 ## Verifier-Only Provider
 
-`Deterministic verifier` is always registered. It is a useful local safety fallback for structured checks and human-review decisions. Its records use `verifier_only`, `data_leaves_machine=false`, and `is_ai=false`. The UI command is `Run verifier`; it is never presented as an AI review.
+`Deterministic verifier` is always registered. It is a useful local safety fallback for structured checks and human-review decisions. Its records use `verifier_only`, `data_leaves_machine=false`, and `is_ai=false`. The UI command is `Run verifier`; it is never presented as an AI review. Verifier-only output cannot authorize approval or submission. Approval requires the current report to come from a completed AI-backed `analyze_fit` task.
 
 ## Hosted Boundary
 
