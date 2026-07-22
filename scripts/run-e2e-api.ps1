@@ -18,10 +18,9 @@ New-Item -ItemType Directory -Path $RunRoot | Out-Null
 
 $env:CAREEROPS_DB_PATH = Join-Path $RunRoot "careerops.db"
 $env:CAREEROPS_VAULT_PATH = Join-Path $RunRoot "vault"
-$env:CAREEROPS_AI_TEST_PROVIDER = "mock"
 
 try {
-    & ".\.venv\Scripts\python.exe" -m uvicorn apps.api.careerops_api.main:app --host 127.0.0.1 --port 8765
+    & ".\.venv\Scripts\python.exe" -m uvicorn tests.e2e_api_app:create_e2e_app --factory --host 127.0.0.1 --port 8765
     exit $LASTEXITCODE
 }
 finally {

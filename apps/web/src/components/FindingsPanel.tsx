@@ -21,6 +21,10 @@ function isDecisionEligible(finding: AiFindingRecord): boolean {
   return finding.verifier_state === "verified";
 }
 
+function isRejectionEligible(finding: AiFindingRecord): boolean {
+  return finding.verifier_state === "verified" || finding.verifier_state === "blocked";
+}
+
 function isDraftEligible(finding: AiFindingRecord): boolean {
   return finding.finding_type === "resume_edit_suggestion" && finding.verifier_state === "verified";
 }
@@ -103,6 +107,7 @@ export default function FindingsPanel({
         <ul className="issue-list">
           {findings.map((finding) => {
             const decisionEligible = isDecisionEligible(finding);
+            const rejectionEligible = isRejectionEligible(finding);
             const resumeSuggestion = finding.finding_type === "resume_edit_suggestion";
             return (
               <li key={finding.id}>
@@ -116,26 +121,30 @@ export default function FindingsPanel({
                 ) : (
                   <span>Blocked by verifier</span>
                 )}
-                {decisionEligible && finding.decision === "pending" && (
+                {(decisionEligible || rejectionEligible) && finding.decision === "pending" && (
                   <div className="actions">
-                    <button
-                      type="button"
-                      disabled={readOnly || busy !== ""}
-                      onClick={() => void decide(finding, "accepted")}
-                    >
-                      <Check aria-hidden="true" size={16} /> {resumeSuggestion ? "Accept suggestion" : "Accept"}
-                    </button>
-                    <button
-                      type="button"
-                      className="secondary"
-                      disabled={readOnly || busy !== ""}
-                      onClick={() => void decide(finding, "rejected")}
-                    >
-                      <X aria-hidden="true" size={16} /> {resumeSuggestion ? "Reject suggestion" : "Reject"}
-                    </button>
+                    {decisionEligible && (
+                      <button
+                        type="button"
+                        disabled={readOnly || busy !== ""}
+                        onClick={() => void decide(finding, "accepted")}
+                      >
+                        <Check aria-hidden="true" size={16} /> {resumeSuggestion ? "Accept suggestion" : "Accept"}
+                      </button>
+                    )}
+                    {rejectionEligible && (
+                      <button
+                        type="button"
+                        className="secondary"
+                        disabled={readOnly || busy !== ""}
+                        onClick={() => void decide(finding, "rejected")}
+                      >
+                        <X aria-hidden="true" size={16} /> {resumeSuggestion || !decisionEligible ? "Reject suggestion" : "Reject"}
+                      </button>
+                    )}
                   </div>
                 )}
-                {decisionEligible && finding.decision !== "pending" && <span>Decision: {finding.decision}</span>}
+                {finding.decision !== "pending" && <span>Decision: {finding.decision}</span>}
               </li>
             );
           })}

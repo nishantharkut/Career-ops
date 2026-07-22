@@ -958,29 +958,33 @@ def test_default_provider_setup_is_fail_closed_and_keeps_codex_identities_distin
     assert ollama["model"] == "fixture-local"
 
 
-def test_default_provider_setup_registers_mock_only_for_explicit_e2e_mode(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize("configured_value", ["mock", "not-a-provider"])
+def test_default_provider_setup_never_registers_mock_from_test_environment(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    configured_value: str,
 ):
     repo = make_repo(tmp_path)
-    monkeypatch.setenv("CAREEROPS_AI_TEST_PROVIDER", "mock")
+    monkeypatch.setenv("CAREEROPS_AI_TEST_PROVIDER", configured_value)
 
     providers = TestClient(create_app(repo)).get("/ai/providers").json()
+
+    assert all(item["provider_kind"] != "mock" for item in providers)
+    assert all(item["display_name"] != "E2E mock provider" for item in providers)
+
+
+def test_e2e_app_factory_registers_local_mock_provider(tmp_path: Path):
+    from tests.e2e_api_app import create_e2e_app
+
+    repo = make_repo(tmp_path)
+
+    providers = TestClient(create_e2e_app(repo)).get("/ai/providers").json()
 
     mock = next(item for item in providers if item["provider_kind"] == "mock")
     assert mock["display_name"] == "E2E mock provider"
     assert mock["available"] is True
     assert mock["privacy_mode"] == "local_private"
     assert mock["data_leaves_machine"] is False
-
-
-def test_default_provider_setup_rejects_unknown_test_provider(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-):
-    repo = make_repo(tmp_path)
-    monkeypatch.setenv("CAREEROPS_AI_TEST_PROVIDER", "not-a-provider")
-
-    with pytest.raises(RuntimeError, match="CAREEROPS_AI_TEST_PROVIDER is invalid"):
-        create_app(repo)
 
 
 def test_default_provider_setup_always_lists_unmanaged_ollama_without_network(

@@ -220,6 +220,16 @@ async function openFixtureDesk(page: Page, state: DeskFixtureState): Promise<voi
   await expect(page.getByRole("heading", { name: "AI review" })).toBeVisible();
 }
 
+test("empty application desk shows the start state", async ({ page }) => {
+  await page.route(`${API_ORIGIN}/applications`, async (route) => {
+    await route.fulfill({ status: 200, json: [] });
+  });
+
+  await page.goto("/");
+
+  await expect(page.getByText("No applications yet. Add a JD to start a packet.")).toBeVisible();
+});
+
 test("day-one application desk blocks risky resume and submits clean packet", async ({ page }) => {
   await page.goto("/");
 
@@ -254,7 +264,7 @@ test("day-one application desk blocks risky resume and submits clean packet", as
   await page.getByRole("button", { name: "Approve packet" }).click();
   await page.getByRole("button", { name: "Mark submitted manually" }).click();
 
-  await expect(page.getByText("Submitted manually", { exact: true })).toBeVisible();
+  await expect(page.locator(".workspace .status")).toHaveText("Submitted manually");
 });
 
 for (const width of [320, 375, 414, 768, 1280]) {

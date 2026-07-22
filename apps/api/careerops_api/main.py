@@ -47,7 +47,6 @@ from careerops.ai.orchestrator import AiOrchestrator
 from careerops.ai.providers.base import AiProvider
 from careerops.ai.providers.codex import discover_codex_providers
 from careerops.ai.providers.deterministic import DeterministicProvider
-from careerops.ai.providers.mock import MockProvider
 from careerops.ai.providers.ollama import OllamaProvider
 from careerops.analyzers.fit import analyze_fit
 from careerops.core.models import (
@@ -194,78 +193,6 @@ def _default_deterministic_output(request: ProviderRequest) -> Mapping[str, Any]
     raise ValueError("Unsupported deterministic task")
 
 
-_E2E_UNSAFE_METRIC = "Improved service throughput by 70+ percent without verified evidence."
-_E2E_RESUME_SOURCE = "Worked on healthcare automation testing and release support with evidence-backed claims only."
-_E2E_RESUME_REPLACEMENT = "Worked on healthcare automation testing, release support, and production software delivery."
-
-
-def _e2e_mock_output(request: ProviderRequest) -> Mapping[str, Any]:
-    context = json.loads(request.context_text())
-    linked_evidence = context.get("linked_evidence", [])
-    evidence_ids = [
-        item["id"]
-        for item in linked_evidence
-        if isinstance(item, dict) and isinstance(item.get("id"), str)
-    ]
-    evidence_refs = evidence_ids[:1]
-
-    if request.task_type == "analyze_jd":
-        return {
-            "task_type": "analyze_jd",
-            "normalized_title": "Data Science Intern",
-            "normalized_company": "Swiggy",
-            "normalized_location": "Bangalore",
-            "responsibilities": [],
-            "required_skills": ["Python", "SQL"],
-            "preferred_skills": [],
-            "keywords": ["Machine learning"],
-            "uncertainties": [],
-        }
-    if request.task_type == "analyze_fit":
-        selected_resume = context.get("selected_resume", {})
-        source_text = selected_resume.get("source_text", "") if isinstance(selected_resume, dict) else ""
-        return {
-            "task_type": "analyze_fit",
-            "score": 90,
-            "matches": [_E2E_UNSAFE_METRIC] if _E2E_UNSAFE_METRIC in source_text else [],
-            "gaps": [],
-            "risks": [],
-            "recommendations": [],
-        }
-    if request.task_type == "suggest_resume_edits":
-        return {
-            "task_type": "suggest_resume_edits",
-            "suggestions": [
-                {
-                    "source_text": _E2E_RESUME_SOURCE,
-                    "replacement_text": _E2E_RESUME_REPLACEMENT,
-                    "reason": "Aligns the wording with the evidence",
-                    "evidence_refs": evidence_refs,
-                }
-            ],
-        }
-    if request.task_type == "draft_cover_letter":
-        return {
-            "task_type": "draft_cover_letter",
-            "plain_text": "I am excited to apply.",
-            "evidence_refs": evidence_refs,
-        }
-    if request.task_type == "review_claims":
-        return {
-            "task_type": "review_claims",
-            "decisions": [
-                {
-                    "claim_id": claim_id,
-                    "decision": "supported",
-                    "reason": "Matches the supplied evidence",
-                    "evidence_refs": evidence_refs,
-                }
-                for claim_id in request.expected_claim_ids
-            ],
-        }
-    raise ValueError("Unsupported E2E mock task")
-
-
 def _default_provider_registry(
     repository: CareerOpsRepository,
     environment: Mapping[str, str] | None = None,
@@ -280,18 +207,6 @@ def _default_provider_registry(
         display_name="Deterministic verifier",
         enabled=True,
     )
-
-    test_provider = environment.get("CAREEROPS_AI_TEST_PROVIDER", "").strip()
-    if test_provider:
-        if test_provider != "mock":
-            raise RuntimeError("CAREEROPS_AI_TEST_PROVIDER is invalid")
-        _register_provider(
-            repository,
-            registry,
-            MockProvider(_e2e_mock_output),
-            display_name="E2E mock provider",
-            enabled=True,
-        )
 
     ollama = OllamaProvider(
         endpoint=environment.get("CAREEROPS_OLLAMA_URL")

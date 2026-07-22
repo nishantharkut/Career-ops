@@ -106,10 +106,13 @@ async function packet(page: Page, applicationId: string): Promise<ApplicationPac
   return apiJson<ApplicationPacket>(page, `/applications/${applicationId}/packet`);
 }
 
-async function selectedApplicationId(page: Page): Promise<string> {
+async function selectApplication(page: Page, applicationId: string): Promise<void> {
   const applications = await apiJson<Array<{ id: string }>>(page, "/applications");
-  expect(applications).toHaveLength(1);
-  return applications[0].id;
+  const applicationIndex = applications.findIndex((application) => application.id === applicationId);
+  expect(applicationIndex).toBeGreaterThanOrEqual(0);
+  const applicationButtons = page.locator("aside[aria-label='Applications'] ul li button");
+  await expect(applicationButtons).toHaveCount(applications.length);
+  await applicationButtons.nth(applicationIndex).click();
 }
 
 async function chooseMockProvider(page: Page): Promise<void> {
@@ -176,20 +179,29 @@ async function downloadArtifact(
   return content;
 }
 
-test("real mock provider completes the day-one application workflow with durable provenance", async ({ page }) => {
+test("real mock provider completes the day-one application workflow with durable provenance", async ({ page }, testInfo) => {
   test.setTimeout(240_000);
   const browserErrors = trackBrowserErrors(page);
+  let applicationId: string;
+  let profileFactId: string;
+  const profileFactKey = `production_software_delivery_e2e_${testInfo.repeatEachIndex}`;
 
   await test.step("create an application and analyze the JD through the persisted mock task runner", async () => {
     await page.goto("/");
-    await expect(page.getByText("No applications yet. Add a JD to start a packet.")).toBeVisible();
     await page.getByRole("button", { name: "Add application" }).click();
     await page.getByLabel("Company").fill("Swiggy");
     await page.getByLabel("Role title").fill("Data Science Intern");
     await page.getByLabel("Location").fill("Bangalore");
     await page.getByLabel("Source URL").fill("https://example.com/swiggy-data-science-intern");
     await page.getByLabel("JD text").fill(readFileSync(sampleJdPath, "utf-8"));
+    const createdResponse = page.waitForResponse((response) => {
+      const url = new URL(response.url());
+      return response.request().method() === "POST" && url.pathname === "/applications";
+    });
     await page.getByRole("button", { name: "Save application" }).click();
+    const created = await createdResponse;
+    expect(created.status()).toBe(201);
+    applicationId = (await created.json() as { id: string }).id;
     await expect(page.getByRole("heading", { name: "Swiggy" })).toBeVisible();
 
     await runAiTask(page, "analyze_jd", "Analyze JD", "Completed");
@@ -218,25 +230,53 @@ test("real mock provider completes the day-one application workflow with durable
     await page.getByRole("button", { name: "Add evidence" }).click();
     await expect(page.getByText("Verified public evidence", { exact: true })).toBeVisible();
 
-    await page.getByLabel("Fact key").fill("production_software_delivery");
+    await page.getByLabel("Fact key").fill(profileFactKey);
     await page.getByLabel("Fact value").fill(safeResumeReplacement);
     await page.getByLabel("Fact verification").selectOption("verified");
     await page.getByLabel("Fact privacy").selectOption("public");
+    const factResponse = page.waitForResponse((response) => {
+      const url = new URL(response.url());
+      return response.request().method() === "POST" && url.pathname === "/profile-facts";
+    });
     await page.getByRole("button", { name: "Add profile fact" }).click();
-    await expect(page.getByText(/production_software_delivery/)).toBeVisible();
+    const createdFact = await factResponse;
+    expect(createdFact.status()).toBe(201);
+    profileFactId = (await createdFact.json() as { id: string }).id;
+    await expect(page.getByText(profileFactKey, { exact: true })).toBeVisible();
   });
 
-  const applicationId = await selectedApplicationId(page);
   const riskyResumePath = makeRiskyResume();
 
   await test.step("block the unsafe 70+ output and reject the risky resume", async () => {
     await uploadResume(page, "Risky 70+ resume", riskyResumePath);
     await renderSelectedResume(page);
     await runAiTask(page, "analyze_fit", "Run AI review", "Blocked");
-    await expect(page.getByText("unsupported_metric in provider output", { exact: true })).toBeVisible();
-    await expect(page.getByText("Blocked by verifier", { exact: true }).first()).toBeVisible();
+    let unsupportedMetric = page
+      .locator("section[aria-label='AI findings'] li")
+      .filter({ hasText: "unsupported_metric in provider output" });
+    await expect(unsupportedMetric.getByText("Blocked by verifier", { exact: true })).toBeVisible();
     await expect(page.getByText(unsafeMetricClaim, { exact: true })).toHaveCount(0);
-    await expect(page.locator("section[aria-label='AI findings']").getByRole("button", { name: /Accept|Reject/ })).toHaveCount(0);
+    await expect(unsupportedMetric.getByRole("button", { name: /Accept/ })).toHaveCount(0);
+    await unsupportedMetric.getByRole("button", { name: "Reject suggestion" }).click();
+    await expect(unsupportedMetric.getByText("Decision: rejected", { exact: true })).toBeVisible();
+
+    const blockedTask = (await packet(page, applicationId)).latest_ai_task!;
+    const blockedFindings = await apiJson<AiFindingRecord[]>(page, `/ai-tasks/${blockedTask.id}/findings`);
+    expect(blockedFindings).toContainEqual(expect.objectContaining({
+      claim_text: "unsupported_metric in provider output",
+      verifier_state: "blocked",
+      decision: "rejected"
+    }));
+
+    await page.reload();
+    await selectApplication(page, applicationId);
+    await expect(page.getByRole("heading", { name: "Swiggy" })).toBeVisible();
+    unsupportedMetric = page
+      .locator("section[aria-label='AI findings'] li")
+      .filter({ hasText: "unsupported_metric in provider output" });
+    await expect(unsupportedMetric.getByText("Blocked by verifier", { exact: true })).toBeVisible();
+    await expect(unsupportedMetric.getByText("Decision: rejected", { exact: true })).toBeVisible();
+    await expect(unsupportedMetric.getByRole("button", { name: /Accept|Reject/ })).toHaveCount(0);
   });
 
   let parentResume: ResumeRecord;
@@ -345,8 +385,9 @@ test("real mock provider completes the day-one application workflow with durable
     await runAiTask(page, "review_claims", "Review claims", "Completed");
     claimTask = (await packet(page, applicationId)).latest_ai_task!;
     const findings = await apiJson<AiFindingRecord[]>(page, `/ai-tasks/${claimTask.id}/findings`);
-    expect(findings).toHaveLength(1);
-    const finding = findings[0];
+    const finding = findings.find((candidate) => candidate.payload.claim_id === profileFactId);
+    expect(finding).toBeDefined();
+    if (!finding) throw new Error(`No claim review finding for ${profileFactId}`);
     acceptedClaimFindingId = finding.id;
     expect(finding).toMatchObject({
       task_id: claimTask.id,
@@ -358,10 +399,12 @@ test("real mock provider completes the day-one application workflow with durable
         evidence_refs: [(await packet(page, applicationId)).evidence[0].id]
       })
     });
-    await expect(page.getByText(/: supported$/)).toBeVisible();
-    await expect(page.getByText("Matches the supplied evidence", { exact: true })).toBeVisible();
-    await page.getByRole("button", { name: "Accept", exact: true }).click();
-    await expect(page.getByText("Decision: accepted", { exact: true })).toBeVisible();
+    const ownClaim = page
+      .locator("section[aria-label='AI findings'] li")
+      .filter({ hasText: `${profileFactId}: supported` });
+    await expect(ownClaim.getByText("Matches the supplied evidence", { exact: true })).toBeVisible();
+    await ownClaim.getByRole("button", { name: "Accept", exact: true }).click();
+    await expect(ownClaim.getByText("Decision: accepted", { exact: true })).toBeVisible();
   });
 
   let approvalId: string;
@@ -394,6 +437,7 @@ test("real mock provider completes the day-one application workflow with durable
   await test.step("reload from the API and prove submission, provenance, and histories remain", async () => {
     const beforeReload = await packet(page, applicationId);
     await page.reload();
+    await selectApplication(page, applicationId);
     await expect(page.getByRole("heading", { name: "Swiggy" })).toBeVisible();
     await expect(page.getByText("Submitted manually", { exact: true }).first()).toBeVisible();
     await expect(page.getByText("Swiggy verified draft", { exact: true })).toBeVisible();

@@ -391,6 +391,102 @@ describe("AI tasks panel", () => {
     expect(await screen.findByText("Decision: accepted")).toBeInTheDocument();
   });
 
+  test("rejects a blocked suggestion without ever offering acceptance and restores the decision", async () => {
+    let decision: "pending" | "rejected" = "pending";
+    const blockedFinding = () => ({
+      id: "aif_blocked",
+      task_id: "ait_1",
+      finding_type: "unsupported_metric",
+      severity: "blocking",
+      claim_text: "unsupported_metric in provider output",
+      evidence_item_id: null,
+      recommendation: "Remove the unsupported metric",
+      verifier_state: "blocked",
+      decision,
+      payload: {},
+      created_at: "",
+      updated_at: ""
+    });
+    const onPacketChanged = vi.fn();
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/ai/providers")) return jsonResponse([]);
+      if (url.endsWith("/ai-tasks/ait_1/findings")) return jsonResponse([blockedFinding()]);
+      if (url.endsWith("/ai-findings/aif_blocked/decision")) {
+        expect(JSON.parse(String(init?.body))).toEqual({ decision: "rejected" });
+        decision = "rejected";
+        return jsonResponse(blockedFinding());
+      }
+      throw new Error(`Unhandled request: ${url}`);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const first = render(
+      <AiTasksPanel
+        applicationId="app_1"
+        initialTask={task({ task_type: "analyze_fit", status: "blocked" })}
+        onPacketChanged={onPacketChanged}
+      />
+    );
+
+    expect(await screen.findByText("Blocked by verifier")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /Accept/ })).not.toBeInTheDocument();
+    await userEvent.click(screen.getByRole("button", { name: "Reject suggestion" }));
+    expect(await screen.findByText("Decision: rejected")).toBeInTheDocument();
+    expect(onPacketChanged).toHaveBeenCalledTimes(1);
+
+    first.unmount();
+    render(
+      <AiTasksPanel
+        applicationId="app_1"
+        initialTask={task({ task_type: "analyze_fit", status: "blocked" })}
+        onPacketChanged={vi.fn()}
+      />
+    );
+    expect(await screen.findByText("Decision: rejected")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /Accept|Reject/ })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Create resume draft" })).not.toBeInTheDocument();
+  });
+
+  test("disables rejection for a blocked finding when read-only", async () => {
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.endsWith("/ai/providers")) return jsonResponse([]);
+      if (url.endsWith("/ai-tasks/ait_1/findings")) {
+        return jsonResponse([{
+          id: "aif_blocked",
+          task_id: "ait_1",
+          finding_type: "unsupported_metric",
+          severity: "blocking",
+          claim_text: "unsupported_metric in provider output",
+          evidence_item_id: null,
+          recommendation: "Remove the unsupported metric",
+          verifier_state: "blocked",
+          decision: "pending",
+          payload: {},
+          created_at: "",
+          updated_at: ""
+        }]);
+      }
+      throw new Error(`Unhandled request: ${url}`);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    render(
+      <AiTasksPanel
+        applicationId="app_1"
+        initialTask={task({ task_type: "analyze_fit", status: "blocked" })}
+        readOnly
+        onPacketChanged={vi.fn()}
+      />
+    );
+
+    expect(await screen.findByText("Blocked by verifier")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /Accept/ })).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Reject suggestion" })).toBeDisabled();
+    expect(fetchMock.mock.calls.some(([input]) => String(input).includes("/decision"))).toBe(false);
+  });
+
   test("disables AI task, finding decision, and draft controls when read-only", async () => {
     const completed = task({ task_type: "suggest_resume_edits", status: "completed" });
     const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
@@ -428,6 +524,7 @@ describe("AI tasks panel", () => {
   test("accepts one safe suggestion, blocks unsafe findings, and creates a child draft", async () => {
     const completed = task({ task_type: "suggest_resume_edits", status: "completed", provider_config_id: "provider_selected" });
     let safeDecision = "pending";
+    let blockedDecision = "pending";
     const draftBodies: unknown[] = [];
     const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
       const url = String(input);
@@ -435,12 +532,16 @@ describe("AI tasks panel", () => {
       if (url.endsWith("/ai-tasks/ait_1/findings")) {
         return jsonResponse([
           { id: "aif_safe", task_id: "ait_1", finding_type: "resume_edit_suggestion", severity: "info", claim_text: "Use evidence-backed wording", evidence_item_id: null, recommendation: "Replace the sentence", verifier_state: "verified", decision: safeDecision, payload: { source_text: "Old", replacement_text: "New", reason: "Clearer", evidence_refs: [] }, created_at: "", updated_at: "" },
-          { id: "aif_blocked", task_id: "ait_1", finding_type: "resume_edit_suggestion", severity: "blocking", claim_text: "Invent a metric", evidence_item_id: null, recommendation: "Add 90%", verifier_state: "blocked", decision: "pending", payload: {}, created_at: "", updated_at: "" }
+          { id: "aif_blocked", task_id: "ait_1", finding_type: "resume_edit_suggestion", severity: "blocking", claim_text: "Invent a metric", evidence_item_id: null, recommendation: "Add 90%", verifier_state: "blocked", decision: blockedDecision, payload: {}, created_at: "", updated_at: "" }
         ]);
       }
       if (url.endsWith("/ai-findings/aif_safe/decision")) {
         safeDecision = "accepted";
         return jsonResponse({ id: "aif_safe", task_id: "ait_1", finding_type: "resume_edit_suggestion", severity: "info", claim_text: "Use evidence-backed wording", evidence_item_id: null, recommendation: "Replace the sentence", verifier_state: "verified", decision: "accepted", payload: { source_text: "Old", replacement_text: "New", reason: "Clearer", evidence_refs: [] }, created_at: "", updated_at: "" });
+      }
+      if (url.endsWith("/ai-findings/aif_blocked/decision")) {
+        blockedDecision = "rejected";
+        return jsonResponse({ id: "aif_blocked", task_id: "ait_1", finding_type: "resume_edit_suggestion", severity: "blocking", claim_text: "Invent a metric", evidence_item_id: null, recommendation: "Add 90%", verifier_state: "blocked", decision: blockedDecision, payload: {}, created_at: "", updated_at: "" });
       }
       if (url.endsWith("/applications/app_1/resume-drafts")) {
         draftBodies.push(JSON.parse(String(init?.body)));
@@ -458,13 +559,16 @@ describe("AI tasks panel", () => {
     await userEvent.click(screen.getByRole("button", { name: "Accept suggestion" }));
     await waitFor(() => expect(screen.getByRole("button", { name: "Create resume draft" })).toBeEnabled());
     expect(onPacketChanged).toHaveBeenCalledTimes(1);
+    await userEvent.click(screen.getByRole("button", { name: "Reject suggestion" }));
+    expect(await screen.findByText("Decision: rejected")).toBeInTheDocument();
+    expect(onPacketChanged).toHaveBeenCalledTimes(2);
     await userEvent.clear(screen.getByLabelText("Draft name"));
     await userEvent.type(screen.getByLabelText("Draft name"), "Tailored draft");
     await userEvent.click(screen.getByRole("button", { name: "Create resume draft" }));
 
     expect(await screen.findByText("Draft created. Render it before review.")).toBeInTheDocument();
     expect(draftBodies).toEqual([{ task_id: "ait_1", finding_ids: ["aif_safe"], name: "Tailored draft" }]);
-    expect(onPacketChanged).toHaveBeenCalledTimes(2);
+    expect(onPacketChanged).toHaveBeenCalledTimes(3);
     expect(screen.queryByRole("button", { name: "Reject suggestion" })).not.toBeInTheDocument();
   });
 
