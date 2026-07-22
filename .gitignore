@@ -35,6 +35,8 @@ coverage/
 playwright-report/
 test-results/
 vault-e2e/
+.playwright-cli/
+output/playwright/
 
 # Logs
 *.log
