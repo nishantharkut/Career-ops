@@ -185,13 +185,13 @@ export default function App() {
 
   async function handleAnalyze() {
     if (!selectedId) return;
-    setBusy("Analyzing");
+    setBusy("Running verifier");
     setActionError("");
     try {
       await analyzeApplication(selectedId);
       await refreshData();
     } catch (analyzeError) {
-      setActionError(errorMessage(analyzeError, "Analyze failed."));
+      setActionError(errorMessage(analyzeError, "Verifier failed."));
     } finally {
       setBusy("");
     }
@@ -293,6 +293,11 @@ export default function App() {
           resume={packet?.selected_resume ?? null}
           report={packet?.latest_report ?? null}
           approval={packet?.approval ?? null}
+          approvalEligibility={packet?.approval_eligibility ?? {
+            eligible: false,
+            reason: "Run AI review for the current JD and resume before approval.",
+            ai_task_id: null
+          }}
           submitted={Boolean(packet && packet.application.submission_state !== "not_submitted")}
           busy={busy}
           error={reviewError}

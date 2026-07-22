@@ -27,6 +27,7 @@ from careerops.ai.providers.base import build_provider_result
 from careerops.core.repository import CareerOpsRepository
 from careerops.core.status import PrivacyMode
 from careerops.resumes.drafts import create_verified_resume_draft
+from tests.ai_approval_helpers import create_ai_approval_report
 
 
 PARENT_SOURCE = (
@@ -1657,14 +1658,7 @@ def _make_application_approved(
         parse_status="parsed",
         page_count=1,
     )
-    application = repo.get_application(application_id)
-    report = repo.save_report(
-        application_id=application_id,
-        resume_version_id=parent_id,
-        jd_snapshot_id=application.jd_snapshot_id,
-        fit={"score": 100},
-        risks={"blockers": [], "warnings": []},
-    )
+    report = create_ai_approval_report(repo, application_id, parent_id)
     repo.approve_application(application_id, report.id, "Reviewed")
 
 

@@ -12,6 +12,7 @@ from fastapi.testclient import TestClient
 
 from apps.api.careerops_api.main import create_app
 from careerops.core.repository import CareerOpsRepository, MAX_PERSISTED_JSON_BYTES
+from tests.ai_approval_helpers import create_ai_approval_report
 
 
 def make_repo(tmp_path: Path) -> CareerOpsRepository:
@@ -421,13 +422,7 @@ def test_requirements_reject_approved_and_submitted_packet_mutation(
     repo = make_repo(tmp_path)
     application = create_application(repo)
     resume = select_resume(repo, application.id)
-    report = repo.save_report(
-        application_id=application.id,
-        resume_version_id=resume.id,
-        jd_snapshot_id=application.jd_snapshot_id,
-        fit={"score": 100},
-        risks={"blockers": [], "warnings": []},
-    )
+    report = create_ai_approval_report(repo, application.id, resume.id)
     repo.approve_application(application.id, report.id, "Reviewed")
     if terminal_state == "submitted":
         repo.mark_submitted_manual(application.id, "Submitted")

@@ -877,6 +877,19 @@ def _add_provider_container_image_bindings(connection: sqlite3.Connection) -> No
     _add_ai_prompt_and_artifact_authority(connection)
 
 
+def _add_report_ai_approval_authority(connection: sqlite3.Connection) -> None:
+    report_columns = _column_names(connection, "reports")
+    if "ai_task_id" not in report_columns:
+        connection.execute(
+            "ALTER TABLE reports ADD COLUMN ai_task_id TEXT REFERENCES ai_tasks(id)"
+        )
+    if "pdf_sha256" not in report_columns:
+        connection.execute("ALTER TABLE reports ADD COLUMN pdf_sha256 TEXT")
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS idx_reports_ai_task ON reports(ai_task_id)"
+    )
+
+
 MIGRATIONS: tuple[tuple[int, Migration], ...] = (
     (1, _add_application_role_type),
     (2, _add_application_submitted_at),
@@ -894,6 +907,7 @@ MIGRATIONS: tuple[tuple[int, Migration], ...] = (
     (14, _add_ai_prompt_and_artifact_authority),
     (15, _add_ai_artifact_storage_version),
     (16, _add_provider_container_image_bindings),
+    (17, _add_report_ai_approval_authority),
 )
 
 LATEST_SCHEMA_VERSION = MIGRATIONS[-1][0]

@@ -26,6 +26,7 @@ from careerops.ai.providers.base import (
 from careerops.ai.context import load_prompt_template
 from careerops.core.repository import CareerOpsRepository
 from careerops.core.status import PrivacyMode
+from tests.ai_approval_helpers import create_ai_approval_report
 
 
 VALID_OUTPUTS: dict[str, dict[str, Any]] = {
@@ -442,13 +443,7 @@ def test_enqueue_rejects_read_only_application_before_provider_access(
     repo = make_repo(tmp_path)
     application = create_application(repo)
     resume = select_resume(repo, application.id)
-    report = repo.save_report(
-        application_id=application.id,
-        resume_version_id=resume.id,
-        jd_snapshot_id=application.jd_snapshot_id,
-        fit={"score": 100},
-        risks={"blockers": [], "warnings": []},
-    )
+    report = create_ai_approval_report(repo, application.id, resume.id)
     repo.approve_application(application.id, report.id, "Reviewed")
     if submitted:
         repo.mark_submitted_manual(application.id, "Submitted")
@@ -466,7 +461,7 @@ def test_enqueue_rejects_read_only_application_before_provider_access(
     with pytest.raises(ValueError, match="read-only"):
         orchestrator.enqueue(application.id, "analyze_jd", config.id)
 
-    assert repo.list_ai_tasks(application.id) == []
+    assert len(repo.list_ai_tasks(application.id)) == 1
 
 
 def test_enqueue_rechecks_application_after_provider_availability_callback(
@@ -477,13 +472,7 @@ def test_enqueue_rechecks_application_after_provider_availability_callback(
     repo = make_repo(tmp_path)
     application = create_application(repo)
     resume = select_resume(repo, application.id)
-    report = repo.save_report(
-        application_id=application.id,
-        resume_version_id=resume.id,
-        jd_snapshot_id=application.jd_snapshot_id,
-        fit={"score": 100},
-        risks={"blockers": [], "warnings": []},
-    )
+    report = create_ai_approval_report(repo, application.id, resume.id)
     status = availability()
     config = create_provider_config(repo, binding_status=status)
 
@@ -506,7 +495,7 @@ def test_enqueue_rechecks_application_after_provider_availability_callback(
 
     assert provider.calls == 1
     assert repo.get_application(application.id).approval_id is not None
-    assert repo.list_ai_tasks(application.id) == []
+    assert len(repo.list_ai_tasks(application.id)) == 1
 
 
 @pytest.mark.parametrize("submitted", [False, True], ids=["approved", "submitted"])
@@ -518,13 +507,7 @@ def test_run_cancels_queued_task_when_application_becomes_read_only_before_provi
     repo = make_repo(tmp_path)
     application = create_application(repo)
     resume = select_resume(repo, application.id)
-    report = repo.save_report(
-        application_id=application.id,
-        resume_version_id=resume.id,
-        jd_snapshot_id=application.jd_snapshot_id,
-        fit={"score": 100},
-        risks={"blockers": [], "warnings": []},
-    )
+    report = create_ai_approval_report(repo, application.id, resume.id)
     config = create_provider_config(repo)
 
     class TrackingProvider:
@@ -1950,16 +1933,12 @@ def test_analyze_jd_cannot_enqueue_for_an_approved_packet(tmp_path: Path):
     repo = make_repo(tmp_path)
     application = create_application(repo)
     resume = select_resume(repo, application.id, "Python developer")
-    report = repo.save_report(
-        application_id=application.id,
-        resume_version_id=resume.id,
-        jd_snapshot_id=application.jd_snapshot_id,
-        fit={"score": 90},
-        risks={"blockers": [], "warnings": []},
-    )
+    report = create_ai_approval_report(repo, application.id, resume.id)
     repo.approve_application(application.id, report.id, "Reviewed")
     before_application = repo.get_application(application.id)
     before_jd = repo.get_jd_snapshot(application.jd_snapshot_id)
+    before_tasks = repo.list_ai_tasks(application.id)
+    before_versions = repo.list_application_versions(application.id)
     config = create_provider_config(repo)
     provider = ScriptedProvider(availability())
     orchestrator = AiOrchestrator(repo, {config.id: provider})
@@ -1968,10 +1947,10 @@ def test_analyze_jd_cannot_enqueue_for_an_approved_packet(tmp_path: Path):
         orchestrator.enqueue(application.id, "analyze_jd", config.id)
 
     assert provider.calls == 0
-    assert repo.list_ai_tasks(application.id) == []
+    assert repo.list_ai_tasks(application.id) == before_tasks
     assert repo.get_application(application.id) == before_application
     assert repo.get_jd_snapshot(application.jd_snapshot_id) == before_jd
-    assert repo.list_application_versions(application.id) == []
+    assert repo.list_application_versions(application.id) == before_versions
 
 
 def test_suggest_resume_edits_creates_findings_without_resume_mutation(tmp_path: Path):

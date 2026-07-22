@@ -25,6 +25,7 @@ from careerops.ai.contracts import (
 from careerops.ai.providers.base import ProviderUnavailableError, build_provider_result
 from careerops.core.repository import CareerOpsRepository
 from careerops.core.status import PrivacyMode
+from tests.ai_approval_helpers import create_ai_approval_report
 
 
 VALID_OUTPUTS: dict[str, dict[str, Any]] = {
@@ -708,13 +709,7 @@ def test_finding_decision_api_rejects_application_that_became_read_only(
     )
     assert orchestrator.run(task.id).status.value == "completed"
     finding = repo.list_ai_findings(task.id)[0]
-    report = repo.save_report(
-        application_id=application.id,
-        resume_version_id=resume.id,
-        jd_snapshot_id=application.jd_snapshot_id,
-        fit={"score": 100},
-        risks={"blockers": [], "warnings": []},
-    )
+    report = create_ai_approval_report(repo, application.id, resume.id)
     repo.approve_application(application.id, report.id, "Reviewed")
     if submitted:
         repo.mark_submitted_manual(application.id, "Submitted")
@@ -1210,13 +1205,7 @@ def test_packet_snapshot_fails_closed_on_broken_aggregate_binding(
     repo = make_repo(tmp_path)
     application = create_application(repo)
     resume = select_resume(repo, application.id)
-    report = repo.save_report(
-        application_id=application.id,
-        resume_version_id=resume.id,
-        jd_snapshot_id=application.jd_snapshot_id,
-        fit={"score": 100},
-        risks={"blockers": [], "warnings": []},
-    )
+    report = create_ai_approval_report(repo, application.id, resume.id)
     task = None
     if mismatch == "task_input_manifest":
         from careerops.ai.orchestrator import AiOrchestrator
@@ -1438,13 +1427,7 @@ def test_artifact_downloads_are_bound_to_latest_packet_and_verify_integrity(tmp_
     repo = make_repo(tmp_path)
     application = create_application(repo, company="Example/Corp")
     resume = select_resume(repo, application.id)
-    report = repo.save_report(
-        application_id=application.id,
-        resume_version_id=resume.id,
-        jd_snapshot_id=application.jd_snapshot_id,
-        fit={"score": 80},
-        risks={"blockers": [], "warnings": []},
-    )
+    report = create_ai_approval_report(repo, application.id, resume.id)
     approval = repo.approve_application(application.id, report.id, "Reviewed")
     client = TestClient(create_app(repo, provider_registry={}))
 
@@ -1495,22 +1478,12 @@ def test_approval_artifact_fails_closed_for_every_packet_or_pdf_mismatch(
     repo = make_repo(tmp_path)
     application = create_application(repo)
     resume = select_resume(repo, application.id)
-    report = repo.save_report(
-        application_id=application.id,
-        resume_version_id=resume.id,
-        jd_snapshot_id=application.jd_snapshot_id,
-        fit={"score": 100},
-        risks={"blockers": [], "warnings": []},
-    )
+    report = create_ai_approval_report(repo, application.id, resume.id)
     approval = repo.approve_application(application.id, report.id, "Reviewed")
     foreign_application = create_application(repo, company="Foreign Corp")
     foreign_resume = select_resume(repo, foreign_application.id)
-    foreign_report = repo.save_report(
-        application_id=foreign_application.id,
-        resume_version_id=foreign_resume.id,
-        jd_snapshot_id=foreign_application.jd_snapshot_id,
-        fit={"score": 100},
-        risks={"blockers": [], "warnings": []},
+    foreign_report = create_ai_approval_report(
+        repo, foreign_application.id, foreign_resume.id
     )
     foreign_approval = repo.approve_application(
         foreign_application.id, foreign_report.id, "Foreign review"
@@ -1599,13 +1572,7 @@ def test_artifact_routes_reject_missing_stale_and_non_vault_paths(tmp_path: Path
     assert client.get("/applications/app_missing/artifacts/jd").status_code == 404
 
     resume = select_resume(repo, application.id)
-    report = repo.save_report(
-        application_id=application.id,
-        resume_version_id=resume.id,
-        jd_snapshot_id=application.jd_snapshot_id,
-        fit={"score": 80},
-        risks={"blockers": [], "warnings": []},
-    )
+    report = create_ai_approval_report(repo, application.id, resume.id)
     repo.approve_application(application.id, report.id, "Reviewed")
     foreign_application = create_application(repo, company="Foreign Corp")
     foreign_resume = select_resume(repo, foreign_application.id)

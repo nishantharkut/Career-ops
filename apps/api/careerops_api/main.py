@@ -947,6 +947,11 @@ def _packet_payload(snapshot: ApplicationPacketSnapshot) -> dict[str, Any]:
             if snapshot.latest_ai_task is not None
             else None
         ),
+        "approval_eligibility": {
+            "eligible": snapshot.approval_eligibility.eligible,
+            "reason": snapshot.approval_eligibility.reason,
+            "ai_task_id": snapshot.approval_eligibility.ai_task_id,
+        },
         "evidence": [_evidence_payload(item) for item in snapshot.evidence],
         "versions": [
             _application_version_payload(item) for item in snapshot.versions
@@ -1401,6 +1406,8 @@ def _report_payload(report: Report) -> dict[str, Any]:
         "application_id": report.application_id,
         "resume_version_id": report.resume_version_id,
         "jd_snapshot_id": report.jd_snapshot_id,
+        "ai_task_id": report.ai_task_id,
+        "pdf_sha256": report.pdf_sha256,
         "fit": _sanitize_public_json(report.fit),
         "risks": _sanitize_public_json(report.risks),
         "blocking_issue_count": report.blocking_issue_count,

@@ -159,6 +159,8 @@ function packetFixture(state: DeskFixtureState) {
       application_id: application.id,
       resume_version_id: "res_fixture",
       jd_snapshot_id: "jd_fixture",
+      ai_task_id: "ait_fixture",
+      pdf_sha256: "b".repeat(64),
       blocking_issue_count: 0,
       warning_count: 1,
       fit: { score: 88 },
@@ -167,6 +169,11 @@ function packetFixture(state: DeskFixtureState) {
     },
     approval: null,
     latest_ai_task: state === "unavailable" ? null : taskFixture(state),
+    approval_eligibility: {
+      eligible: false,
+      reason: "Run AI review for the current JD and resume before approval.",
+      ai_task_id: null
+    },
     evidence: [],
     versions: [{
       id: "apv_fixture",
@@ -230,7 +237,7 @@ test("empty application desk shows the start state", async ({ page }) => {
   await expect(page.getByText("No applications yet. Add a JD to start a packet.")).toBeVisible();
 });
 
-test("day-one application desk blocks risky resume and submits clean packet", async ({ page }, testInfo) => {
+test("deterministic compatibility verifier reports risks but cannot approve or submit", async ({ page }, testInfo) => {
   const riskyResumePath = writeRiskyResume(testInfo.outputPath("risky_resume.tex"));
   const cleanResumePath = writeCleanResume(testInfo.outputPath("clean_resume.tex"));
   await page.goto("/");
@@ -251,7 +258,7 @@ test("day-one application desk blocks risky resume and submits clean packet", as
   await expect(page.getByText("Risky resume")).toBeVisible();
   await page.getByRole("button", { name: "Render PDF" }).click();
   await expect(page.getByText("rendered")).toBeVisible({ timeout: 60000 });
-  await page.getByRole("button", { name: "Analyze" }).click();
+  await page.getByLabel("Application and resume").getByRole("button", { name: "Run verifier" }).click();
   await expect(page.getByText("NDA-sensitive wording")).toBeVisible();
   await expect(page.getByRole("button", { name: "Approve packet" })).toBeDisabled();
 
@@ -261,12 +268,19 @@ test("day-one application desk blocks risky resume and submits clean packet", as
   await expect(page.getByText("Application resume")).toBeVisible();
   await page.getByRole("button", { name: "Render PDF" }).click();
   await expect(page.getByText("rendered")).toBeVisible({ timeout: 60000 });
-  await page.getByRole("button", { name: "Analyze" }).click();
-  await expect(page.getByText("0 blockers")).toBeVisible();
-  await page.getByRole("button", { name: "Approve packet" }).click();
-  await page.getByRole("button", { name: "Mark submitted manually" }).click();
+  await page.getByLabel("Application and resume").getByRole("button", { name: "Run verifier" }).click();
+  await expect(page.locator(".report p").filter({ hasText: "blockers" }).first()).toContainText("0 blockers");
+  await expect(page.getByText("Run AI review for the current JD and resume before approval.")).toBeVisible();
+  await expect(page.getByRole("button", { name: "Approve packet" })).toBeDisabled();
+  await expect(page.getByRole("button", { name: "Mark submitted manually" })).toBeDisabled();
 
-  await expect(page.locator(".workspace .status")).toHaveText("Submitted manually");
+  const applications = await page.request.get(`${API_ORIGIN}/applications`);
+  const [application] = await applications.json() as Array<{ id: string }>;
+  const packet = await page.request.get(`${API_ORIGIN}/applications/${application.id}/packet`);
+  expect(await packet.json()).toMatchObject({
+    approval: null,
+    approval_eligibility: { eligible: false, ai_task_id: null }
+  });
 });
 
 for (const width of [320, 375, 414, 768, 1280]) {

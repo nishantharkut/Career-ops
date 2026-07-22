@@ -121,7 +121,7 @@ export default function PacketWorkspace({
                 <RefreshCw aria-hidden="true" size={16} /> Render PDF
               </button>
               <button type="button" disabled={readOnly || !resume?.pdf_sha256 || busy !== ""} onClick={() => void onAnalyze()}>
-                <Play aria-hidden="true" size={16} /> Analyze
+                <Play aria-hidden="true" size={16} /> Run verifier
               </button>
             </div>
           </form>

@@ -39,13 +39,14 @@ const TASK_COMMANDS: Record<AiTaskType, string> = {
 const TERMINAL_STATUSES = new Set(["completed", "blocked", "failed"]);
 
 function providerLabel(provider: AiProviderRecord): string {
+  let label = provider.display_name;
   if (provider.provider_kind === "codex" && provider.identity_name === "codex2") {
-    return "Codex account 2 (codex2)";
+    label = "Codex account 2 (codex2)";
   }
   if (provider.provider_kind === "codex" && provider.identity_name === "codex") {
-    return "Codex default (codex)";
+    label = "Codex default (codex)";
   }
-  return provider.display_name;
+  return provider.is_ai ? label : `${label} (Not AI)`;
 }
 
 function statusLabel(status: string): string {
@@ -235,6 +236,9 @@ export default function AiTasksPanel({ applicationId, initialTask, readOnly = fa
         <p id={unavailableReasonId} className="error" role="status" aria-live="polite">
           Provider unavailable: {unavailableReason}
         </p>
+      )}
+      {(selectedProvider?.is_ai === false || taskProvider?.is_ai === false) && (
+        <p className="notice" role="status">Not AI. This verifier cannot unlock approval.</p>
       )}
       {cloudCodex && (
         <>

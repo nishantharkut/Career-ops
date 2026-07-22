@@ -6,6 +6,7 @@ import pytest
 
 from apps.api.careerops_api.main import create_app
 from careerops.core.repository import CareerOpsRepository
+from tests.ai_approval_helpers import create_ai_approval_report
 
 
 def make_client(tmp_path: Path) -> TestClient:
@@ -46,17 +47,11 @@ def create_reviewable_packet(repo: CareerOpsRepository):
         page_count=1,
     )
     repo.select_resume(application.id, resume.id)
-    report = repo.save_report(
-        application_id=application.id,
-        resume_version_id=resume.id,
-        jd_snapshot_id=application.jd_snapshot_id,
-        fit={"score": 100},
-        risks={"blockers": [], "warnings": []},
-    )
+    report = create_ai_approval_report(repo, application.id, resume.id)
     return application, resume, report
 
 
-def test_day_one_api_flow_blocks_then_approves_clean_packet(tmp_path: Path):
+def test_verifier_endpoint_reports_risks_but_cannot_bypass_ai_approval(tmp_path: Path):
     client = make_client(tmp_path)
 
     create_response = client.post(
@@ -124,20 +119,26 @@ def test_day_one_api_flow_blocks_then_approves_clean_packet(tmp_path: Path):
     assert clean_report_response.status_code == 200
     clean_report = clean_report_response.json()
     assert clean_report["blocking_issue_count"] == 0
+    assert clean_report["ai_task_id"] is None
 
     approval_response = client.post(
         f"/applications/{application['id']}/approve",
         json={"report_id": clean_report["id"], "note": "Reviewed PDF and report"},
     )
-    assert approval_response.status_code == 200
-    assert approval_response.json()["approval_note"] == "Reviewed PDF and report"
+    assert approval_response.status_code == 409
 
     submitted_response = client.post(
         f"/applications/{application['id']}/mark-submitted",
         json={"note": "Submitted manually through form"},
     )
-    assert submitted_response.status_code == 200
-    assert submitted_response.json()["status"] == "submitted_manual"
+    assert submitted_response.status_code == 409
+    packet = client.get(f"/applications/{application['id']}/packet").json()
+    assert packet["latest_report"]["id"] == clean_report["id"]
+    assert packet["approval_eligibility"] == {
+        "eligible": False,
+        "reason": "Run AI review for the current JD and resume before approval.",
+        "ai_task_id": None,
+    }
 
 
 def test_health_endpoint(tmp_path: Path):

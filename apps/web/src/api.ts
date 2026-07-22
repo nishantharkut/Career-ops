@@ -49,6 +49,8 @@ export type ReportRecord = {
   application_id: string;
   resume_version_id: string;
   jd_snapshot_id: string;
+  ai_task_id: string | null;
+  pdf_sha256: string | null;
   blocking_issue_count: number;
   warning_count: number;
   fit: {
@@ -196,6 +198,12 @@ export type ApplicationVersionRecord = {
   created_at: string;
 };
 
+export type ApprovalEligibilityRecord = {
+  eligible: boolean;
+  reason: string;
+  ai_task_id: string | null;
+};
+
 export type ApplicationPacket = {
   application: ApplicationRecord;
   job_description: JobDescriptionRecord;
@@ -203,6 +211,7 @@ export type ApplicationPacket = {
   latest_report: ReportRecord | null;
   approval: ApprovalRecord | null;
   latest_ai_task: AiTaskRecord | null;
+  approval_eligibility: ApprovalEligibilityRecord;
   evidence: EvidenceRecord[];
   versions: ApplicationVersionRecord[];
 };

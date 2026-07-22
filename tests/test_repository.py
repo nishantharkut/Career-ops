@@ -5,6 +5,7 @@ import pytest
 
 from careerops.core.repository import CareerOpsRepository
 from careerops.core.status import ApplicationStatus
+from tests.ai_approval_helpers import create_ai_approval_report
 
 
 def make_repo(tmp_path: Path) -> CareerOpsRepository:
@@ -84,13 +85,7 @@ def test_selecting_new_resume_invalidates_existing_approval(tmp_path: Path):
     )
 
     repo.select_resume(application.id, first_resume.id)
-    report = repo.save_report(
-        application_id=application.id,
-        resume_version_id=first_resume.id,
-        jd_snapshot_id=application.jd_snapshot_id,
-        fit={"score": 88, "matched_requirements": ["C++"]},
-        risks={"blockers": [], "warnings": []},
-    )
+    report = create_ai_approval_report(repo, application.id, first_resume.id)
     approval = repo.approve_application(application.id, report.id, "Reviewed manually")
 
     assert repo.get_application(application.id).approval_id == approval.id
@@ -181,13 +176,7 @@ def test_atomic_resume_create_and_select_rejects_approved_application_without_in
         pdf_sha256=hashlib.sha256(pdf_path.read_bytes()).hexdigest(),
     )
     repo.select_resume(application.id, selected.id)
-    report = repo.save_report(
-        application_id=application.id,
-        resume_version_id=selected.id,
-        jd_snapshot_id=application.jd_snapshot_id,
-        fit={"score": 100},
-        risks={"blockers": [], "warnings": []},
-    )
+    report = create_ai_approval_report(repo, application.id, selected.id)
     repo.approve_application(application.id, report.id, "Reviewed")
     tex_path = repo.vault_path / "resumes" / "rejected-upload.tex"
     tex_path.write_text("Replacement", encoding="utf-8")

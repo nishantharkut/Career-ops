@@ -451,6 +451,69 @@ def create_aggregate_finding(
     return task, findings[0]
 
 
+def finalize_fit_report(
+    repo: CareerOpsRepository,
+    application_id: str,
+    resume_id: str,
+    provider_id: str,
+    *,
+    findings: list[dict[str, Any]] | None = None,
+):
+    application = repo.get_application(application_id)
+    provider = repo.get_ai_provider(provider_id)
+    prompt = load_prompt_template("analyze_fit")
+    task = repo.create_ai_task(
+        application_id=application_id,
+        task_type="analyze_fit",
+        provider_config_id=provider_id,
+        prompt_template_id=prompt.id,
+        prompt_sha256=prompt.sha256,
+        input_artifact_ids=[],
+        privacy_mode=provider.privacy_mode.value,
+        expected_provider_binding=provider.availability_binding,
+        expected_provider_binding_sha256=provider.availability_binding_sha256,
+    )
+    claim = claim_task(repo, task.id)
+    assert repo.begin_ai_task_invocation(task.id, claim) is True
+    context = json.dumps(
+        {
+            "task_type": "analyze_fit",
+            "job_description": {"snapshot_id": application.jd_snapshot_id},
+            "selected_resume": {"version_id": resume_id},
+        },
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    for artifact_type, content in (
+        ("context", context),
+        ("raw_output", b'{"task_type":"analyze_fit","score":90}'),
+        ("validated_output", b'{"task_type":"analyze_fit","score":90}'),
+    ):
+        write_attempt_artifact(
+            repo,
+            task.id,
+            claim,
+            artifact_type,
+            content,
+        )
+    completed = repo.finalize_ai_task_attempt(
+        task_id=task.id,
+        claim_token=claim,
+        terminal_status="completed",
+        error_summary="",
+        expected_jd_snapshot_id=application.jd_snapshot_id,
+        expected_resume_version_id=resume_id,
+        findings=findings or [],
+        success_payload={
+            "fit": {"score": 90},
+            "risks": {"blockers": [], "warnings": []},
+        },
+    )
+    report_id = repo.get_application(application_id).latest_report_id
+    assert report_id is not None
+    return completed, repo.get_report(report_id)
+
+
 def test_completed_finalization_rejects_empty_artifact_set(tmp_path: Path):
     repo = make_repo(tmp_path)
     application = create_application(repo)
@@ -531,13 +594,16 @@ def test_finalization_builds_provenance_from_repository_rows(tmp_path: Path):
     resume_dir = repo.vault_path / "resumes" / "ai-report"
     resume_dir.mkdir(parents=True)
     pdf_path = resume_dir / "resume.pdf"
+    tex_path = resume_dir / "resume.tex"
+    tex_bytes = b"repository-owned provenance source"
     pdf_bytes = b"%PDF-1.4\nrepository-owned provenance"
+    tex_path.write_bytes(tex_bytes)
     pdf_path.write_bytes(pdf_bytes)
     resume = repo.create_resume_version(
         name="Current resume",
         role_family="software",
-        tex_path=resume_dir / "resume.tex",
-        tex_sha256="a" * 64,
+        tex_path=tex_path,
+        tex_sha256=hashlib.sha256(tex_bytes).hexdigest(),
         pdf_path=pdf_path,
         pdf_sha256=hashlib.sha256(pdf_bytes).hexdigest(),
     )
@@ -546,11 +612,22 @@ def test_finalization_builds_provenance_from_repository_rows(tmp_path: Path):
     task = create_task(repo, application.id, provider.id)
     claim = claim_task(repo, task.id)
     assert repo.begin_ai_task_invocation(task.id, claim) is True
+    context = json.dumps(
+        {
+            "task_type": "analyze_fit",
+            "job_description": {"snapshot_id": application.jd_snapshot_id},
+            "selected_resume": {"version_id": resume.id},
+        },
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
     artifacts = {
-        kind: write_attempt_artifact(
-            repo, task.id, claim, kind, kind.encode("ascii")
+        kind: write_attempt_artifact(repo, task.id, claim, kind, content)
+        for kind, content in (
+            ("context", context),
+            ("raw_output", b"raw_output"),
+            ("validated_output", b"validated_output"),
         )
-        for kind in ("context", "raw_output", "validated_output")
     }
 
     completed = repo.finalize_ai_task_attempt(
@@ -590,6 +667,8 @@ def test_finalization_builds_provenance_from_repository_rows(tmp_path: Path):
         "provider_model": "fixture-v1",
     }
     assert completed.status == "completed"
+    assert report.ai_task_id == task.id
+    assert report.pdf_sha256 == resume.pdf_sha256
     assert report.fit["provenance"] == expected_provenance
     assert "provenance" not in report.fit["details"]
     version = repo.list_application_versions(application.id)[-1]
@@ -2214,12 +2293,9 @@ def prepare_approvable_application(repo: CareerOpsRepository, tmp_path: Path):
         pdf_sha256=hashlib.sha256(pdf_bytes).hexdigest(),
     )
     repo.select_resume(application.id, resume.id)
-    report = repo.save_report(
-        application_id=application.id,
-        resume_version_id=resume.id,
-        jd_snapshot_id=application.jd_snapshot_id,
-        fit={"score": 90},
-        risks={"blockers": [], "warnings": []},
+    provider = create_provider(repo)
+    _task, report = finalize_fit_report(
+        repo, application.id, resume.id, provider.id
     )
     return application, resume, report
 
@@ -2244,7 +2320,10 @@ def test_create_ai_task_rejects_read_only_application_transactionally(
     with pytest.raises(ValueError, match="approved or submitted"):
         create_bound_task(repo, application.id, provider.id, "analyze_jd")
 
-    assert repo.list_ai_tasks(application.id) == []
+    existing_tasks = repo.list_ai_tasks(application.id)
+    assert len(existing_tasks) == 1
+    assert existing_tasks[0].task_type == "analyze_fit"
+    assert existing_tasks[0].status == "completed"
 
 
 def test_approval_rejects_claimed_task_and_leaves_invocation_path_coherent(
@@ -2390,6 +2469,88 @@ def test_task_claim_commit_wins_race_with_approval(
     assert unchanged.approval_id is None
     assert unchanged.status == "ready_for_review"
     assert repo.get_ai_task(task.id).status == "running"
+
+
+def test_approval_waits_for_ai_report_and_task_completion_to_commit_together(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    repo = make_repo(tmp_path)
+    application, resume, _report = prepare_approvable_application(repo, tmp_path)
+    provider = create_provider(repo)
+    task = create_task(repo, application.id, provider.id)
+    claim = claim_task(repo, task.id)
+    assert repo.begin_ai_task_invocation(task.id, claim) is True
+    context = json.dumps(
+        {
+            "task_type": "analyze_fit",
+            "job_description": {"snapshot_id": application.jd_snapshot_id},
+            "selected_resume": {"version_id": resume.id},
+        },
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    for artifact_type, content in (
+        ("context", context),
+        ("raw_output", b"raw"),
+        ("validated_output", b"validated"),
+    ):
+        write_attempt_artifact(repo, task.id, claim, artifact_type, content)
+
+    finalizer = CareerOpsRepository(repo.database_path, repo.vault_path)
+    approver = CareerOpsRepository(repo.database_path, repo.vault_path)
+    report_created = Event()
+    release_finalizer = Event()
+    approval_started = Event()
+    created_report_id: list[str] = []
+    original_write_audit = finalizer._write_audit
+
+    def pause_after_report_insert(
+        connection, event_type, entity_type, entity_id, before, after
+    ):
+        original_write_audit(
+            connection, event_type, entity_type, entity_id, before, after
+        )
+        if event_type == "report.created" and entity_id != _report.id:
+            created_report_id.append(entity_id)
+            report_created.set()
+            assert release_finalizer.wait(2)
+
+    monkeypatch.setattr(finalizer, "_write_audit", pause_after_report_insert)
+
+    def finalize():
+        return finalizer.finalize_ai_task_attempt(
+            task_id=task.id,
+            claim_token=claim,
+            terminal_status="completed",
+            error_summary="",
+            expected_jd_snapshot_id=application.jd_snapshot_id,
+            expected_resume_version_id=resume.id,
+            findings=[],
+            success_payload={
+                "fit": {"score": 90},
+                "risks": {"blockers": [], "warnings": []},
+            },
+        )
+
+    def approve():
+        approval_started.set()
+        return approver.approve_application(
+            application.id, created_report_id[0], "Reviewed"
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        finalization = executor.submit(finalize)
+        assert report_created.wait(2)
+        approval = executor.submit(approve)
+        assert approval_started.wait(2)
+        assert not approval.done()
+        release_finalizer.set()
+        assert finalization.result(timeout=2).status == "completed"
+        assert approval.result(timeout=2).report_id == created_report_id[0]
+
+    committed_report = repo.get_report(created_report_id[0])
+    assert committed_report.ai_task_id == task.id
+    assert repo.get_application(application.id).approval_id is not None
 
 
 def test_invocation_wins_before_approval_and_application_stays_unapproved(
@@ -2595,7 +2756,7 @@ def test_non_ai_report_recursively_rejects_reserved_provenance(
     assert repo.get_application(application.id).latest_report_id is None
 
 
-def test_approval_rejects_forged_reserved_provenance_but_accepts_normal_report(
+def test_approval_rejects_forged_and_no_provenance_reports(
     tmp_path: Path,
 ):
     repo = make_repo(tmp_path)
@@ -2642,16 +2803,127 @@ def test_approval_rejects_forged_reserved_provenance_but_accepts_normal_report(
     with pytest.raises(ValueError, match="reserved AI provenance"):
         repo.approve_application(application.id, forged_report_id, "Reviewed")
 
-    normal = repo.save_report(
+    deterministic = repo.save_report(
         application_id=application.id,
         resume_version_id=resume.id,
         jd_snapshot_id=application.jd_snapshot_id,
         fit={"score": 90, "method": "deterministic"},
         risks={"blockers": [], "warnings": []},
     )
-    approval = repo.approve_application(application.id, normal.id, "Reviewed")
 
-    assert approval.report_id == normal.id
+    with pytest.raises(ValueError, match="AI review"):
+        repo.approve_application(application.id, deterministic.id, "Reviewed")
+
+    assert deterministic.ai_task_id is None
+    assert repo.get_application(application.id).approval_id is None
+
+
+def test_approval_rejects_completed_verifier_only_fit_report(tmp_path: Path):
+    repo = make_repo(tmp_path)
+    application, resume, _ai_report = prepare_approvable_application(repo, tmp_path)
+    verifier_binding = provider_binding(
+        provider_kind="deterministic_verifier",
+        model="careerops-verifier-v1",
+        privacy_mode="verifier_only",
+        is_ai=False,
+    )
+    verifier = repo.upsert_ai_provider(
+        provider_kind="deterministic_verifier",
+        display_name="Deterministic verifier",
+        privacy_mode="verifier_only",
+        endpoint="",
+        model="careerops-verifier-v1",
+        enabled=True,
+        availability_binding=verifier_binding,
+    )
+    task, report = finalize_fit_report(
+        repo, application.id, resume.id, verifier.id
+    )
+
+    with pytest.raises(ValueError, match="AI review"):
+        repo.approve_application(application.id, report.id, "Reviewed")
+
+    assert task.status == "completed"
+    assert report.ai_task_id == task.id
+    assert repo.get_application(application.id).approval_id is None
+
+
+def test_completed_ai_fit_report_for_current_pdf_is_approval_eligible(tmp_path: Path):
+    repo = make_repo(tmp_path)
+    application, resume, report = prepare_approvable_application(repo, tmp_path)
+
+    approval = repo.approve_application(application.id, report.id, "Reviewed")
+
+    assert report.ai_task_id is not None
+    assert report.pdf_sha256 == resume.pdf_sha256
+    assert approval.report_id == report.id
+
+
+@pytest.mark.parametrize(
+    "mismatch",
+    [
+        "task_status",
+        "task_type",
+        "report_task",
+        "provider_binding",
+        "report_pdf",
+    ],
+)
+def test_approval_rejects_stale_ai_task_report_and_provider_bindings(
+    tmp_path: Path, mismatch: str
+):
+    repo = make_repo(tmp_path)
+    application, _resume, report = prepare_approvable_application(repo, tmp_path)
+    assert report.ai_task_id is not None
+    task = repo.get_ai_task(report.ai_task_id)
+    provider = repo.get_ai_provider(task.provider_config_id)
+    other_task = (
+        create_task(repo, application.id, provider.id)
+        if mismatch == "report_task"
+        else None
+    )
+
+    with repo.connection() as connection:
+        if mismatch == "task_status":
+            connection.execute(
+                "UPDATE ai_tasks SET status = 'failed' WHERE id = ?", (task.id,)
+            )
+        elif mismatch == "task_type":
+            connection.execute(
+                "UPDATE ai_tasks SET task_type = 'analyze_jd' WHERE id = ?",
+                (task.id,),
+            )
+        elif mismatch == "report_task":
+            assert other_task is not None
+            connection.execute(
+                "UPDATE reports SET ai_task_id = ? WHERE id = ?",
+                (other_task.id, report.id),
+            )
+        elif mismatch == "provider_binding":
+            changed = provider_binding(is_ai=False)
+            changed_json = json.dumps(changed, separators=(",", ":"), sort_keys=True)
+            connection.execute(
+                """
+                UPDATE ai_provider_configs
+                SET availability_binding_json = ?, availability_binding_sha256 = ?
+                WHERE id = ?
+                """,
+                (
+                    changed_json,
+                    hashlib.sha256(changed_json.encode("utf-8")).hexdigest(),
+                    provider.id,
+                ),
+            )
+        elif mismatch == "report_pdf":
+            connection.execute(
+                "UPDATE reports SET pdf_sha256 = ? WHERE id = ?",
+                ("f" * 64, report.id),
+            )
+
+    with pytest.raises(ValueError, match="AI review"):
+        repo.approve_application(application.id, report.id, "Reviewed")
+
+    assert repo.get_application(application.id).approval_id is None
 
 
 def test_approval_rejects_nested_reserved_provenance_forged_in_database(
@@ -2710,26 +2982,26 @@ def test_approval_and_submission_require_current_vault_pdf_bytes(tmp_path: Path)
     application = create_application(repo)
     source_dir = repo.vault_path / "resumes" / "packet"
     source_dir.mkdir(parents=True)
+    tex_path = source_dir / "resume.tex"
+    tex_bytes = b"current packet source"
+    tex_path.write_bytes(tex_bytes)
     missing_pdf = source_dir / "missing.pdf"
     resume = repo.create_resume_version(
         name="Packet resume",
         role_family="software",
-        tex_path=source_dir / "resume.tex",
-        tex_sha256="a" * 64,
+        tex_path=tex_path,
+        tex_sha256=hashlib.sha256(tex_bytes).hexdigest(),
         pdf_path=missing_pdf,
         pdf_sha256=hashlib.sha256(b"expected").hexdigest(),
     )
     repo.select_resume(application.id, resume.id)
-    report = repo.save_report(
-        application_id=application.id,
-        resume_version_id=resume.id,
-        jd_snapshot_id=application.jd_snapshot_id,
-        fit={"score": 90},
-        risks={"blockers": [], "warnings": []},
+    provider = create_provider(repo)
+    _task, missing_pdf_report = finalize_fit_report(
+        repo, application.id, resume.id, provider.id
     )
 
     with pytest.raises(ValueError, match="PDF integrity"):
-        repo.approve_application(application.id, report.id, "Reviewed")
+        repo.approve_application(application.id, missing_pdf_report.id, "Reviewed")
 
     pdf_bytes = b"%PDF-1.4\ncurrent"
     missing_pdf.write_bytes(pdf_bytes)
@@ -2740,6 +3012,9 @@ def test_approval_and_submission_require_current_vault_pdf_bytes(tmp_path: Path)
         render_status="rendered",
         parse_status="parsed",
         page_count=1,
+    )
+    _task, report = finalize_fit_report(
+        repo, application.id, resume.id, provider.id
     )
     approval = repo.approve_application(application.id, report.id, "Reviewed")
     missing_pdf.write_bytes(b"tampered")
@@ -2883,30 +3158,32 @@ def test_approval_validation_holds_write_lock_until_audit_commit(
 ):
     repo = make_repo(tmp_path)
     application = create_application(repo)
-    first_pdf = repo.vault_path / "resumes" / "first.pdf"
+    resume_dir = repo.vault_path / "resumes"
+    first_tex = resume_dir / "first.tex"
+    second_tex = resume_dir / "second.tex"
+    first_pdf = resume_dir / "first.pdf"
+    first_tex.write_bytes(b"first source")
+    second_tex.write_bytes(b"second source")
     first_pdf.write_bytes(b"%PDF-1.4\nfirst")
     first = repo.create_resume_version(
         name="First",
         role_family="software",
-        tex_path=tmp_path / "first.tex",
-        tex_sha256="a" * 64,
+        tex_path=first_tex,
+        tex_sha256=hashlib.sha256(first_tex.read_bytes()).hexdigest(),
         pdf_path=first_pdf,
         pdf_sha256=hashlib.sha256(first_pdf.read_bytes()).hexdigest(),
     )
     second = repo.create_resume_version(
         name="Second",
         role_family="software",
-        tex_path=tmp_path / "second.tex",
-        tex_sha256="c" * 64,
+        tex_path=second_tex,
+        tex_sha256=hashlib.sha256(second_tex.read_bytes()).hexdigest(),
         pdf_sha256="d" * 64,
     )
     repo.select_resume(application.id, first.id)
-    report = repo.save_report(
-        application_id=application.id,
-        resume_version_id=first.id,
-        jd_snapshot_id=application.jd_snapshot_id,
-        fit={"score": 90},
-        risks={"blockers": [], "warnings": []},
+    provider = create_provider(repo)
+    _task, report = finalize_fit_report(
+        repo, application.id, first.id, provider.id
     )
     validation_complete = Event()
     release_validation = Event()
@@ -4369,12 +4646,9 @@ def approve_existing_application(
         pdf_sha256=hashlib.sha256(pdf_bytes).hexdigest(),
     )
     repo.select_resume(application_id, resume.id)
-    report = repo.save_report(
-        application_id=application_id,
-        resume_version_id=resume.id,
-        jd_snapshot_id=application.jd_snapshot_id,
-        fit={"score": 90},
-        risks={"blockers": [], "warnings": []},
+    provider = create_provider(repo)
+    _task, report = finalize_fit_report(
+        repo, application_id, resume.id, provider.id
     )
     return repo.approve_application(application_id, report.id, "Reviewed")
 
@@ -4449,12 +4723,8 @@ def test_finding_decision_waiting_on_approval_transaction_observes_read_only_sta
         pdf_sha256=hashlib.sha256(pdf_bytes).hexdigest(),
     )
     repo.select_resume(application.id, resume.id)
-    report = repo.save_report(
-        application_id=application.id,
-        resume_version_id=resume.id,
-        jd_snapshot_id=application.jd_snapshot_id,
-        fit={"score": 90},
-        risks={"blockers": [], "warnings": []},
+    _review_task, report = finalize_fit_report(
+        repo, application.id, resume.id, provider.id
     )
     approval_repo = CareerOpsRepository(repo.database_path, repo.vault_path)
     decision_repo = CareerOpsRepository(repo.database_path, repo.vault_path)
@@ -5462,7 +5732,7 @@ def test_v15_upgrade_preserves_bindings_while_adding_container_image_identity(
             "SELECT * FROM ai_tasks WHERE id = ?", (task.id,)
         ).fetchone()
 
-    assert LATEST_SCHEMA_VERSION == 16
+    assert LATEST_SCHEMA_VERSION == 17
     assert upgraded_provider["enabled"] == 0
     assert upgraded_provider["availability_binding_json"] == expected_json
     assert upgraded_provider["availability_binding_sha256"] == expected_sha256

@@ -145,6 +145,14 @@ class ApplicationPacketSnapshot:
     latest_ai_task: AiTask | None
     evidence: list[EvidenceItem]
     versions: list[ApplicationVersion]
+    approval_eligibility: ApprovalEligibility
+
+
+@dataclass(frozen=True)
+class ApprovalEligibility:
+    eligible: bool
+    reason: str
+    ai_task_id: str | None
 
 
 @dataclass(frozen=True)
@@ -1379,6 +1387,12 @@ class CareerOpsRepository:
                     if expected_resume_version_id is None:
                         raise ValueError("A selected resume is required for this AI task")
                     self._require_pristine_application_packet(application)
+                    reviewed_resume = connection.execute(
+                        "SELECT * FROM resume_versions WHERE id = ?",
+                        (expected_resume_version_id,),
+                    ).fetchone()
+                    if reviewed_resume is None:
+                        raise ValueError("Selected AI review resume is missing")
                     fit_values = dict(safe_success["fit"])
                     risk_values = dict(safe_success["risks"])
                     fit_values["provenance"] = safe_provenance
@@ -1399,15 +1413,17 @@ class CareerOpsRepository:
                         """
                         INSERT INTO reports (
                             id, application_id, resume_version_id, jd_snapshot_id,
-                            fit_json, risks_json, blocking_issue_count, warning_count,
-                            created_at
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            ai_task_id, pdf_sha256, fit_json, risks_json,
+                            blocking_issue_count, warning_count, created_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """,
                         (
                             report_id,
                             application["id"],
                             expected_resume_version_id,
                             expected_jd_snapshot_id,
+                            task_id,
+                            reviewed_resume["pdf_sha256"],
                             fit_json,
                             risks_json,
                             len(blockers),
@@ -3430,18 +3446,25 @@ class CareerOpsRepository:
                 or application["jd_snapshot_id"] != jd_snapshot_id
             ):
                 raise ValueError("Report does not match the selected application packet")
+            resume = connection.execute(
+                "SELECT * FROM resume_versions WHERE id = ?", (resume_version_id,)
+            ).fetchone()
+            if resume is None:
+                raise KeyError("No resume version with that ID")
             connection.execute(
                 """
                 INSERT INTO reports (
-                    id, application_id, resume_version_id, jd_snapshot_id, fit_json,
-                    risks_json, blocking_issue_count, warning_count, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    id, application_id, resume_version_id, jd_snapshot_id,
+                    ai_task_id, pdf_sha256, fit_json, risks_json,
+                    blocking_issue_count, warning_count, created_at
+                ) VALUES (?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     report_id,
                     application_id,
                     resume_version_id,
                     jd_snapshot_id,
+                    resume["pdf_sha256"],
                     fit_json,
                     risks_json,
                     len(blockers),
@@ -3697,12 +3720,65 @@ class CareerOpsRepository:
         fit_provenance = fit.get("provenance")
         risks_provenance = risks.get("provenance")
         if fit_provenance is None and risks_provenance is None:
-            return
+            raise ValueError(
+                "AI review is required for the current application report"
+            )
         if (
             not isinstance(fit_provenance, dict)
             or fit_provenance != risks_provenance
         ):
             raise ValueError("Report contains untrusted reserved AI provenance")
+        task_id = report["ai_task_id"]
+        if not isinstance(task_id, str) or not task_id:
+            raise ValueError("Report contains untrusted reserved AI provenance")
+        if set(fit_provenance) != REPORT_AI_AUTHORITY_FIELDS:
+            raise ValueError("Report contains untrusted reserved AI provenance")
+        if fit_provenance.get("ai_task_id") != task_id:
+            raise ValueError("AI review report task binding does not match")
+
+        task = connection.execute(
+            "SELECT * FROM ai_tasks WHERE id = ?", (task_id,)
+        ).fetchone()
+        if (
+            task is None
+            or task["application_id"] != report["application_id"]
+            or task["task_type"] != AiTaskType.ANALYZE_FIT.value
+            or task["status"] != AiTaskStatus.COMPLETED.value
+            or not task["completed_at"]
+        ):
+            raise ValueError("AI review task is not current and completed")
+        provider = connection.execute(
+            "SELECT * FROM ai_provider_configs WHERE id = ?",
+            (task["provider_config_id"],),
+        ).fetchone()
+        if provider is None or not provider["enabled"]:
+            raise ValueError("AI review provider authority is unavailable")
+        try:
+            task_binding, task_binding_json, task_binding_sha256 = (
+                canonical_provider_binding(json.loads(task["provider_binding_json"]))
+            )
+            provider_binding, provider_binding_json, provider_binding_sha256 = (
+                canonical_provider_binding(
+                    json.loads(provider["availability_binding_json"])
+                )
+            )
+        except (TypeError, json.JSONDecodeError, ValueError) as exc:
+            raise ValueError("AI review provider authority is invalid") from exc
+        if (
+            task_binding_json != task["provider_binding_json"]
+            or task_binding_sha256 != task["provider_binding_sha256"]
+            or provider_binding_json != provider["availability_binding_json"]
+            or provider_binding_sha256
+            != provider["availability_binding_sha256"]
+            or task_binding != provider_binding
+            or task_binding_sha256 != provider_binding_sha256
+            or task["provider_config_id"] != provider["id"]
+            or task["privacy_mode"] != provider["privacy_mode"]
+        ):
+            raise ValueError("AI review provider binding is stale")
+        if task_binding["is_ai"] is not True:
+            raise ValueError("AI review must use an AI provider")
+
         versions = connection.execute(
             """
             SELECT snapshot_json
@@ -3712,6 +3788,7 @@ class CareerOpsRepository:
             """,
             (report["application_id"],),
         ).fetchall()
+        authority_snapshots: list[dict[str, Any]] = []
         for version in versions:
             try:
                 snapshot = json.loads(version["snapshot_json"])
@@ -3719,12 +3796,148 @@ class CareerOpsRepository:
                 continue
             if (
                 isinstance(snapshot, dict)
+                and isinstance(snapshot.get("ai_task"), dict)
+                and snapshot["ai_task"].get("id") == task_id
                 and snapshot.get("provenance") == fit_provenance
                 and isinstance(snapshot.get("side_effect"), dict)
                 and snapshot["side_effect"].get("report_id") == report["id"]
             ):
-                return
-        raise ValueError("Report contains untrusted reserved AI provenance")
+                authority_snapshots.append(snapshot)
+        if len(authority_snapshots) != 1:
+            raise ValueError("AI review report authority is missing or ambiguous")
+        authority = authority_snapshots[0]
+        task_snapshot = authority["ai_task"]
+        try:
+            declared_input_ids = json.loads(task["input_artifact_ids_json"])
+        except (TypeError, json.JSONDecodeError) as exc:
+            raise ValueError("AI review task input authority is invalid") from exc
+        normalized_input_ids = self._ai_task_input_artifact_ids(connection, task_id)
+        if (
+            declared_input_ids != normalized_input_ids
+            or task_snapshot.get("input_artifact_ids") != normalized_input_ids
+            or task_snapshot.get("provider_config_id") != provider["id"]
+            or task_snapshot.get("status") != AiTaskStatus.COMPLETED.value
+            or task_snapshot.get("task_type") != AiTaskType.ANALYZE_FIT.value
+        ):
+            raise ValueError("AI review task authority is invalid")
+
+        manifest = authority.get("artifacts")
+        if not isinstance(manifest, list):
+            raise ValueError("AI review artifact authority is invalid")
+        manifest_by_id: dict[str, dict[str, str]] = {}
+        manifest_by_type: dict[str, dict[str, str]] = {}
+        for item in manifest:
+            if (
+                not isinstance(item, dict)
+                or set(item) != {"artifact_type", "id", "sha256"}
+                or any(type(item.get(field)) is not str for field in item)
+                or item["id"] in manifest_by_id
+                or item["artifact_type"] in manifest_by_type
+            ):
+                raise ValueError("AI review artifact authority is invalid")
+            manifest_by_id[item["id"]] = item
+            manifest_by_type[item["artifact_type"]] = item
+        if set(manifest_by_type) != {
+            "context",
+            "raw_output",
+            "validated_output",
+        }:
+            raise ValueError("AI review artifact authority is incomplete")
+        placeholders = ", ".join("?" for _ in manifest_by_id)
+        artifact_rows = connection.execute(
+            f"SELECT * FROM ai_artifacts WHERE id IN ({placeholders})",
+            tuple(manifest_by_id),
+        ).fetchall()
+        if len(artifact_rows) != len(manifest_by_id):
+            raise ValueError("AI review artifact authority is missing")
+        artifact_by_id = {row["id"]: row for row in artifact_rows}
+        context_row = artifact_by_id[manifest_by_type["context"]["id"]]
+        claim_token = context_row["claim_token"]
+        if not isinstance(claim_token, str) or not claim_token:
+            raise ValueError("AI review attempt authority is invalid")
+        for artifact_id, manifest_item in manifest_by_id.items():
+            artifact = artifact_by_id[artifact_id]
+            if (
+                artifact["task_id"] != task_id
+                or artifact["claim_token"] != claim_token
+                or artifact["artifact_type"] != manifest_item["artifact_type"]
+                or artifact["sha256"] != manifest_item["sha256"]
+            ):
+                raise ValueError("AI review artifact authority changed")
+            self._validate_artifact_row(artifact)
+        attempt_artifacts = connection.execute(
+            "SELECT id FROM ai_artifacts WHERE task_id = ? AND claim_token = ?",
+            (task_id, claim_token),
+        ).fetchall()
+        if {row["id"] for row in attempt_artifacts} != set(manifest_by_id):
+            raise ValueError("AI review attempt artifact authority is ambiguous")
+
+        context_buffer = BytesIO()
+        context_evidence = self._stable_artifact_read(
+            Path(context_row["path"]), context_buffer
+        )
+        if context_evidence.sha256 != context_row["sha256"]:
+            raise ValueError("AI review context checksum changed")
+        try:
+            context = json.loads(context_buffer.getvalue())
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ValueError("AI review context is invalid") from exc
+        if (
+            not isinstance(context, dict)
+            or context.get("task_type") != AiTaskType.ANALYZE_FIT.value
+            or not isinstance(context.get("job_description"), dict)
+            or context["job_description"].get("snapshot_id")
+            != report["jd_snapshot_id"]
+            or not isinstance(context.get("selected_resume"), dict)
+            or context["selected_resume"].get("version_id")
+            != report["resume_version_id"]
+        ):
+            raise ValueError("AI review context does not match the report")
+
+        finding_ids = authority.get("finding_ids")
+        if (
+            not isinstance(finding_ids, list)
+            or any(type(finding_id) is not str for finding_id in finding_ids)
+            or len(set(finding_ids)) != len(finding_ids)
+        ):
+            raise ValueError("AI review finding authority is invalid")
+        finding_rows = connection.execute(
+            "SELECT * FROM ai_findings WHERE task_id = ? AND claim_token = ?",
+            (task_id, claim_token),
+        ).fetchall()
+        if {row["id"] for row in finding_rows} != set(finding_ids):
+            raise ValueError("AI review finding authority changed")
+        if any(
+            row["severity"] == FindingSeverity.BLOCKING.value
+            or row["verifier_state"]
+            in {
+                VerifierState.BLOCKED.value,
+                VerifierState.NEEDS_EVIDENCE.value,
+                VerifierState.REJECTED.value,
+            }
+            for row in finding_rows
+        ):
+            raise ValueError("AI review has verifier blockers")
+
+        expected_provenance = {
+            "ai_task_id": task_id,
+            "context_sha256": manifest_by_type["context"]["sha256"],
+            "output_checksums": {
+                "raw_output": manifest_by_type["raw_output"]["sha256"],
+                "validated_output": manifest_by_type["validated_output"]["sha256"],
+            },
+            "privacy_mode": task["privacy_mode"],
+            "prompt_sha256": task["prompt_sha256"],
+            "prompt_template_id": task["prompt_template_id"],
+            "provider_binding": task_binding,
+            "provider_binding_sha256": task_binding_sha256,
+            "provider_config_id": provider["id"],
+            "provider_identity_name": provider["identity_name"],
+            "provider_kind": provider["provider_kind"],
+            "provider_model": provider["model"],
+        }
+        if fit_provenance != expected_provenance:
+            raise ValueError("AI review provenance no longer matches repository authority")
 
     def _approval_packet_rows(
         self,
@@ -3749,6 +3962,7 @@ class CareerOpsRepository:
         if report["application_id"] != application["id"]:
             raise ValueError("Report does not belong to application")
         self._require_report_provenance_authority(connection, report)
+        self._require_report_risk_counts(report)
         if report["blocking_issue_count"]:
             raise ValueError("Application has blocking risks")
         if application["latest_report_id"] != report["id"]:
@@ -3759,6 +3973,9 @@ class CareerOpsRepository:
             raise ValueError("Selected JD differs from report JD")
         if not resume["pdf_sha256"]:
             raise ValueError("Selected resume has no PDF checksum")
+        if report["pdf_sha256"] != resume["pdf_sha256"]:
+            raise ValueError("AI review does not match the current resume PDF")
+        self._verify_resume_source_row(resume)
         self._verify_resume_pdf_row(resume)
         if (
             application["approval_id"] is not None
@@ -3807,8 +4024,48 @@ class CareerOpsRepository:
         ):
             raise ValueError("Approved application packet changed before submission")
         self._require_report_provenance_authority(connection, report)
+        self._require_report_risk_counts(report)
+        if report["blocking_issue_count"]:
+            raise ValueError("Approved application report has blocking risks")
+        if report["pdf_sha256"] != resume["pdf_sha256"]:
+            raise ValueError("AI review does not match the current resume PDF")
+        self._verify_resume_source_row(resume)
         self._verify_resume_pdf_row(resume)
         return application
+
+    @staticmethod
+    def _require_report_risk_counts(report: sqlite3.Row) -> None:
+        try:
+            risks = json.loads(report["risks_json"])
+        except (TypeError, json.JSONDecodeError) as exc:
+            raise ValueError("Report risks are invalid") from exc
+        blockers = risks.get("blockers") if isinstance(risks, dict) else None
+        warnings = risks.get("warnings") if isinstance(risks, dict) else None
+        if (
+            not isinstance(blockers, list)
+            or not isinstance(warnings, list)
+            or len(blockers) != report["blocking_issue_count"]
+            or len(warnings) != report["warning_count"]
+        ):
+            raise ValueError("Report risk counts are invalid")
+
+    def _verify_resume_source_row(self, resume: sqlite3.Row) -> None:
+        source_path = resume["tex_path"]
+        expected_sha256 = resume["tex_sha256"]
+        if (
+            not source_path
+            or not expected_sha256
+            or not SHA256_PATTERN.fullmatch(expected_sha256)
+        ):
+            raise ValueError("Selected resume source integrity verification failed")
+        try:
+            _path, actual_sha256 = self._stable_artifact_digest(Path(source_path))
+        except (FileNotFoundError, OSError, ValueError) as exc:
+            raise ValueError(
+                "Selected resume source integrity verification failed"
+            ) from exc
+        if actual_sha256 != expected_sha256.lower():
+            raise ValueError("Selected resume source integrity verification failed")
 
     def _verify_resume_pdf_row(self, resume: sqlite3.Row) -> None:
         pdf_path = resume["pdf_path"]
@@ -3859,6 +4116,7 @@ class CareerOpsRepository:
             )
 
             selected_resume = None
+            resume_row = None
             if application.selected_resume_version_id is not None:
                 resume_row = connection.execute(
                     "SELECT * FROM resume_versions WHERE id = ?",
@@ -3869,6 +4127,7 @@ class CareerOpsRepository:
                 selected_resume = self._resume_from_row(resume_row)
 
             latest_report = None
+            report_row = None
             if application.latest_report_id is not None:
                 report_row = connection.execute(
                     "SELECT * FROM reports WHERE id = ?",
@@ -3881,6 +4140,8 @@ class CareerOpsRepository:
                     application_id=report_row["application_id"],
                     resume_version_id=report_row["resume_version_id"],
                     jd_snapshot_id=report_row["jd_snapshot_id"],
+                    ai_task_id=report_row["ai_task_id"],
+                    pdf_sha256=report_row["pdf_sha256"],
                     fit=json.loads(report_row["fit_json"]),
                     risks=json.loads(report_row["risks_json"]),
                     blocking_issue_count=report_row["blocking_issue_count"],
@@ -3995,8 +4256,73 @@ class CareerOpsRepository:
                 versions=[
                     self._application_version_from_row(row) for row in version_rows
                 ],
+                approval_eligibility=self._approval_eligibility(
+                    connection, application_row, report_row, resume_row
+                ),
             )
         return packet
+
+    def _approval_eligibility(
+        self,
+        connection: sqlite3.Connection,
+        application: sqlite3.Row,
+        report: sqlite3.Row | None,
+        resume: sqlite3.Row | None,
+    ) -> ApprovalEligibility:
+        task_id = report["ai_task_id"] if report is not None else None
+        if application["approval_id"] is not None:
+            return ApprovalEligibility(False, "Packet is already approved.", task_id)
+        default_reason = (
+            "Run AI review for the current JD and resume before approval."
+        )
+        if report is None or resume is None:
+            return ApprovalEligibility(False, default_reason, task_id)
+        try:
+            self._require_report_provenance_authority(connection, report)
+            self._require_report_risk_counts(report)
+            if report["blocking_issue_count"]:
+                return ApprovalEligibility(
+                    False,
+                    "Resolve report blockers and run AI review again before approval.",
+                    task_id,
+                )
+            if (
+                application["latest_report_id"] != report["id"]
+                or application["selected_resume_version_id"]
+                != report["resume_version_id"]
+                or application["jd_snapshot_id"] != report["jd_snapshot_id"]
+                or report["pdf_sha256"] != resume["pdf_sha256"]
+            ):
+                raise ValueError("AI review packet binding is stale")
+            self._verify_resume_source_row(resume)
+            self._verify_resume_pdf_row(resume)
+        except (KeyError, OSError, TypeError, ValueError):
+            if isinstance(task_id, str) and task_id:
+                provider_row = connection.execute(
+                    """
+                    SELECT config.availability_binding_json
+                    FROM ai_tasks AS task
+                    JOIN ai_provider_configs AS config
+                      ON config.id = task.provider_config_id
+                    WHERE task.id = ?
+                    """,
+                    (task_id,),
+                ).fetchone()
+                if provider_row is not None:
+                    try:
+                        binding = json.loads(
+                            provider_row["availability_binding_json"]
+                        )
+                    except (TypeError, json.JSONDecodeError):
+                        binding = None
+                    if isinstance(binding, dict) and binding.get("is_ai") is False:
+                        return ApprovalEligibility(
+                            False,
+                            "Verifier-only results are Not AI. Run AI review with an AI provider.",
+                            task_id,
+                        )
+            return ApprovalEligibility(False, default_reason, task_id)
+        return ApprovalEligibility(True, "AI review is current and complete.", task_id)
 
     def list_applications(self) -> list[Application]:
         with self.connection() as connection:
@@ -4045,6 +4371,8 @@ class CareerOpsRepository:
             application_id=row["application_id"],
             resume_version_id=row["resume_version_id"],
             jd_snapshot_id=row["jd_snapshot_id"],
+            ai_task_id=row["ai_task_id"],
+            pdf_sha256=row["pdf_sha256"],
             fit=json.loads(row["fit_json"]),
             risks=json.loads(row["risks_json"]),
             blocking_issue_count=row["blocking_issue_count"],

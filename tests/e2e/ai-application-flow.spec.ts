@@ -51,6 +51,8 @@ type ApplicationPacket = {
     id: string;
     application_id: string;
     resume_version_id: string;
+    ai_task_id: string | null;
+    pdf_sha256: string | null;
     blocking_issue_count: number;
   } | null;
   approval: {
@@ -60,6 +62,11 @@ type ApplicationPacket = {
     pdf_sha256: string;
   } | null;
   latest_ai_task: AiTaskRecord | null;
+  approval_eligibility: {
+    eligible: boolean;
+    reason: string;
+    ai_task_id: string | null;
+  };
   evidence: Array<{
     id: string;
     claim_text: string;
@@ -349,10 +356,17 @@ test("real mock provider completes the day-one application workflow with durable
     await expect(page.getByText("0 blockers", { exact: true })).toBeVisible();
     reviewedPacket = await packet(page, applicationId);
     expect(reviewedPacket.selected_resume?.id).toBe(childResume.id);
+    expect(reviewedPacket.selected_resume?.pdf_sha256).toMatch(/^[0-9a-f]{64}$/);
     expect(reviewedPacket.latest_report).toMatchObject({
       application_id: applicationId,
       resume_version_id: childResume.id,
+      ai_task_id: reviewedPacket.latest_ai_task!.id,
+      pdf_sha256: reviewedPacket.selected_resume?.pdf_sha256,
       blocking_issue_count: 0
+    });
+    expect(reviewedPacket.approval_eligibility).toMatchObject({
+      eligible: true,
+      ai_task_id: reviewedPacket.latest_ai_task!.id
     });
 
     const jd = await downloadArtifact(
@@ -428,6 +442,11 @@ test("real mock provider completes the day-one application workflow with durable
     const current = await packet(page, applicationId);
     const expectedPdfSha256 = current.selected_resume!.pdf_sha256!;
     const expectedReportId = current.latest_report!.id;
+    expect(current.approval_eligibility).toMatchObject({
+      eligible: true,
+      ai_task_id: current.latest_report!.ai_task_id
+    });
+    await expect(page.getByRole("button", { name: "Approve packet" })).toBeEnabled();
     await page.getByRole("button", { name: "Approve packet" }).click();
     await expect(page.getByText("Approved", { exact: true }).first()).toBeVisible();
 

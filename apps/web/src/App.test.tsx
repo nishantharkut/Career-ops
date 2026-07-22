@@ -28,25 +28,37 @@ const application = (id: string, company: string): ApplicationRecord => ({
   updated_at: "2026-07-21T00:00:00Z"
 });
 
-const packet = (record: ApplicationRecord, overrides: Partial<ApplicationPacket> = {}): ApplicationPacket => ({
-  application: record,
-  job_description: {
-    id: record.jd_snapshot_id,
-    application_id: record.id,
-    source_url: record.source_url,
-    raw_text_sha256: "jd-checksum",
-    captured_at: "2026-07-21T00:00:00Z",
-    parser_version: "v1",
-    requirements: { raw_ai: {}, deterministic: {}, user_corrected: {}, uncertainty: {} }
-  },
-  selected_resume: null,
-  latest_report: null,
-  approval: null,
-  latest_ai_task: null,
-  evidence: [],
-  versions: [],
-  ...overrides
-});
+const packet = (
+  record: ApplicationRecord,
+  overrides: Partial<ApplicationPacket> = {},
+  approvalEligibility = {
+    eligible: false,
+    reason: "Run AI review for the current JD and resume before approval.",
+    ai_task_id: null as string | null
+  }
+): ApplicationPacket => {
+  const result = {
+    application: record,
+    job_description: {
+      id: record.jd_snapshot_id,
+      application_id: record.id,
+      source_url: record.source_url,
+      raw_text_sha256: "jd-checksum",
+      captured_at: "2026-07-21T00:00:00Z",
+      parser_version: "v1",
+      requirements: { raw_ai: {}, deterministic: {}, user_corrected: {}, uncertainty: {} }
+    },
+    selected_resume: null,
+    latest_report: null,
+    approval: null,
+    latest_ai_task: null,
+    approval_eligibility: approvalEligibility,
+    evidence: [],
+    versions: [],
+    ...overrides
+  };
+  return result;
+};
 
 function jsonResponse(body: unknown, ok = true, status = 200, statusText = "OK") {
   return { ok, status, statusText, json: async () => body };
@@ -104,6 +116,8 @@ describe("Application Desk UI", () => {
         application_id: "app_1",
         resume_version_id: "res_1",
         jd_snapshot_id: "jd_app_1",
+        ai_task_id: "ait_1",
+        pdf_sha256: "pdf-checksum",
         blocking_issue_count: 1,
         warning_count: 0,
         fit: { matched_requirements: [], missing_requirements: [], exact_keyword_gaps: [], summary_score: 0 },
@@ -151,13 +165,12 @@ describe("Application Desk UI", () => {
     expect(screen.queryByText(/tex_path|pdf_path/i)).not.toBeInTheDocument();
   });
 
-  test("preserves upload, render, analyze, approve, and manual submission flow", async () => {
+  test("keeps verifier-only analysis inspectable but blocks approval and submission", async () => {
     let record = application("app_1", "Swiggy");
     let currentPacket = packet(record);
     const uploaded = { id: "res_1", name: "Application resume", role_family: "general", tex_sha256: "tex", pdf_sha256: null, parent_resume_version_id: null, render_status: "not_rendered", parse_status: "not_parsed", page_count: null, created_at: "", updated_at: "" };
     const rendered = { ...uploaded, pdf_sha256: "pdf", render_status: "rendered", parse_status: "parsed", page_count: 1 };
-    const report = { id: "rpt_1", application_id: "app_1", resume_version_id: "res_1", jd_snapshot_id: "jd_app_1", blocking_issue_count: 0, warning_count: 0, fit: { matched_requirements: [], missing_requirements: [], exact_keyword_gaps: [], summary_score: 100 }, risks: { blockers: [], warnings: [] }, created_at: "" };
-    const approval = { id: "apr_1", application_id: "app_1", resume_version_id: "res_1", report_id: "rpt_1", pdf_sha256: "pdf", approved_at: "", approval_note: "Reviewed PDF and report" };
+    const report = { id: "rpt_1", application_id: "app_1", resume_version_id: "res_1", jd_snapshot_id: "jd_app_1", ai_task_id: null, pdf_sha256: "pdf", blocking_issue_count: 0, warning_count: 0, fit: { matched_requirements: [], missing_requirements: [], exact_keyword_gaps: [], summary_score: 100 }, risks: { blockers: [], warnings: [] }, created_at: "" };
     const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
       const url = String(input);
       if (url.endsWith("/applications") && !init?.method) return jsonResponse([record]);
@@ -177,16 +190,6 @@ describe("Application Desk UI", () => {
         currentPacket = packet(record, { selected_resume: rendered, latest_report: report });
         return jsonResponse(report);
       }
-      if (url.endsWith("/applications/app_1/approve")) {
-        record = { ...record, status: "approved", approval_id: "apr_1" };
-        currentPacket = packet(record, { selected_resume: rendered, latest_report: report, approval });
-        return jsonResponse(approval);
-      }
-      if (url.endsWith("/applications/app_1/mark-submitted")) {
-        record = { ...record, status: "submitted_manual", submission_state: "submitted_manual" };
-        currentPacket = packet(record, { selected_resume: rendered, latest_report: report, approval });
-        return jsonResponse(record);
-      }
       throw new Error(`Unhandled request: ${url}`);
     });
     vi.stubGlobal("fetch", fetchMock);
@@ -197,14 +200,55 @@ describe("Application Desk UI", () => {
     await userEvent.click(screen.getByRole("button", { name: "Upload resume" }));
     expect(await screen.findByText("Application resume")).toBeInTheDocument();
     await userEvent.click(screen.getByRole("button", { name: "Render PDF" }));
-    await waitFor(() => expect(screen.getByRole("button", { name: "Analyze" })).toBeEnabled());
-    await userEvent.click(screen.getByRole("button", { name: "Analyze" }));
-    expect((await screen.findAllByText("Ready to review")).length).toBeGreaterThan(0);
-    await userEvent.click(screen.getByRole("button", { name: "Approve packet" }));
-    await waitFor(() => expect(screen.getByRole("button", { name: "Mark submitted manually" })).toBeEnabled());
-    await userEvent.click(screen.getByRole("button", { name: "Mark submitted manually" }));
-    expect(await screen.findAllByText("Submitted manually")).not.toHaveLength(0);
+    await waitFor(() => expect(screen.getByRole("button", { name: "Run verifier" })).toBeEnabled());
+    await userEvent.click(screen.getByRole("button", { name: "Run verifier" }));
+    expect(await screen.findByText("blockers")).toHaveTextContent("0 blockers");
+    expect(screen.getByText("Run AI review for the current JD and resume before approval.")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Approve packet" })).toBeDisabled();
     expect(screen.getByRole("button", { name: "Mark submitted manually" })).toBeDisabled();
+    expect(fetchMock.mock.calls.some(([input]) => String(input).endsWith("/approve"))).toBe(false);
+  });
+
+  test("enables approval after an injected AI mock completes analyze_fit", async () => {
+    let record = {
+      ...application("app_1", "Swiggy"),
+      status: "ready_for_review",
+      selected_resume_version_id: "res_1",
+      latest_report_id: "rep_verifier"
+    };
+    const resume = { id: "res_1", name: "Application resume", role_family: "general", tex_sha256: "tex", pdf_sha256: "pdf", parent_resume_version_id: null, render_status: "rendered", parse_status: "parsed", page_count: 1, created_at: "", updated_at: "" };
+    const verifierReport = { id: "rep_verifier", application_id: "app_1", resume_version_id: "res_1", jd_snapshot_id: "jd_app_1", ai_task_id: null, pdf_sha256: "pdf", blocking_issue_count: 0, warning_count: 0, fit: { score: 100 }, risks: { blockers: [], warnings: [] }, created_at: "" };
+    const aiReport = { ...verifierReport, id: "rep_ai", ai_task_id: "ait_1" };
+    const completedTask = { id: "ait_1", application_id: "app_1", task_type: "analyze_fit" as const, provider_config_id: "aip_mock", prompt_template_id: "analyze_fit_v1", prompt_sha256: "a".repeat(64), input_artifact_ids: [], status: "completed" as const, privacy_mode: "local_private", started_at: "", completed_at: "", error_summary: "", created_at: "", updated_at: "" };
+    let currentPacket = packet(record, { selected_resume: resume, latest_report: verifierReport });
+    let approved = false;
+    vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/applications") && !init?.method) return jsonResponse([record]);
+      if (url.endsWith("/applications/app_1/packet")) return jsonResponse(currentPacket);
+      if (url.endsWith("/ai/providers")) return jsonResponse([{ id: "aip_mock", provider_kind: "mock", display_name: "AI fixture", identity_name: "", enabled: true, privacy_mode: "local_private", endpoint: "", model: "fixture-v1", available: true, availability_detail: "available", is_ai: true, data_leaves_machine: false, current_metadata: null, created_at: "", updated_at: "" }]);
+      if (url.endsWith("/applications/app_1/ai-tasks")) {
+        record = { ...record, latest_report_id: "rep_ai" };
+        currentPacket = packet(
+          record,
+          { selected_resume: resume, latest_report: aiReport, latest_ai_task: completedTask },
+          { eligible: true, reason: "AI review is current and complete.", ai_task_id: "ait_1" }
+        );
+        return jsonResponse(completedTask, true, 202);
+      }
+      if (url.endsWith("/ai-tasks/ait_1/findings")) return jsonResponse([]);
+      if (url.endsWith("/applications/app_1/approve")) {
+        approved = true;
+        return jsonResponse({ id: "apr_1", application_id: "app_1", resume_version_id: "res_1", report_id: "rep_ai", pdf_sha256: "pdf", approved_at: "", approval_note: "Reviewed PDF and report" });
+      }
+      throw new Error(`Unhandled request: ${url}`);
+    }));
+
+    render(<App />);
+    await userEvent.click(await screen.findByRole("button", { name: "Run AI review" }));
+    await waitFor(() => expect(screen.getByRole("button", { name: "Approve packet" })).toBeEnabled());
+    await userEvent.click(screen.getByRole("button", { name: "Approve packet" }));
+    await waitFor(() => expect(approved).toBe(true));
   });
 
   test("uses typed requirement corrections and preserves untouched structured values", async () => {
@@ -426,6 +470,7 @@ describe("Application Desk UI", () => {
         resume={null}
         report={null}
         approval={null}
+        approvalEligibility={{ eligible: false, reason: "Run AI review before approval.", ai_task_id: null }}
         submitted={false}
         busy=""
         error=""
@@ -457,6 +502,7 @@ describe("Application Desk UI", () => {
         resume={null}
         report={null}
         approval={null}
+        approvalEligibility={{ eligible: false, reason: "Run AI review before approval.", ai_task_id: null }}
         submitted={false}
         busy=""
         error=""
@@ -475,6 +521,8 @@ describe("Application Desk UI", () => {
       application_id: "app_1",
       resume_version_id: "res_1",
       jd_snapshot_id: "jd_1",
+      ai_task_id: "ait_1",
+      pdf_sha256: "pdf",
       blocking_issue_count: 0,
       warning_count: 2,
       fit: {},
@@ -493,6 +541,7 @@ describe("Application Desk UI", () => {
         resume={null}
         report={report}
         approval={null}
+        approvalEligibility={{ eligible: true, reason: "AI review is current and complete.", ai_task_id: "ait_1" }}
         submitted={false}
         busy=""
         error=""

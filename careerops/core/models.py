@@ -76,6 +76,8 @@ class Report:
     application_id: str
     resume_version_id: str
     jd_snapshot_id: str
+    ai_task_id: str | None
+    pdf_sha256: str | None
     fit: JsonDict
     risks: JsonDict
     blocking_issue_count: int

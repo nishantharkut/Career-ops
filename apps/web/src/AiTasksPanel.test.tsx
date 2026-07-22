@@ -129,6 +129,8 @@ describe("AI tasks panel", () => {
     render(<AiTasksPanel applicationId="app_1" initialTask={null} onPacketChanged={vi.fn()} />);
 
     const runButton = await screen.findByRole("button", { name: "Run verifier" });
+    expect(screen.getByRole("option", { name: "Deterministic verifier (Not AI)" })).toBeInTheDocument();
+    expect(screen.getByText("Not AI. This verifier cannot unlock approval.")).toBeInTheDocument();
     expect(runButton).toBeEnabled();
     for (const option of ["analyze_jd", "suggest_resume_edits", "draft_cover_letter", "review_claims"]) {
       await userEvent.selectOptions(screen.getByLabelText("Task"), option);

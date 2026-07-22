@@ -2,6 +2,7 @@ import { useState } from "react";
 import { Check, FileDown, ShieldCheck } from "lucide-react";
 
 import {
+  ApprovalEligibilityRecord,
   ApprovalRecord,
   DownloadedArtifact,
   ReportRecord,
@@ -18,6 +19,7 @@ type ReviewPanelProps = {
   resume: ResumeRecord | null;
   report: ReportRecord | null;
   approval: ApprovalRecord | null;
+  approvalEligibility: ApprovalEligibilityRecord;
   submitted: boolean;
   busy: string;
   error: string;
@@ -60,6 +62,7 @@ export default function ReviewPanel({
   resume,
   report,
   approval,
+  approvalEligibility,
   submitted,
   busy,
   error,
@@ -69,6 +72,7 @@ export default function ReviewPanel({
   const [exportBusy, setExportBusy] = useState("");
   const [exportError, setExportError] = useState("");
   const hasCleanReport = Boolean(report && report.blocking_issue_count === 0);
+  const canApprove = hasCleanReport && approvalEligibility.eligible;
   const warnings = report?.risks.warnings.filter(warningHasContent) ?? [];
 
   async function exportArtifact(label: string, download: DownloadClient) {
@@ -100,7 +104,7 @@ export default function ReviewPanel({
       {error && <p className="error" role="alert">{error}</p>}
       {exportError && <p className="error" role="alert">{exportError}</p>}
       {!applicationId && <p className="muted">Select an application to review checks.</p>}
-      {applicationId && !report && <p className="muted">Run Analyze after rendering the selected resume.</p>}
+      {applicationId && !report && <p className="muted">Run AI review after rendering the selected resume.</p>}
       {report && (
         <div className="report">
           <p><strong>{report.blocking_issue_count}</strong> blockers</p>
@@ -129,8 +133,11 @@ export default function ReviewPanel({
               ))}
             </ul>
           )}
-          {hasCleanReport && <p className="notice"><ShieldCheck aria-hidden="true" size={16} /> Ready to review</p>}
+          {canApprove && <p className="notice"><ShieldCheck aria-hidden="true" size={16} /> Ready to review</p>}
         </div>
+      )}
+      {applicationId && !approvalEligibility.eligible && (
+        <p className="notice" role="status">{approvalEligibility.reason}</p>
       )}
 
       <section aria-label="Exports">
@@ -166,7 +173,7 @@ export default function ReviewPanel({
       <div className="actions actions--stacked">
         <button
           type="button"
-          disabled={!hasCleanReport || Boolean(approval) || busy !== ""}
+          disabled={!canApprove || Boolean(approval) || busy !== ""}
           onClick={() => void onApprove()}
         >
           <Check aria-hidden="true" size={16} /> Approve packet
