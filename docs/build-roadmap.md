@@ -1,10 +1,10 @@
 # CareerOps Build Roadmap
 
-Status: AI-first planning guide for goal mode.
+Status: approved AI-first build-order reference; Application Desk v0 implemented.
 
 This is not an implementation plan. It defines the correct build order so the e2e platform becomes useful without becoming unreliable.
 
-The corrected direction is AI-assisted CareerOps with deterministic verification. The current deterministic Application Desk is a verifier foundation, not the final product.
+The implemented direction is AI-assisted CareerOps with deterministic verification. The deterministic Application Desk baseline remains the verifier foundation beneath the AI-assisted v0 workflow.
 
 ## Phase 0. Repository And Test Harness
 

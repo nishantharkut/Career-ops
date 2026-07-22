@@ -1,6 +1,6 @@
 # CareerOps AI-First Correction Design
 
-Status: proposed correction for approval.
+Status: approved and implemented in Application Desk v0.
 
 Date: 2026-07-21.
 
