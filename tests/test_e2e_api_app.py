@@ -6,7 +6,9 @@ import os
 from pathlib import Path
 import re
 import shutil
+import subprocess
 import tempfile
+from threading import Event, enumerate as enumerate_threads
 from uuid import uuid4
 
 from fastapi.testclient import TestClient
@@ -28,6 +30,21 @@ def _remove_owned_test_root(root: Path) -> None:
     assert RUN_NAME_PATTERN.fullmatch(resolved.name)
     assert not resolved.is_symlink()
     shutil.rmtree(resolved)
+
+
+def _new_e2e_root() -> Path:
+    return Path(tempfile.gettempdir()).resolve() / (
+        f"careerops-e2e-{os.getpid()}-{uuid4().hex}"
+    )
+
+
+def _remove_directory_link(path: Path) -> None:
+    if not path.exists() and not path.is_symlink():
+        return
+    if os.name == "nt":
+        os.rmdir(path)
+    else:
+        path.unlink()
 
 
 @pytest.fixture
@@ -103,6 +120,88 @@ def test_e2e_factory_rejects_temp_prefix_collision(monkeypatch: pytest.MonkeyPat
             assert collision_parent.parent == temp_root.parent
             assert collision_parent.name.startswith(f"{temp_root.name}-collision-")
             shutil.rmtree(collision_parent)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows junction regression")
+def test_e2e_factory_and_cleanup_reject_junction_without_deleting_target(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    temp_root = Path(tempfile.gettempdir()).resolve()
+    target = _new_e2e_root()
+    junction = _new_e2e_root()
+    marker = target / "must-survive.txt"
+    target.mkdir()
+    marker.write_text("owned target", encoding="utf-8")
+    created = subprocess.run(
+        ["cmd.exe", "/d", "/c", "mklink", "/J", str(junction), str(target)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if created.returncode != 0:
+        _remove_owned_test_root(target)
+        pytest.fail(f"Could not create Windows junction: {created.stderr or created.stdout}")
+
+    original_resolve = Path.resolve
+
+    def reject_junction_resolution(path: Path, *args, **kwargs):
+        if path == junction:
+            raise AssertionError("raw junction was resolved before rejection")
+        return original_resolve(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "resolve", reject_junction_resolution)
+    monkeypatch.setenv("CAREEROPS_E2E_RUN_ROOT", str(junction))
+    monkeypatch.setenv("CAREEROPS_DB_PATH", str(junction / "careerops.db"))
+    monkeypatch.setenv("CAREEROPS_VAULT_PATH", str(junction / "vault"))
+    paths = e2e_app.E2ePaths(
+        temp_root=temp_root,
+        run_root=junction,
+        database_path=junction / "careerops.db",
+        vault_path=junction / "vault",
+    )
+    try:
+        with pytest.raises(RuntimeError, match="symlink or junction"):
+            e2e_app.create_e2e_app()
+        with pytest.raises(RuntimeError, match="E2E run root"):
+            e2e_app._remove_validated_run_root(paths)
+        assert marker.read_text(encoding="utf-8") == "owned target"
+    finally:
+        _remove_directory_link(junction)
+        _remove_owned_test_root(target)
+
+
+def test_e2e_factory_rejects_symlink_without_deleting_target(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    temp_root = Path(tempfile.gettempdir()).resolve()
+    target = _new_e2e_root()
+    symlink = _new_e2e_root()
+    marker = target / "must-survive.txt"
+    target.mkdir()
+    marker.write_text("owned target", encoding="utf-8")
+    try:
+        try:
+            symlink.symlink_to(target, target_is_directory=True)
+        except OSError as exc:
+            pytest.skip(f"Directory symlinks are unavailable: {exc}")
+        monkeypatch.setenv("CAREEROPS_E2E_RUN_ROOT", str(symlink))
+        monkeypatch.setenv("CAREEROPS_DB_PATH", str(symlink / "careerops.db"))
+        monkeypatch.setenv("CAREEROPS_VAULT_PATH", str(symlink / "vault"))
+        paths = e2e_app.E2ePaths(
+            temp_root=temp_root,
+            run_root=symlink,
+            database_path=symlink / "careerops.db",
+            vault_path=symlink / "vault",
+        )
+
+        with pytest.raises(RuntimeError, match="symlink or junction"):
+            e2e_app.create_e2e_app()
+        with pytest.raises(RuntimeError, match="E2E run root"):
+            e2e_app._remove_validated_run_root(paths)
+        assert marker.read_text(encoding="utf-8") == "owned target"
+    finally:
+        _remove_directory_link(symlink)
+        _remove_owned_test_root(target)
 
 
 @pytest.mark.parametrize(
@@ -183,6 +282,64 @@ def test_e2e_cleanup_requires_control_header_and_removes_only_validated_root(
 
     assert cleaned.status_code == 204
     assert not isolated_e2e_environment.exists()
+
+
+def test_e2e_cleanup_fails_closed_until_blocked_worker_quiesces(
+    isolated_e2e_environment: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    entered = Event()
+    release = Event()
+    original_output = e2e_app._mock_output
+
+    def blocked_output(request):
+        entered.set()
+        if not release.wait(timeout=10):
+            raise RuntimeError("blocked E2E provider timed out")
+        return original_output(request)
+
+    monkeypatch.setattr(e2e_app, "_mock_output", blocked_output)
+    app = e2e_app.create_e2e_app()
+    repository = app.state.repository
+    application = repository.create_application(
+        company="Example Labs",
+        role_title="Test Engineer",
+        location="Bengaluru",
+        source_url="https://example.com/job",
+        jd_text="Company: Example Labs\nTitle: Test Engineer\n",
+    )
+    provider_config = repository.list_ai_provider_configs()[0]
+
+    with TestClient(app) as client:
+        launched = client.post(
+            f"/applications/{application.id}/ai-tasks",
+            json={
+                "task_type": "analyze_jd",
+                "provider_config_id": provider_config.id,
+            },
+        )
+        assert launched.status_code == 202
+        assert entered.wait(timeout=2)
+
+        blocked = client.post("/__e2e__/cleanup", headers=CONTROL_HEADERS)
+        root_survived = isolated_e2e_environment.exists()
+        worker_survived = any(
+            thread.is_alive()
+            and thread.name.startswith(app.state.task_runner.thread_name_prefix)
+            and "worker" in thread.name
+            for thread in enumerate_threads()
+        )
+        release.set()
+
+        assert blocked.status_code == 503
+        assert blocked.json() == {"detail": "E2E task runner did not quiesce"}
+        assert root_survived
+        assert worker_survived
+
+        cleaned = client.post("/__e2e__/cleanup", headers=CONTROL_HEADERS)
+
+        assert cleaned.status_code == 204
+        assert not isolated_e2e_environment.exists()
 
 
 def _create_selected_resume(app) -> tuple[str, Path, str]:

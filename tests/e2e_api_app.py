@@ -40,7 +40,7 @@ class E2ePaths:
     vault_path: Path
 
 
-def _required_absolute_path(name: str) -> tuple[Path, Path]:
+def _required_absolute_path(name: str) -> Path:
     raw = os.environ.get(name, "")
     if not raw:
         raise RuntimeError(f"{name} is required for the E2E app")
@@ -49,15 +49,33 @@ def _required_absolute_path(name: str) -> tuple[Path, Path]:
         raise RuntimeError(f"{name} must be an absolute E2E path")
     if ".." in raw_path.parts:
         raise RuntimeError(f"{name} must not contain path traversal")
-    absolute = Path(os.path.abspath(raw_path))
-    return absolute, absolute.resolve(strict=False)
+    return Path(os.path.abspath(raw_path))
+
+
+def _is_link_or_junction(path: Path) -> bool:
+    try:
+        if path.is_symlink():
+            return True
+        junction_check = getattr(path, "is_junction", None)
+        if callable(junction_check) and junction_check():
+            return True
+        attributes = getattr(path.lstat(), "st_file_attributes", 0)
+    except FileNotFoundError:
+        return False
+    except OSError as exc:
+        raise RuntimeError("E2E run root could not be inspected") from exc
+    reparse_point = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+    return bool(reparse_point and attributes & reparse_point)
 
 
 def _validated_e2e_paths() -> E2ePaths:
     temp_root = Path(tempfile.gettempdir()).resolve()
-    raw_root, run_root = _required_absolute_path("CAREEROPS_E2E_RUN_ROOT")
-    if raw_root.exists() and raw_root.is_symlink():
-        raise RuntimeError("CAREEROPS_E2E_RUN_ROOT must not be a symlink")
+    raw_root = _required_absolute_path("CAREEROPS_E2E_RUN_ROOT")
+    if _is_link_or_junction(raw_root):
+        raise RuntimeError(
+            "CAREEROPS_E2E_RUN_ROOT must not be a symlink or junction"
+        )
+    run_root = raw_root.resolve(strict=False)
     if (
         run_root.parent != temp_root
         or RUN_NAME_PATTERN.fullmatch(run_root.name) is None
@@ -71,8 +89,8 @@ def _validated_e2e_paths() -> E2ePaths:
     if stat.S_ISLNK(root_stat.st_mode) or not stat.S_ISDIR(root_stat.st_mode):
         raise RuntimeError("CAREEROPS_E2E_RUN_ROOT must be a regular directory")
 
-    _raw_database, database_path = _required_absolute_path("CAREEROPS_DB_PATH")
-    _raw_vault, vault_path = _required_absolute_path("CAREEROPS_VAULT_PATH")
+    database_path = _required_absolute_path("CAREEROPS_DB_PATH").resolve(strict=False)
+    vault_path = _required_absolute_path("CAREEROPS_VAULT_PATH").resolve(strict=False)
     expected_database = run_root / "careerops.db"
     expected_vault = run_root / "vault"
     if database_path != expected_database or vault_path != expected_vault:
@@ -93,6 +111,8 @@ def _same_e2e_paths(expected: E2ePaths) -> E2ePaths:
 
 
 def _remove_validated_run_root(paths: E2ePaths) -> None:
+    if _is_link_or_junction(paths.run_root):
+        raise RuntimeError("Refusing to remove an invalid E2E run root")
     run_root = paths.run_root.resolve(strict=False)
     if (
         run_root != paths.run_root
@@ -246,7 +266,11 @@ def create_e2e_app() -> FastAPI:
         _require_control(request)
         try:
             _same_e2e_paths(paths)
-            app.state.task_runner.stop()
+            if not app.state.task_runner.stop():
+                raise HTTPException(
+                    status_code=503,
+                    detail="E2E task runner did not quiesce",
+                )
             _remove_validated_run_root(paths)
         except (OSError, RuntimeError, ValueError) as exc:
             raise HTTPException(

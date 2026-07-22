@@ -122,15 +122,17 @@ class AiTaskRunner:
             return False
         return True
 
-    def stop(self) -> None:
+    def stop(self) -> bool:
         with self._state_lock:
             generation = self._generation
             if generation is None:
-                return
+                return True
             generation.stop.set()
 
         self._join_generation(generation)
+        quiesced = not generation.has_live_threads()
         self._discard_drained_generation(generation)
+        return quiesced
 
     def submit(self, task_id: str, *, allow_synchronous: bool = True) -> bool:
         with self._state_lock:

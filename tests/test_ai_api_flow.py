@@ -393,7 +393,7 @@ def test_task_runner_restart_uses_fresh_generation_after_delayed_supervisor(
             stopped = executor.submit(runner.stop)
             wait_until(lambda: not runner_threads(runner, kind="worker"))
             release_poll.set()
-            stopped.result(timeout=2)
+            assert stopped.result(timeout=2) is True
 
         assert not runner.is_running
         assert not runner_threads(runner)
@@ -438,7 +438,7 @@ def test_task_runner_refuses_restart_and_submit_until_blocked_generation_drains(
     try:
         assert runner.submit(first.id)
         assert entered.wait(timeout=2)
-        runner.stop()
+        assert runner.stop() is False
         assert not runner.is_running
         assert len(runner_threads(runner, kind="worker")) == 1
 
@@ -455,6 +455,7 @@ def test_task_runner_refuses_restart_and_submit_until_blocked_generation_drains(
         release.set()
         wait_for_task_status(repo, first.id, "completed")
         wait_until(lambda: not runner_threads(runner))
+        assert runner.stop() is True
 
         assert runner.start() is True
         wait_for_task_status(repo, second.id, "completed")
